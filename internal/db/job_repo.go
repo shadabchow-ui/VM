@@ -134,6 +134,124 @@ func (r *Repo) AtomicClaimJob(ctx context.Context) (*JobRow, error) {
 	return row, nil
 }
 
+// ListStuckInProgressJobs returns all in_progress jobs whose per-type timeout
+// has elapsed since claimed_at. Used exclusively by the janitor.
+// Timeout values per type are per JOB_MODEL_V1 §3.
+// Source: JOB_MODEL_V1 §8 (janitor scan query).
+func (r *Repo) ListStuckInProgressJobs(ctx context.Context) ([]*JobRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, instance_id, job_type, status,
+		       idempotency_key, attempt_count, max_attempts,
+		       error_message, created_at, updated_at, claimed_at, completed_at
+		FROM jobs
+		WHERE status = 'in_progress'
+		  AND claimed_at IS NOT NULL
+		  AND claimed_at + (
+		        CASE job_type
+		            WHEN 'INSTANCE_CREATE'  THEN INTERVAL '1800 seconds'
+		            WHEN 'INSTANCE_START'   THEN INTERVAL '300 seconds'
+		            WHEN 'INSTANCE_STOP'    THEN INTERVAL '600 seconds'
+		            WHEN 'INSTANCE_REBOOT'  THEN INTERVAL '180 seconds'
+		            WHEN 'INSTANCE_DELETE'  THEN INTERVAL '900 seconds'
+		            ELSE                         INTERVAL '600 seconds'
+		        END
+		      ) < NOW()
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListStuckInProgressJobs: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*JobRow
+	for rows.Next() {
+		row := &JobRow{}
+		if err := rows.Scan(
+			&row.ID, &row.InstanceID, &row.JobType, &row.Status,
+			&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
+			&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
+		); err != nil {
+			return nil, fmt.Errorf("ListStuckInProgressJobs scan: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// RequeueTimedOutJob resets a stuck in_progress job back to pending so the
+// worker can reclaim it. Called by the janitor when attempt_count < max_attempts.
+// Uses an optimistic WHERE status='in_progress' guard to prevent double-reset.
+// Source: JOB_MODEL_V1 §8 (TIMED_OUT → PENDING re-enqueue path).
+func (r *Repo) RequeueTimedOutJob(ctx context.Context, id string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE jobs
+		SET status      = 'pending',
+		    claimed_at  = NULL,
+		    updated_at  = NOW()
+		WHERE id     = $1
+		  AND status = 'in_progress'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("RequeueTimedOutJob: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Already transitioned by another process — idempotent, not an error.
+		return nil
+	}
+	return nil
+}
+
+// HasActivePendingJob returns true when the instance already has a pending or
+// in_progress job of the given type. Used by the reconciler to avoid dispatching
+// duplicate repair jobs.
+// Source: 03-03-reconciliation-loops §Job-Based Architecture (idempotency check).
+func (r *Repo) HasActivePendingJob(ctx context.Context, instanceID, jobType string) (bool, error) {
+	var count int
+	err := r.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM jobs
+		WHERE instance_id = $1
+		  AND job_type    = $2
+		  AND status IN ('pending', 'in_progress')
+	`, instanceID, jobType).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("HasActivePendingJob: %w", err)
+	}
+	return count > 0, nil
+}
+
+// ListActiveInstances returns all non-deleted instances. Used by the reconciler's
+// periodic full-resync scan.
+// Source: 03-03-reconciliation-loops §Periodic Polling (Resync).
+func (r *Repo) ListActiveInstances(ctx context.Context) ([]*InstanceRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, name, owner_principal_id, vm_state,
+		       instance_type_id, image_id, host_id, availability_zone,
+		       version, created_at, updated_at, deleted_at
+		FROM instances
+		WHERE deleted_at IS NULL
+		  AND vm_state NOT IN ('deleted', 'failed')
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListActiveInstances: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*InstanceRow
+	for rows.Next() {
+		row := &InstanceRow{}
+		if err := rows.Scan(
+			&row.ID, &row.Name, &row.OwnerPrincipalID, &row.VMState,
+			&row.InstanceTypeID, &row.ImageID, &row.HostID, &row.AvailabilityZone,
+			&row.Version, &row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
+		); err != nil {
+			return nil, fmt.Errorf("ListActiveInstances scan: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 // UpdateJobStatus updates a job's status and optionally sets error_message.
 // Source: JOB_MODEL_V1 §2 (status transitions).
 func (r *Repo) UpdateJobStatus(ctx context.Context, id, status string, errMsg *string) error {
