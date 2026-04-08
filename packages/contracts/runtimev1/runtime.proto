@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+package runtimev1;
+
+option go_package = "github.com/compute-platform/compute-platform/packages/contracts/runtimev1";
+
+// RuntimeService is the gRPC interface between the control plane worker and the Host Agent.
+// All RPCs must be idempotent. Source: RUNTIMESERVICE_GRPC_V1 §2-3.
+//
+// Authentication: mTLS with host-specific certificates (CN=host-{host_id}).
+// Source: RUNTIMESERVICE_GRPC_V1 §6, AUTH_OWNERSHIP_MODEL_V1 §6.
+//
+// Timeout: 60s default, 300s for CreateInstance (rootfs materialization).
+// Source: RUNTIMESERVICE_GRPC_V1 §timeout.
+//
+// FROZEN at M0. Changes require formal review. Source: IMPLEMENTATION_PLAN_V1 §10.7.
+service RuntimeService {
+  // CreateInstance materialises a VM from spec but does not start it. Idempotent.
+  rpc CreateInstance(CreateInstanceRequest) returns (CreateInstanceResponse);
+
+  // StartInstance starts a previously created VM. Idempotent.
+  rpc StartInstance(StartInstanceRequest) returns (StartInstanceResponse);
+
+  // StopInstance stops a running VM. Idempotent. Two-phase: ACPI then force.
+  rpc StopInstance(StopInstanceRequest) returns (StopInstanceResponse);
+
+  // DeleteInstance destroys all VM resources. Idempotent.
+  rpc DeleteInstance(DeleteInstanceRequest) returns (DeleteInstanceResponse);
+
+  // ListInstances returns the state of all VMs currently on this host.
+  rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
+}
+
+// ── CreateInstance ────────────────────────────────────────────────────────────
+
+message CreateInstanceRequest {
+  string instance_id       = 1;  // KSUID
+  string image_url         = 2;  // object storage URL for base image
+  string instance_type_id  = 3;  // e.g. c1.small
+  int32  cpu_cores         = 4;
+  int32  memory_mb         = 5;
+  int32  disk_gb           = 6;
+  string rootfs_path       = 7;  // NFS path for qcow2 CoW overlay
+  NetworkConfig network    = 8;
+  string ssh_public_key    = 9;  // injected via metadata service
+}
+
+message CreateInstanceResponse {
+  string instance_id = 1;
+  string state       = 2;  // "CREATED"
+}
+
+// ── StartInstance ─────────────────────────────────────────────────────────────
+
+message StartInstanceRequest {
+  string instance_id = 1;
+}
+
+message StartInstanceResponse {
+  string instance_id = 1;
+  string state       = 2;  // "RUNNING"
+}
+
+// ── StopInstance ──────────────────────────────────────────────────────────────
+
+message StopInstanceRequest {
+  string instance_id     = 1;
+  int32  timeout_seconds = 2;  // ACPI grace period before force-kill. Default 90.
+}
+
+message StopInstanceResponse {
+  string instance_id = 1;
+  string state       = 2;  // "STOPPED"
+}
+
+// ── DeleteInstance ────────────────────────────────────────────────────────────
+
+message DeleteInstanceRequest {
+  string instance_id      = 1;
+  bool   delete_root_disk = 2;  // Phase 1: always true.
+}
+
+message DeleteInstanceResponse {
+  string instance_id = 1;
+  string state       = 2;  // "DELETED"
+}
+
+// ── ListInstances ─────────────────────────────────────────────────────────────
+
+message ListInstancesRequest {
+  // Empty: returns all instances on the host.
+}
+
+message ListInstancesResponse {
+  repeated InstanceStatus instances = 1;
+}
+
+message InstanceStatus {
+  string instance_id = 1;
+  string state       = 2;  // CREATED, RUNNING, STOPPED, DELETED
+  int32  host_pid    = 3;  // Firecracker process PID; 0 if not running
+}
+
+// ── Shared types ──────────────────────────────────────────────────────────────
+
+message NetworkConfig {
+  string private_ip  = 1;  // assigned from ip_allocations pool
+  string public_ip   = 2;  // optional; empty if no public IP
+  string tap_device  = 3;  // TAP device name on host (e.g. tap0)
+  string mac_address = 4;
+}

@@ -1,0 +1,119 @@
+package main
+
+// placement.go — Scheduler host selection for VM placement.
+//
+// M1 scope: read host inventory from Resource Manager HTTP API; return best-fit host.
+// This is PLACEMENT INPUT only. Full scheduling (AZ spread, anti-affinity) is M3.
+// The worker does not call SelectHost in M1 — wired in M2.
+//
+// Source: IMPLEMENTATION_PLAN_V1 §C3 (Scheduler v1: depends on Resource Manager),
+//         12-02-implementation-sequence §M3 (dynamic VM placement gate).
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+)
+
+// ErrNoCapacity is returned when no available host can satisfy the resource request.
+var ErrNoCapacity = errors.New("no host with sufficient capacity available")
+
+// HostSummary mirrors the JSON shape returned by GET /internal/v1/hosts.
+type HostSummary struct {
+	ID               string `json:"id"`
+	AvailabilityZone string `json:"availability_zone"`
+	Status           string `json:"status"`
+	TotalCPU         int    `json:"total_cpu"`
+	TotalMemoryMB    int    `json:"total_memory_mb"`
+	TotalDiskGB      int    `json:"total_disk_gb"`
+	UsedCPU          int    `json:"used_cpu"`
+	UsedMemoryMB     int    `json:"used_memory_mb"`
+	UsedDiskGB       int    `json:"used_disk_gb"`
+}
+
+func (h *HostSummary) AvailableCPU() int     { return h.TotalCPU - h.UsedCPU }
+func (h *HostSummary) AvailableMemoryMB() int { return h.TotalMemoryMB - h.UsedMemoryMB }
+func (h *HostSummary) AvailableDiskGB() int   { return h.TotalDiskGB - h.UsedDiskGB }
+
+// CanFit reports whether the host has enough free resources.
+func (h *HostSummary) CanFit(cpuCores, memoryMB, diskGB int) bool {
+	return h.Status == "ready" &&
+		h.AvailableCPU() >= cpuCores &&
+		h.AvailableMemoryMB() >= memoryMB &&
+		h.AvailableDiskGB() >= diskGB
+}
+
+// Scheduler provides host placement decisions by querying the Resource Manager.
+type Scheduler struct {
+	rmURL  string
+	client *http.Client // mTLS client authenticated to Resource Manager
+	log    *slog.Logger
+}
+
+func newScheduler(rmURL string, client *http.Client, log *slog.Logger) *Scheduler {
+	return &Scheduler{rmURL: rmURL, client: client, log: log}
+}
+
+// SelectHost returns the best available host for the given resource requirements.
+// Strategy (Phase 1): first-fit descending by free CPU.
+// Resource Manager returns hosts pre-sorted by (total_cpu - used_cpu) DESC so
+// the first host satisfying CanFit is the correct selection.
+//
+// Returns ErrNoCapacity if no ready host satisfies the request.
+// Source: IMPLEMENTATION_PLAN_V1 §C3.
+func (s *Scheduler) SelectHost(ctx context.Context, cpuCores, memoryMB, diskGB int) (*HostSummary, error) {
+	hosts, err := s.fetchAvailableHosts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("SelectHost: %w", err)
+	}
+	for _, h := range hosts {
+		if h.CanFit(cpuCores, memoryMB, diskGB) {
+			s.log.Info("host selected",
+				"host_id", h.ID,
+				"az", h.AvailabilityZone,
+				"free_cpu", h.AvailableCPU(),
+				"free_mem_mb", h.AvailableMemoryMB(),
+				"req_cpu", cpuCores,
+				"req_mem_mb", memoryMB,
+			)
+			return h, nil
+		}
+	}
+	s.log.Warn("no capacity",
+		"req_cpu", cpuCores, "req_mem_mb", memoryMB, "req_disk_gb", diskGB,
+		"candidates", len(hosts),
+	)
+	return nil, ErrNoCapacity
+}
+
+// fetchAvailableHosts calls GET /internal/v1/hosts on the Resource Manager.
+// The Resource Manager applies the 90-second heartbeat staleness filter and
+// returns only status=ready hosts.
+func (s *Scheduler) fetchAvailableHosts(ctx context.Context) ([]*HostSummary, error) {
+	url := s.rmURL + "/internal/v1/hosts"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GET %s returned %d: %s", url, resp.StatusCode, string(body))
+	}
+	var out struct {
+		Hosts []*HostSummary `json:"hosts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return out.Hosts, nil
+}
