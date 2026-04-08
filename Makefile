@@ -2,7 +2,8 @@
         migrate-up migrate-down proto ci build-all \
         build-worker build-host-agent build-resource-manager build-scheduler build-cli \
         build-network-controller \
-        m0-gate m1-gate m2-gate \
+        m0-gate m1-gate m2-gate m8-gate m8-gate-full \
+        test-m8 \
         run-worker run-host-agent run-network-controller
 
 # ── Linting ───────────────────────────────────────────────────────────────────
@@ -32,6 +33,33 @@ test-auth:
 
 # All tests that can run in CI without a DB.
 test: test-unit test-auth
+
+# ── M8 Test Suite ─────────────────────────────────────────────────────────────
+# Full M8 validation: lifecycle matrix, failure injection, idempotency,
+# reconciler drift, janitor timeout, optimistic locking, secret leakage.
+# Runs entirely without a DB or hardware.
+# Source: IMPLEMENTATION_PLAN_V1 §M8 exit criteria.
+test-m8:
+	@echo "=== M8: state machine matrix ==="
+	go test -count=1 -short \
+		./packages/state-machine/... \
+		./packages/state-machine/...
+	@echo "=== M8: worker handlers (lifecycle, failure injection, idempotency, lock, secrets) ==="
+	go test -count=1 -short \
+		./services/worker/handlers/...
+	@echo "=== M8: worker loop + janitor ==="
+	go test -count=1 -short \
+		./services/worker/...
+	@echo "=== M8: reconciler drift detection ==="
+	go test -count=1 -short \
+		./reconciler/...
+	@echo "=== M8: API (idempotency-key, auth, ownership, illegal transitions, job status) ==="
+	go test -count=1 -short \
+		./services/resource-manager/...
+	@echo "=== M8: DB repo unit tests ==="
+	go test -count=1 -short \
+		./internal/db/...
+	@echo "=== M8: all packages pass ==="
 
 # ── Database ──────────────────────────────────────────────────────────────────
 # Apply migrations using the golang-migrate CLI (requires 'migrate' binary).
@@ -86,6 +114,19 @@ m1-gate:
 # Source: IMPLEMENTATION_PLAN_V1 §Phase 3 gate criteria.
 m2-gate:
 	bash scripts/m2-gate-check.sh
+
+# M8 gate: full release readiness validation.
+# Runs all lifecycle, failure injection, idempotency, reconciler, janitor,
+# optimistic lock, secret leakage checks plus artifact presence verification.
+# No DB or hardware required.
+# Source: IMPLEMENTATION_PLAN_V1 §M8 exit criteria.
+m8-gate:
+	bash scripts/m8-gate-check.sh
+
+# M8 gate with integration tests against a real PostgreSQL instance.
+# Requires DATABASE_URL to be set and migrations applied.
+m8-gate-full:
+	DATABASE_URL=$(DATABASE_URL) bash scripts/m8-gate-check.sh --with-integration
 
 # Build network controller service (M2).
 build-network-controller:
