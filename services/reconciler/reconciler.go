@@ -87,8 +87,26 @@ func (r *Reconciler) RunPeriodicResync(ctx context.Context) {
 	}
 }
 
-// resync scans all active instances and enqueues each for reconciliation.
-// Source: 03-03 §Periodic Polling (step 2–3).
+// RunIPUniquenessScanLoop runs the IP uniqueness sub-scan on each reconciler
+// resync cycle. Logs anomalies; never mutates allocations.
+//
+// Source: IMPLEMENTATION_PLAN_V1 §M6 gate (IP uniqueness reconciler sub-scan),
+//
+//	IP_ALLOCATION_CONTRACT_V1 §anomaly-detection.
+func RunIPUniquenessScanLoop(ctx context.Context, scan *IPUniquenessScan, log *slog.Logger) {
+	log.Info("ip-uniqueness-scan: loop started", "interval", resyncInterval)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("ip-uniqueness-scan: loop stopped")
+			return
+		case <-time.After(resyncInterval):
+		}
+		if _, err := scan.Scan(ctx); err != nil {
+			log.Error("ip-uniqueness-scan: scan cycle failed", "error", err)
+		}
+	}
+}
 func (r *Reconciler) resync(ctx context.Context) {
 	r.log.Info("reconciler: starting full resync")
 	instances, err := r.repo.ListActiveInstances(ctx)

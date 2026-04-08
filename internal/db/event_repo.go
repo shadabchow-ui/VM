@@ -43,6 +43,11 @@ const (
 	EventSSHKeyAttached            = "instance.ssh_key.attached"
 	EventIPAllocated               = "instance.ip.allocated"
 	EventIPReleased                = "instance.ip.released"
+	// EventIPUniquenessViolation is written by the IP uniqueness reconciler
+	// sub-scan when it detects that two instances share the same IP (invariant I-2
+	// violated). Written once per affected instance per scan cycle.
+	// Source: IMPLEMENTATION_PLAN_V1 §M6 gate, IP_ALLOCATION_CONTRACT_V1.
+	EventIPUniquenessViolation = "instance.ip.uniqueness_violation"
 )
 
 // InsertEvent appends an event to the instance event log.

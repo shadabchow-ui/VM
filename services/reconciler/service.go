@@ -26,11 +26,13 @@ func Run(ctx context.Context, repo *db.Repo) {
 
 	janitor := NewJanitor(repo, log)
 	rec := NewReconciler(repo, log)
+	ipScan := NewIPUniquenessScan(repo, log)
 
 	// Run all loops concurrently.
 	go janitor.Run(ctx)
 	go rec.RunPeriodicResync(ctx)
-	rec.RunWorkers(ctx) // blocks
+	go RunIPUniquenessScanLoop(ctx, ipScan, log) // M6: IP uniqueness sub-scan
+	rec.RunWorkers(ctx)                          // blocks
 }
 
 // ServiceMain is the standalone service entry for services/reconciler/cmd/main.go

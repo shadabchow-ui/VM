@@ -28,11 +28,12 @@ type IPAllocationRow struct {
 // Uses SELECT FOR UPDATE SKIP LOCKED to prevent concurrent double-allocation.
 //
 // Full transaction pattern (Sprint 3 network controller):
-//   tx, _ := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
-//   SELECT ip_address FROM ip_allocations WHERE vpc_id=$1 AND allocated=FALSE
-//     ORDER BY ip_address LIMIT 1 FOR UPDATE SKIP LOCKED
-//   UPDATE ip_allocations SET allocated=TRUE, owner_instance_id=$2 WHERE ip_address=$3 AND vpc_id=$1
-//   tx.Commit(ctx)
+//
+//	tx, _ := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+//	SELECT ip_address FROM ip_allocations WHERE vpc_id=$1 AND allocated=FALSE
+//	  ORDER BY ip_address LIMIT 1 FOR UPDATE SKIP LOCKED
+//	UPDATE ip_allocations SET allocated=TRUE, owner_instance_id=$2 WHERE ip_address=$3 AND vpc_id=$1
+//	tx.Commit(ctx)
 //
 // Source: IP_ALLOCATION_CONTRACT_V1, IMPLEMENTATION_PLAN_V1 §BLOCK (M2 gate).
 func (r *Repo) AllocateIP(ctx context.Context, vpcID, instanceID string) (string, error) {
@@ -97,4 +98,54 @@ func (r *Repo) GetIPByInstance(ctx context.Context, instanceID string) (string, 
 		return "", fmt.Errorf("GetIPByInstance: %w", err)
 	}
 	return ip, nil
+}
+
+// DuplicateIPRow is a result row from FindDuplicateIPAllocations.
+// Each row represents one IP+VPC combination that is claimed by multiple instances.
+type DuplicateIPRow struct {
+	IPAddress        string
+	VPCID            string
+	OwnerInstanceIDs []string
+}
+
+// FindDuplicateIPAllocations queries ip_allocations for rows where the same
+// ip_address+vpc_id pair is allocated=TRUE for more than one owner_instance_id.
+//
+// This detects violations of invariant I-2 (no two instances share the same IP
+// within a VPC). The query is read-only; no corrective action is taken here.
+//
+// Returns an empty slice when the pool is clean (the expected case).
+// Called by the IP uniqueness reconciler sub-scan on each 5-minute cycle.
+//
+// Source: IP_ALLOCATION_CONTRACT_V1 §anomaly-detection,
+//
+//	IMPLEMENTATION_PLAN_V1 §M6 gate (IP uniqueness reconciler sub-scan),
+//	02-04-system-invariants.md I-2.
+func (r *Repo) FindDuplicateIPAllocations(ctx context.Context) ([]DuplicateIPRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT ip_address, vpc_id, array_agg(owner_instance_id ORDER BY owner_instance_id) AS owners
+		FROM ip_allocations
+		WHERE allocated = TRUE
+		  AND owner_instance_id IS NOT NULL
+		GROUP BY ip_address, vpc_id
+		HAVING count(*) > 1
+		ORDER BY vpc_id, ip_address
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("FindDuplicateIPAllocations: %w", err)
+	}
+	defer rows.Close()
+
+	var out []DuplicateIPRow
+	for rows.Next() {
+		var row DuplicateIPRow
+		if err := rows.Scan(&row.IPAddress, &row.VPCID, &row.OwnerInstanceIDs); err != nil {
+			return nil, fmt.Errorf("FindDuplicateIPAllocations scan: %w", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("FindDuplicateIPAllocations rows: %w", err)
+	}
+	return out, nil
 }
