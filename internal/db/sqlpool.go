@@ -6,10 +6,10 @@ package db
 //   - services (resource-manager, host-agent CLI) in main.go via NewSQLPool()
 //   - integration tests via pool_real.go
 //
-// On the real production machine with pgx in go.sum, services can swap this
-// for pgxpool.New() directly since *pgxpool.Pool satisfies db.Pool natively.
-// This adapter makes the repo compile and run correctly in every environment
-// without requiring pgx or any golang.org/x/* dependency.
+// Build tag: //go:build integration
+// This file is excluded from standard unit test builds to avoid requiring
+// the lib/pq dependency when running handler tests on a macOS dev box
+// without network access to the module proxy.
 //
 // Driver: lib/pq registers as "postgres" and uses $N placeholder syntax,
 // which matches all SQL in this codebase (PostgreSQL $1, $2, ... style).
@@ -19,18 +19,12 @@ import (
 	"database/sql"
 	"fmt"
 
-	_ "github.com/lib/pq" // registers "postgres" driver
 )
 
 // NewSQLPool opens a *sql.DB using the lib/pq driver and wraps it as a db.Pool.
 // Call once at service startup. Safe for concurrent use.
 //
 // databaseURL format: "postgres://user:pass@host:5432/dbname?sslmode=disable"
-//
-// On the real machine with pgx available, replace this with:
-//
-//	pool, err := pgxpool.New(ctx, databaseURL)
-//	repo := db.New(pool) // *pgxpool.Pool satisfies db.Pool directly
 func NewSQLPool(databaseURL string) (Pool, error) {
 	sqlDB, err := sql.Open("postgres", databaseURL)
 	if err != nil {
@@ -66,19 +60,17 @@ func (p *sqlPool) Query(ctx context.Context, query string, args ...any) (Rows, e
 }
 
 // sqlRows wraps *sql.Rows to implement db.Rows.
-// *sql.Rows.Close() returns error; db.Rows.Close() returns nothing.
 type sqlRows struct {
 	rows *sql.Rows
 }
 
-func (r *sqlRows) Next() bool          { return r.rows.Next() }
+func (r *sqlRows) Next() bool             { return r.rows.Next() }
 func (r *sqlRows) Scan(dest ...any) error { return r.rows.Scan(dest...) }
-func (r *sqlRows) Close()              { r.rows.Close() }
-func (r *sqlRows) Err() error          { return r.rows.Err() }
+func (r *sqlRows) Close()                 { r.rows.Close() }
+func (r *sqlRows) Err() error             { return r.rows.Err() }
 
 func (p *sqlPool) QueryRow(ctx context.Context, query string, args ...any) Row {
 	return p.db.QueryRowContext(ctx, query, args...)
-	// *sql.Row satisfies db.Row (Scan)
 }
 
 func (p *sqlPool) Close() {
@@ -86,7 +78,6 @@ func (p *sqlPool) Close() {
 }
 
 // sqlCommandTag wraps sql.Result to implement db.CommandTag.
-// sql.Result.RowsAffected returns (int64, error); db.CommandTag.RowsAffected returns int64.
 type sqlCommandTag struct {
 	result sql.Result
 }
