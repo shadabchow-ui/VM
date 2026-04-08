@@ -468,25 +468,5 @@ func TestDeleteHandler_UsageEndEventWritten(t *testing.T) {
 	}
 }
 
-// ── M3 stub tests ─────────────────────────────────────────────────────────────
-
-func TestStopHandler_ReturnsNotImplemented(t *testing.T) {
-	deps := &Deps{Store: newFakeStore(), Network: &fakeNetwork{}, DefaultVPCID: phase1VPCID, Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
-	if err := NewStopHandler(deps, testLog()).Execute(context.Background(), testJob("x", "INSTANCE_STOP")); err == nil {
-		t.Error("StopHandler returned nil, want error")
-	}
-}
-
-func TestStartHandler_ReturnsNotImplemented(t *testing.T) {
-	deps := &Deps{Store: newFakeStore(), Network: &fakeNetwork{}, DefaultVPCID: phase1VPCID, Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
-	if err := NewStartHandler(deps, testLog()).Execute(context.Background(), testJob("x", "INSTANCE_START")); err == nil {
-		t.Error("StartHandler returned nil, want error")
-	}
-}
-
-func TestRebootHandler_ReturnsNotImplemented(t *testing.T) {
-	deps := &Deps{Store: newFakeStore(), Network: &fakeNetwork{}, DefaultVPCID: phase1VPCID, Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
-	if err := NewRebootHandler(deps, testLog()).Execute(context.Background(), testJob("x", "INSTANCE_REBOOT")); err == nil {
-		t.Error("RebootHandler returned nil, want error")
-	}
-}
+// M3 stub tests removed — stop/start/reboot are fully implemented.
+// Full test coverage is in stop_test.go, start_test.go, reboot_test.go.
