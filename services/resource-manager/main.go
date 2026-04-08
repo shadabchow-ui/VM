@@ -32,6 +32,9 @@ type server struct {
 	inventory *HostInventory
 	ca        *auth.CA
 	log       *slog.Logger
+	// Added for public instance API (PASS 1).
+	repo   *db.Repo
+	region string
 }
 
 func main() {
@@ -97,6 +100,8 @@ func main() {
 		inventory: newHostInventory(repo),
 		ca:        ca,
 		log:       log,
+		repo:      repo,
+		region:    envOr("REGION", "us-east-1"),
 	}
 	httpSrv := &http.Server{
 		Handler:           srv.routes(),

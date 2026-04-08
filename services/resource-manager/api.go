@@ -235,6 +235,10 @@ func (s *server) routes() http.Handler {
 	mux.Handle("/internal/v1/hosts", auth.RequireMTLS(protected))
 	mux.Handle("/internal/v1/hosts/", auth.RequireMTLS(protected))
 
+	// Public instance management API — PASS 1: create, get, list.
+	// Auth middleware added in PASS 2.
+	s.registerInstanceRoutes(mux)
+
 	return mux
 }
 
