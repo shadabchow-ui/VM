@@ -2,31 +2,52 @@ package main
 
 // instance_handlers.go — HTTP handlers for the public instance management API.
 //
-// PASS 1 scope: POST /v1/instances, GET /v1/instances, GET /v1/instances/{id}.
-// No auth middleware yet (added in PASS 2).
-// No idempotency yet (added in PASS 3).
-// No lifecycle actions yet (added in PASS 2).
-// No job status endpoint yet (added in PASS 3).
+// PASS 1: POST /v1/instances, GET /v1/instances, GET /v1/instances/{id}.
+// PASS 2: auth middleware wired, ownership enforced, lifecycle endpoints added:
+//         DELETE /v1/instances/{id}
+//         POST   /v1/instances/{id}/stop
+//         POST   /v1/instances/{id}/start
+//         POST   /v1/instances/{id}/reboot
+// PASS 3 (not yet): idempotency, job status endpoint.
 //
-// Source: 08-01-api-resource-model-and-endpoint-design.md,
-//         INSTANCE_MODEL_V1 §2, §4,
-//         03-02-async-job-model-and-idempotency.md.
+// Control-plane rule: lifecycle handlers enqueue a job via InsertJob.
+// They never call runtime directly. Workers drive all state transitions.
+// Source: JOB_MODEL_V1, core-architecture-blueprint §control-plane semantics.
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/compute-platform/compute-platform/internal/db"
 	"github.com/compute-platform/compute-platform/packages/idgen"
+	statemachine "github.com/compute-platform/compute-platform/packages/state-machine"
 )
 
+// Job type constants — aligned with JOB_MODEL_V1 §3 and worker handler names.
+const (
+	jobTypeStop   = "INSTANCE_STOP"
+	jobTypeStart  = "INSTANCE_START"
+	jobTypeReboot = "INSTANCE_REBOOT"
+	jobTypeDelete = "INSTANCE_DELETE"
+)
+
+// jobMaxAttempts per job type. Source: JOB_MODEL_V1 §3.
+var jobMaxAttempts = map[string]int{
+	jobTypeStop:   5,
+	jobTypeStart:  5,
+	jobTypeReboot: 5,
+	jobTypeDelete: 5,
+}
+
+// ── Route registration ────────────────────────────────────────────────────────
+
 // registerInstanceRoutes registers the public instance API routes.
-// Called from routes() in api.go.
-// No auth middleware in PASS 1 — added in PASS 2.
+// PASS 2: requirePrincipal wraps all handlers.
 func (s *server) registerInstanceRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/v1/instances", s.handleInstanceRoot)
-	mux.HandleFunc("/v1/instances/", s.handleInstanceByID)
+	mux.HandleFunc("/v1/instances", requirePrincipal(s.handleInstanceRoot))
+	mux.HandleFunc("/v1/instances/", requirePrincipal(s.handleInstanceByID))
 }
 
 // handleInstanceRoot dispatches POST /v1/instances and GET /v1/instances.
@@ -41,31 +62,66 @@ func (s *server) handleInstanceRoot(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleInstanceByID dispatches GET /v1/instances/{id}.
-// PASS 1: GET only. DELETE and POST /stop|start|reboot added in PASS 2.
+// handleInstanceByID dispatches based on method and subpath.
+// Routes:
+//   GET    /v1/instances/{id}         → handleGetInstance
+//   DELETE /v1/instances/{id}         → handleDeleteInstance
+//   POST   /v1/instances/{id}/stop    → handleLifecycleAction(stop)
+//   POST   /v1/instances/{id}/start   → handleLifecycleAction(start)
+//   POST   /v1/instances/{id}/reboot  → handleLifecycleAction(reboot)
 func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
-	// Strip the /v1/instances/ prefix and take the first segment as the ID.
-	// Subpaths (e.g. /stop, /jobs/...) are handled in PASS 2 and PASS 3.
-	id := strings.TrimPrefix(r.URL.Path, "/v1/instances/")
-	if id == "" || strings.Contains(id, "/") {
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/instances/")
+	if rest == "" {
 		http.NotFound(w, r)
 		return
 	}
 
-	switch r.Method {
-	case http.MethodGet:
-		s.handleGetInstance(w, r, id)
-	default:
+	parts := strings.SplitN(rest, "/", 2)
+	id := parts[0]
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// /v1/instances/{id}
+	if len(parts) == 1 {
+		switch r.Method {
+		case http.MethodGet:
+			s.handleGetInstance(w, r, id)
+		case http.MethodDelete:
+			s.handleDeleteInstance(w, r, id)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	// /v1/instances/{id}/{subpath}
+	subpath := parts[1]
+	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	switch subpath {
+	case "stop":
+		s.handleLifecycleAction(w, r, id, statemachine.ActionStop, jobTypeStop)
+	case "start":
+		s.handleLifecycleAction(w, r, id, statemachine.ActionStart, jobTypeStart)
+	case "reboot":
+		s.handleLifecycleAction(w, r, id, statemachine.ActionReboot, jobTypeReboot)
+	default:
+		http.NotFound(w, r)
 	}
 }
 
 // ── POST /v1/instances ────────────────────────────────────────────────────────
 
 // handleCreateInstance handles POST /v1/instances.
-// Returns 202 Accepted + CreateInstanceResponse (instance record only in PASS 1).
+// Returns 202 Accepted + CreateInstanceResponse.
 // Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2.
 func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
+	principal, _ := principalFromCtx(r.Context())
+
 	var req CreateInstanceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeAPIError(w, http.StatusBadRequest, errInvalidRequest,
@@ -82,7 +138,7 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	row := &db.InstanceRow{
 		ID:               instanceID,
 		Name:             req.Name,
-		OwnerPrincipalID: ownerFromRequest(r), // placeholder until PASS 2 auth
+		OwnerPrincipalID: principal,
 		VMState:          "requested",
 		InstanceTypeID:   req.InstanceType,
 		ImageID:          req.ImageID,
@@ -95,7 +151,6 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reload to pick up DB-generated created_at / updated_at timestamps.
 	created, err := s.repo.GetInstanceByID(r.Context(), instanceID)
 	if err != nil {
 		s.log.Error("GetInstanceByID after insert failed", "error", err)
@@ -111,13 +166,12 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/instances ─────────────────────────────────────────────────────────
 
 // handleListInstances handles GET /v1/instances.
-// Returns 200 + ListInstancesResponse, scoped to the calling principal.
-// PASS 1: principal derived from placeholder; real auth added in PASS 2.
+// Returns 200 + ListInstancesResponse scoped to the calling principal.
 // Source: 08-01 §ListInstances.
 func (s *server) handleListInstances(w http.ResponseWriter, r *http.Request) {
-	ownerID := ownerFromRequest(r)
+	principal, _ := principalFromCtx(r.Context())
 
-	rows, err := s.repo.ListInstancesByOwner(r.Context(), ownerID)
+	rows, err := s.repo.ListInstancesByOwner(r.Context(), principal)
 	if err != nil {
 		s.log.Error("ListInstancesByOwner failed", "error", err)
 		writeInternalError(w)
@@ -139,23 +193,74 @@ func (s *server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 
 // handleGetInstance handles GET /v1/instances/{id}.
 // Returns 200 + InstanceResponse or 404.
-// PASS 1: no ownership check yet — added in PASS 2.
-// Source: 08-01 §GetInstance.
+// PASS 2: ownership enforced via loadOwnedInstance.
+// Source: 08-01 §GetInstance, AUTH_OWNERSHIP_MODEL_V1 §3.
 func (s *server) handleGetInstance(w http.ResponseWriter, r *http.Request, id string) {
-	row, err := s.repo.GetInstanceByID(r.Context(), id)
-	if err != nil {
-		// GetInstanceByID wraps pgx.ErrNoRows as "no rows in result set".
-		if isNoRows(err) {
-			writeAPIError(w, http.StatusNotFound, errInstanceNotFound,
-				"The instance does not exist.", "id")
-			return
-		}
-		s.log.Error("GetInstanceByID failed", "error", err)
-		writeInternalError(w)
+	principal, _ := principalFromCtx(r.Context())
+
+	row, ok := s.loadOwnedInstance(w, r, principal, id)
+	if !ok {
 		return
 	}
 
 	writeJSON(w, http.StatusOK, instanceToResponse(row, s.region))
+}
+
+// ── DELETE /v1/instances/{id} ─────────────────────────────────────────────────
+
+// handleDeleteInstance handles DELETE /v1/instances/{id}.
+// Returns 202 + LifecycleResponse with the enqueued job_id.
+// Source: 04-02-lifecycle-action-flows.md §INSTANCE_DELETE, JOB_MODEL_V1.
+func (s *server) handleDeleteInstance(w http.ResponseWriter, r *http.Request, id string) {
+	s.handleLifecycleAction(w, r, id, statemachine.ActionDelete, jobTypeDelete)
+}
+
+// ── Lifecycle action shared handler ──────────────────────────────────────────
+
+// handleLifecycleAction is the shared handler for stop, start, reboot, delete.
+// Validates transition, enqueues job, returns 202.
+// Never calls runtime directly — jobs consumed by worker.
+// Source: LIFECYCLE_STATE_MACHINE_V1, JOB_MODEL_V1, 04-02-lifecycle-action-flows.md.
+func (s *server) handleLifecycleAction(
+	w http.ResponseWriter,
+	r *http.Request,
+	id string,
+	action statemachine.Action,
+	jobType string,
+) {
+	principal, _ := principalFromCtx(r.Context())
+
+	row, ok := s.loadOwnedInstance(w, r, principal, id)
+	if !ok {
+		return
+	}
+
+	// Validate state transition before enqueuing.
+	// Source: LIFECYCLE_STATE_MACHINE_V1, API_ERROR_CONTRACT_V1 §4.
+	if _, err := statemachine.Transition(statemachine.State(row.VMState), action); err != nil {
+		writeAPIError(w, http.StatusConflict, errIllegalTransition,
+			fmt.Sprintf("Cannot perform '%s' on an instance in state '%s'.", action, row.VMState),
+			"status")
+		return
+	}
+
+	jobID := idgen.New(idgen.PrefixJob)
+	if err := s.repo.InsertJob(r.Context(), &db.JobRow{
+		ID:          jobID,
+		InstanceID:  row.ID,
+		JobType:     jobType,
+		MaxAttempts: jobMaxAttempts[jobType],
+	}); err != nil {
+		s.log.Error("InsertJob failed", "job_type", jobType, "error", err)
+		writeInternalError(w)
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, LifecycleResponse{
+		InstanceID: row.ID,
+		JobID:      jobID,
+		Action:     string(action),
+	})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -163,7 +268,6 @@ func (s *server) handleGetInstance(w http.ResponseWriter, r *http.Request, id st
 // instanceToResponse maps a db.InstanceRow to the canonical InstanceResponse.
 // Source: INSTANCE_MODEL_V1 §2, §4.
 func instanceToResponse(row *db.InstanceRow, region string) InstanceResponse {
-	labels := map[string]string{}
 	return InstanceResponse{
 		ID:               row.ID,
 		Name:             row.Name,
@@ -172,21 +276,13 @@ func instanceToResponse(row *db.InstanceRow, region string) InstanceResponse {
 		ImageID:          row.ImageID,
 		AvailabilityZone: row.AvailabilityZone,
 		Region:           region,
-		Labels:           labels,
+		Labels:           map[string]string{},
 		CreatedAt:        row.CreatedAt,
 		UpdatedAt:        row.UpdatedAt,
 	}
 }
 
-// ownerFromRequest returns the principal ID for the request.
-// PASS 1 placeholder: reads the X-Principal-ID header directly (no validation).
-// Replaced in PASS 2 by requirePrincipal middleware + principalFromCtx.
-func ownerFromRequest(r *http.Request) string {
-	return r.Header.Get("X-Principal-ID")
-}
-
 // isNoRows detects the "no rows" error returned by the DB layer.
-// The repo wraps pgx.ErrNoRows as a string containing "no rows in result set".
 func isNoRows(err error) bool {
 	if err == nil {
 		return false

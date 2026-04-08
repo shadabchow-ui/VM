@@ -27,6 +27,8 @@ const (
 	errInvalidRequest      = "invalid_request"
 	errInstanceNotFound    = "instance_not_found"
 	errInternalError       = "internal_error"
+	errAuthRequired        = "authentication_required"
+	errIllegalTransition   = "illegal_state_transition"
 )
 
 // apiError is the structured error envelope sent in every error response.

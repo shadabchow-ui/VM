@@ -54,3 +54,14 @@ type ListInstancesResponse struct {
 	Instances []InstanceResponse `json:"instances"`
 	Total     int                `json:"total"`
 }
+
+// ── Lifecycle action response ─────────────────────────────────────────────────
+
+// LifecycleResponse is returned by delete/stop/start/reboot endpoints.
+// Contains the enqueued job_id so the caller can poll for completion.
+// Source: JOB_MODEL_V1 §1, 08-01 §lifecycle endpoints.
+type LifecycleResponse struct {
+	InstanceID string `json:"instance_id"`
+	JobID      string `json:"job_id"`
+	Action     string `json:"action"`
+}
