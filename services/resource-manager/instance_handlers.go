@@ -120,6 +120,16 @@ func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// GET /v1/instances/{id}/events  (M7)
+	if subpath == "events" {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleListEvents(w, r, id)
+		return
+	}
+
 	// POST lifecycle subpaths.
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -169,8 +179,9 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 				writeInternalError(w)
 				return
 			}
+			ip183, _ := s.repo.GetIPByInstance(r.Context(), existing.InstanceID)
 			writeJSON(w, http.StatusAccepted, CreateInstanceResponse{
-				Instance: instanceToResponse(inst, s.region),
+				Instance: instanceToResponse(inst, s.region, ip183),
 			})
 			return
 		}
@@ -229,8 +240,9 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip242, _ := s.repo.GetIPByInstance(r.Context(), created.ID)
 	writeJSON(w, http.StatusAccepted, CreateInstanceResponse{
-		Instance: instanceToResponse(created, s.region),
+		Instance: instanceToResponse(created, s.region, ip242),
 	})
 }
 
@@ -251,7 +263,8 @@ func (s *server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]InstanceResponse, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, instanceToResponse(row, s.region))
+		ip264, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
+		out = append(out, instanceToResponse(row, s.region, ip264))
 	}
 
 	writeJSON(w, http.StatusOK, ListInstancesResponse{
@@ -274,7 +287,8 @@ func (s *server) handleGetInstance(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
-	writeJSON(w, http.StatusOK, instanceToResponse(row, s.region))
+	ip287, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
+	writeJSON(w, http.StatusOK, instanceToResponse(row, s.region, ip287))
 }
 
 // ── DELETE /v1/instances/{id} ─────────────────────────────────────────────────
@@ -417,9 +431,10 @@ func (s *server) handleGetJob(w http.ResponseWriter, r *http.Request, instanceID
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // instanceToResponse maps a db.InstanceRow to the canonical InstanceResponse.
+// M7: ip param carries the allocated IP from GetIPByInstance (empty string = nil fields).
 // Source: INSTANCE_MODEL_V1 §2, §4.
-func instanceToResponse(row *db.InstanceRow, region string) InstanceResponse {
-	return InstanceResponse{
+func instanceToResponse(row *db.InstanceRow, region, ip string) InstanceResponse {
+	resp := InstanceResponse{
 		ID:               row.ID,
 		Name:             row.Name,
 		Status:           row.VMState,
@@ -431,6 +446,13 @@ func instanceToResponse(row *db.InstanceRow, region string) InstanceResponse {
 		CreatedAt:        row.CreatedAt,
 		UpdatedAt:        row.UpdatedAt,
 	}
+	if ip != "" {
+		// Phase 1: single VPC, public and private IP are both the allocated address.
+		// NAT model documented in 07-01-phase-1-network-architecture.
+		resp.PublicIP = &ip
+		resp.PrivateIP = &ip
+	}
+	return resp
 }
 
 // jobToResponse maps a db.JobRow to the canonical JobResponse.

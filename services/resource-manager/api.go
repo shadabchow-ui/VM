@@ -34,7 +34,7 @@ type csrRequest struct {
 }
 
 type csrResponse struct {
-	CertPEM   string `json:"cert_pem"`   // signed client cert for the host agent
+	CertPEM   string `json:"cert_pem"`    // signed client cert for the host agent
 	CACertPEM string `json:"ca_cert_pem"` // CA cert for server verification
 }
 
@@ -239,7 +239,28 @@ func (s *server) routes() http.Handler {
 	// Auth middleware added in PASS 2.
 	s.registerInstanceRoutes(mux)
 
-	return mux
+	// M7: SSH key management.
+	s.registerSSHKeyRoutes(mux)
+
+	// M7: CORS middleware so the browser console SPA can call the API.
+	// In production this is handled by the API gateway / reverse proxy.
+	return corsMiddleware(mux)
+}
+
+// corsMiddleware adds CORS headers to allow the console SPA (running on a
+// different origin during development) to reach the resource-manager API.
+// Source: M7 console requirement — browser-accessible API.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Principal-ID, Idempotency-Key")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // handleHostsSubpath routes /internal/v1/hosts/{id}/heartbeat to the right handler.
