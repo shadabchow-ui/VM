@@ -16,6 +16,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	_ "github.com/lib/pq"
 	"log/slog"
 	"net"
 	"net/http"
