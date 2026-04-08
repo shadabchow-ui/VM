@@ -5,6 +5,8 @@ package main
 // All public-facing errors flow through writeAPIError.
 // Internal details (DB errors, stack traces) are never written to responses.
 //
+// PASS 3: Added errJobNotFound, errIdempotencyMismatch error codes.
+//
 // Source: API_ERROR_CONTRACT_V1 §1 (envelope shape),
 //         §2 (HTTP status mapping),
 //         §4 (error code catalog),
@@ -26,9 +28,11 @@ const (
 	errInvalidName         = "invalid_name"
 	errInvalidRequest      = "invalid_request"
 	errInstanceNotFound    = "instance_not_found"
+	errJobNotFound         = "job_not_found"
 	errInternalError       = "internal_error"
 	errAuthRequired        = "authentication_required"
 	errIllegalTransition   = "illegal_state_transition"
+	errIdempotencyMismatch = "idempotency_key_mismatch"
 )
 
 // apiError is the structured error envelope sent in every error response.

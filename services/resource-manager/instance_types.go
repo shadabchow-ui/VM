@@ -2,11 +2,11 @@ package main
 
 // instance_types.go — Public API request/response DTOs.
 //
-// PASS 1 scope: CreateInstanceRequest, InstanceResponse, ListInstancesResponse.
-// Job fields and lifecycle action responses are added in later passes.
+// PASS 1: CreateInstanceRequest, InstanceResponse, ListInstancesResponse.
+// PASS 2: LifecycleResponse.
+// PASS 3: JobResponse for GET /v1/instances/{id}/jobs/{job_id}.
 //
-// Source: INSTANCE_MODEL_V1 §2 (canonical API resource shape),
-//         08-01-api-resource-model-and-endpoint-design.md §3.
+// Source: INSTANCE_MODEL_V1 §2, JOB_MODEL_V1 §1, 08-01 §3.
 
 import "time"
 
@@ -64,4 +64,23 @@ type LifecycleResponse struct {
 	InstanceID string `json:"instance_id"`
 	JobID      string `json:"job_id"`
 	Action     string `json:"action"`
+}
+
+// ── Job status response ───────────────────────────────────────────────────────
+
+// JobResponse is the canonical JSON shape for GET /v1/instances/{id}/jobs/{job_id}.
+// Only exposes fields appropriate for external clients per JOB_MODEL_V1 §1.
+// Internal-only fields (idempotency_key, claimed_at) are not exposed.
+// Source: JOB_MODEL_V1 §1, 08-01 §job status endpoint.
+type JobResponse struct {
+	ID           string     `json:"id"`
+	InstanceID   string     `json:"instance_id"`
+	JobType      string     `json:"job_type"`
+	Status       string     `json:"status"`
+	AttemptCount int        `json:"attempt_count"`
+	MaxAttempts  int        `json:"max_attempts"`
+	ErrorMessage *string    `json:"error_message,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 }

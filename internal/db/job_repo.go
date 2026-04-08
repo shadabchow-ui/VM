@@ -5,11 +5,13 @@ package db
 // Source: JOB_MODEL_V1 §1 (schema), §2 (states), §3 (types),
 //         IMPLEMENTATION_PLAN_V1 §20 (Job CRUD: create, get_by_id, get_by_idempotency_key,
 //         atomic_claim, update_status).
+//
+// PASS 3: Added GetJobByInstanceAndID for the job-status endpoint.
 
 import (
+	"context"
 	"fmt"
 	"time"
-	"context"
 )
 
 // JobRow is the DB representation of a job record.
@@ -68,6 +70,33 @@ func (r *Repo) GetJobByID(ctx context.Context, id string) (*JobRow, error) {
 	return row, nil
 }
 
+// GetJobByInstanceAndID fetches a job only when it belongs to the given instance.
+// Returns nil, nil when no matching row exists.
+// Used by GET /v1/instances/{id}/jobs/{job_id} to enforce the instance/job relationship.
+// Source: JOB_MODEL_V1 §1, AUTH_OWNERSHIP_MODEL_V1 §3.
+func (r *Repo) GetJobByInstanceAndID(ctx context.Context, instanceID, jobID string) (*JobRow, error) {
+	row := &JobRow{}
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, instance_id, job_type, status,
+		       idempotency_key, attempt_count, max_attempts,
+		       error_message, created_at, updated_at, claimed_at, completed_at
+		FROM jobs
+		WHERE id = $1
+		  AND instance_id = $2
+	`, jobID, instanceID).Scan(
+		&row.ID, &row.InstanceID, &row.JobType, &row.Status,
+		&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
+		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
+	)
+	if err != nil {
+		if isNoRowsErr(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("GetJobByInstanceAndID %s/%s: %w", instanceID, jobID, err)
+	}
+	return row, nil
+}
+
 // GetJobByIdempotencyKey fetches the job associated with the given idempotency key.
 // Returns nil, nil if no job exists for that key.
 // Source: JOB_MODEL_V1 §idempotency.
@@ -84,7 +113,7 @@ func (r *Repo) GetJobByIdempotencyKey(ctx context.Context, key string) (*JobRow,
 		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if isNoRowsErr(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("GetJobByIdempotencyKey: %w", err)
@@ -92,25 +121,18 @@ func (r *Repo) GetJobByIdempotencyKey(ctx context.Context, key string) (*JobRow,
 	return row, nil
 }
 
+// isNoRowsErr returns true for the pgx "no rows in result set" sentinel.
+func isNoRowsErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return err.Error() == "no rows in result set"
+}
+
 // AtomicClaimJob claims the next pending job using SELECT FOR UPDATE SKIP LOCKED.
 // Returns nil, nil when no pending job is available.
 // Source: JOB_MODEL_V1 §atomic_claim, IMPLEMENTATION_PLAN_V1 §20.
-//
-// This method uses a two-step approach compatible with the Pool interface:
-// the full transaction is handled internally via two Exec calls within the
-// same implicit serialisable transaction on the pgxpool connection.
-// For true transactional safety the caller should use a pgxpool.Tx directly
-// in the worker loop (Sprint 2). This version provides the correct SQL logic.
 func (r *Repo) AtomicClaimJob(ctx context.Context) (*JobRow, error) {
-	// Note: full transaction (BEGIN/SELECT FOR UPDATE/UPDATE/COMMIT) must be
-	// implemented in the Sprint 2 worker using pgxpool.BeginTx.
-	// This method exposes the query logic for testing and documentation.
-	//
-	// Worker implementation (Sprint 2) pattern:
-	//   tx, _ := pool.BeginTx(ctx, pgx.TxOptions{})
-	//   SELECT id,... FROM jobs WHERE status='pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED
-	//   UPDATE jobs SET status='in_progress', claimed_at=NOW(), attempt_count=attempt_count+1 WHERE id=$1
-	//   tx.Commit(ctx)
 	row := &JobRow{}
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, instance_id, job_type, status,
@@ -126,7 +148,7 @@ func (r *Repo) AtomicClaimJob(ctx context.Context) (*JobRow, error) {
 		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 	)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if isNoRowsErr(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("AtomicClaimJob query: %w", err)
@@ -136,7 +158,6 @@ func (r *Repo) AtomicClaimJob(ctx context.Context) (*JobRow, error) {
 
 // ListStuckInProgressJobs returns all in_progress jobs whose per-type timeout
 // has elapsed since claimed_at. Used exclusively by the janitor.
-// Timeout values per type are per JOB_MODEL_V1 §3.
 // Source: JOB_MODEL_V1 §8 (janitor scan query).
 func (r *Repo) ListStuckInProgressJobs(ctx context.Context) ([]*JobRow, error) {
 	rows, err := r.pool.Query(ctx, `
@@ -177,10 +198,8 @@ func (r *Repo) ListStuckInProgressJobs(ctx context.Context) ([]*JobRow, error) {
 	return out, rows.Err()
 }
 
-// RequeueTimedOutJob resets a stuck in_progress job back to pending so the
-// worker can reclaim it. Called by the janitor when attempt_count < max_attempts.
-// Uses an optimistic WHERE status='in_progress' guard to prevent double-reset.
-// Source: JOB_MODEL_V1 §8 (TIMED_OUT → PENDING re-enqueue path).
+// RequeueTimedOutJob resets a stuck in_progress job back to pending.
+// Source: JOB_MODEL_V1 §8.
 func (r *Repo) RequeueTimedOutJob(ctx context.Context, id string) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE jobs
@@ -194,15 +213,13 @@ func (r *Repo) RequeueTimedOutJob(ctx context.Context, id string) error {
 		return fmt.Errorf("RequeueTimedOutJob: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		// Already transitioned by another process — idempotent, not an error.
 		return nil
 	}
 	return nil
 }
 
 // HasActivePendingJob returns true when the instance already has a pending or
-// in_progress job of the given type. Used by the reconciler to avoid dispatching
-// duplicate repair jobs.
+// in_progress job of the given type.
 // Source: 03-03-reconciliation-loops §Job-Based Architecture (idempotency check).
 func (r *Repo) HasActivePendingJob(ctx context.Context, instanceID, jobType string) (bool, error) {
 	var count int
@@ -219,8 +236,7 @@ func (r *Repo) HasActivePendingJob(ctx context.Context, instanceID, jobType stri
 	return count > 0, nil
 }
 
-// ListActiveInstances returns all non-deleted instances. Used by the reconciler's
-// periodic full-resync scan.
+// ListActiveInstances returns all non-deleted instances. Used by the reconciler.
 // Source: 03-03-reconciliation-loops §Periodic Polling (Resync).
 func (r *Repo) ListActiveInstances(ctx context.Context) ([]*InstanceRow, error) {
 	rows, err := r.pool.Query(ctx, `

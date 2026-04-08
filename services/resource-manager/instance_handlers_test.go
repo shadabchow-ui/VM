@@ -1,26 +1,25 @@
 package main
 
-// instance_handlers_test.go — PASS 1 + PASS 2 tests for the public instance API.
+// instance_handlers_test.go — PASS 1 + PASS 2 + PASS 3 tests.
 //
-// PASS 1 coverage (unchanged behaviour, headers fixed for auth middleware):
-//   - POST /v1/instances: happy path, validation failures, error envelope shape
-//   - GET  /v1/instances/{id}: happy path, not found
-//   - GET  /v1/instances: list scoped to principal, empty list, response shape
-//   - Error envelope: request_id always present, details never null
-//   - Validation unit: name regexp
-//
-// PASS 2 coverage (new):
-//   AUTH:
-//     - missing X-Principal-ID → 401 authentication_required
-//     - all endpoints enforce auth
-//   OWNERSHIP:
-//     - access own instance → 200
-//     - access other user's instance → 404 (not 403)
-//     - delete/stop/start/reboot on other user's instance → 404
-//   LIFECYCLE:
-//     - stop/start/reboot/delete happy paths → 202 + job_id
-//     - illegal state transitions → 409 illegal_state_transition
-//     - lifecycle on non-existent instance → 404
+// PASS 1/2 coverage: unchanged.
+// PASS 3 coverage (new):
+//   IDEMPOTENCY — CREATE:
+//     - Same key + same request → stable 202, same instance returned
+//     - Different key → distinct new instance
+//     - No key → normal behavior preserved
+//   IDEMPOTENCY — LIFECYCLE ACTIONS:
+//     - Same key + same stop/start/reboot → stable 202, same job_id
+//     - Same key on different instance → 409 idempotency_key_mismatch
+//     - Different key → distinct job
+//     - No key → normal behavior preserved
+//   JOB STATUS ENDPOINT:
+//     - Happy path: GET /v1/instances/{id}/jobs/{job_id} → 202 + JobResponse
+//     - Job not found → 404 job_not_found
+//     - Wrong instance/job pairing → 404 job_not_found
+//     - Wrong owner → 404 (instance ownership enforced first)
+//     - Missing auth → 401
+//     - Response shape: all required fields present
 //
 // Test strategy: in-process httptest.Server backed by memPool (fake db.Pool).
 // No DB, no Linux/KVM, no network required.
@@ -45,16 +44,20 @@ import (
 // ── in-memory Pool ────────────────────────────────────────────────────────────
 
 // memPool is a fake db.Pool for handler tests.
-// Covers: InsertInstance, GetInstanceByID, ListInstancesByOwner, InsertJob.
+// PASS 3: extended QueryRow dispatch to support:
+//   - GetJobByIdempotencyKey  (FROM jobs WHERE idempotency_key = $1)
+//   - GetJobByInstanceAndID   (FROM jobs WHERE id = $1 AND instance_id = $2)
 type memPool struct {
-	instances map[string]*db.InstanceRow
-	jobs      map[string]*db.JobRow
+	instances     map[string]*db.InstanceRow
+	jobs          map[string]*db.JobRow
+	jobsByIdemKey map[string]*db.JobRow // idempotency_key → job
 }
 
 func newMemPool() *memPool {
 	return &memPool{
-		instances: make(map[string]*db.InstanceRow),
-		jobs:      make(map[string]*db.JobRow),
+		instances:     make(map[string]*db.InstanceRow),
+		jobs:          make(map[string]*db.JobRow),
+		jobsByIdemKey: make(map[string]*db.JobRow),
 	}
 }
 
@@ -73,11 +76,32 @@ func (p *memPool) seed(row *db.InstanceRow) {
 	p.instances[row.ID] = row
 }
 
+// seedJob adds a job directly (used in test setup for job-status tests).
+func (p *memPool) seedJob(row *db.JobRow) {
+	now := time.Now()
+	if row.CreatedAt.IsZero() {
+		row.CreatedAt = now
+	}
+	if row.UpdatedAt.IsZero() {
+		row.UpdatedAt = now
+	}
+	if row.Status == "" {
+		row.Status = "pending"
+	}
+	p.jobs[row.ID] = row
+	if row.IdempotencyKey != "" {
+		p.jobsByIdemKey[row.IdempotencyKey] = row
+	}
+}
+
 // Exec handles INSERT INTO instances and INSERT INTO jobs.
 // InsertInstance arg order (instance_repo.go):
-//   $1=id, $2=name, $3=owner_principal_id, $4=instance_type_id, $5=image_id, $6=availability_zone
+//
+//	$1=id, $2=name, $3=owner_principal_id, $4=instance_type_id, $5=image_id, $6=availability_zone
+//
 // InsertJob arg order (job_repo.go):
-//   $1=id, $2=instance_id, $3=job_type, $4=idempotency_key, $5=max_attempts
+//
+//	$1=id, $2=instance_id, $3=job_type, $4=idempotency_key, $5=max_attempts
 func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTag, error) {
 	switch {
 	case strings.Contains(sql, "INSERT INTO instances"):
@@ -99,14 +123,26 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 	case strings.Contains(sql, "INSERT INTO jobs"):
 		// $1=id, $2=instance_id, $3=job_type, $4=idempotency_key, $5=max_attempts
 		id := asStr(args[0])
+		ikey := asStr(args[3])
+		// ON CONFLICT (idempotency_key) DO NOTHING simulation.
+		if ikey != "" {
+			if _, exists := p.jobsByIdemKey[ikey]; exists {
+				return &fakeTag{0}, nil
+			}
+		}
 		now := time.Now()
-		p.jobs[id] = &db.JobRow{
-			ID:         id,
-			InstanceID: asStr(args[1]),
-			JobType:    asStr(args[2]),
-			Status:     "pending",
-			CreatedAt:  now,
-			UpdatedAt:  now,
+		row := &db.JobRow{
+			ID:             id,
+			InstanceID:     asStr(args[1]),
+			JobType:        asStr(args[2]),
+			IdempotencyKey: ikey,
+			Status:         "pending",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		p.jobs[id] = row
+		if ikey != "" {
+			p.jobsByIdemKey[ikey] = row
 		}
 		return &fakeTag{1}, nil
 	}
@@ -128,15 +164,39 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 	return &instRows{}, nil
 }
 
-// QueryRow handles GetInstanceByID.
+// QueryRow handles:
+//   - GetInstanceByID           (FROM instances WHERE id = $1)
+//   - GetJobByIdempotencyKey    (FROM jobs WHERE idempotency_key = $1)
+//   - GetJobByInstanceAndID     (FROM jobs WHERE id = $1 AND instance_id = $2)
 func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
-	if strings.Contains(sql, "FROM instances") && strings.Contains(sql, "id = $1") {
+	switch {
+	// GetInstanceByID
+	case strings.Contains(sql, "FROM instances") && strings.Contains(sql, "id = $1"):
 		id := asStr(args[0])
 		r, ok := p.instances[id]
 		if !ok || r.DeletedAt != nil {
 			return &errRow{fmt.Errorf("GetInstanceByID %s: no rows in result set", id)}
 		}
 		return &instRow{r: r}
+
+	// GetJobByIdempotencyKey: WHERE idempotency_key = $1
+	case strings.Contains(sql, "FROM jobs") && strings.Contains(sql, "idempotency_key = $1"):
+		key := asStr(args[0])
+		job, ok := p.jobsByIdemKey[key]
+		if !ok {
+			return &errRow{fmt.Errorf("no rows in result set")}
+		}
+		return &jobRow{r: job}
+
+	// GetJobByInstanceAndID: WHERE id = $1 AND instance_id = $2
+	case strings.Contains(sql, "FROM jobs") && strings.Contains(sql, "instance_id = $2"):
+		jobID := asStr(args[0])
+		instanceID := asStr(args[1])
+		job, ok := p.jobs[jobID]
+		if !ok || job.InstanceID != instanceID {
+			return &errRow{fmt.Errorf("no rows in result set")}
+		}
+		return &jobRow{r: job}
 	}
 	return &errRow{fmt.Errorf("no rows in result set")}
 }
@@ -176,6 +236,32 @@ func (row *instRow) Scan(dest ...any) error {
 	*dest[9].(*time.Time) = r.CreatedAt
 	*dest[10].(*time.Time) = r.UpdatedAt
 	*dest[11].(**time.Time) = r.DeletedAt
+	return nil
+}
+
+// jobRow scans a single JobRow.
+// Column order matches GetJobByID / GetJobByIdempotencyKey / GetJobByInstanceAndID SELECT:
+// id, instance_id, job_type, status, idempotency_key, attempt_count, max_attempts,
+// error_message, created_at, updated_at, claimed_at, completed_at
+type jobRow struct{ r *db.JobRow }
+
+func (row *jobRow) Scan(dest ...any) error {
+	r := row.r
+	if len(dest) < 12 {
+		return fmt.Errorf("jobRow.Scan: need 12 dest, got %d", len(dest))
+	}
+	*dest[0].(*string) = r.ID
+	*dest[1].(*string) = r.InstanceID
+	*dest[2].(*string) = r.JobType
+	*dest[3].(*string) = r.Status
+	*dest[4].(*string) = r.IdempotencyKey
+	*dest[5].(*int) = r.AttemptCount
+	*dest[6].(*int) = r.MaxAttempts
+	*dest[7].(**string) = r.ErrorMessage
+	*dest[8].(*time.Time) = r.CreatedAt
+	*dest[9].(*time.Time) = r.UpdatedAt
+	*dest[10].(**time.Time) = r.ClaimedAt
+	*dest[11].(**time.Time) = r.CompletedAt
 	return nil
 }
 
@@ -242,13 +328,18 @@ func newTestSrv(t *testing.T) *testSrv {
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-// alice is the default test principal.
 const alice = "princ_alice"
 const bob = "princ_bob"
 
-// authHdr returns a header map with X-Principal-ID set to principal.
 func authHdr(principal string) map[string]string {
 	return map[string]string{"X-Principal-ID": principal}
+}
+
+func authHdrWithIkey(principal, ikey string) map[string]string {
+	return map[string]string{
+		"X-Principal-ID":  principal,
+		"Idempotency-Key": ikey,
+	}
 }
 
 func doReq(t *testing.T, ts *httptest.Server, method, path string, body any, headers map[string]string) *http.Response {
@@ -314,7 +405,421 @@ func seedInstance(mem *memPool, id, name, owner, vmState string) {
 	})
 }
 
-// ── PASS 2: Auth tests ────────────────────────────────────────────────────────
+// ── PASS 3: Idempotency — Create ─────────────────────────────────────────────
+
+// TestIdempotency_Create_SameKey verifies that repeating POST /v1/instances with
+// the same Idempotency-Key returns the same instance without creating a duplicate.
+// Source: JOB_MODEL_V1 §6.
+func TestIdempotency_Create_SameKey(t *testing.T) {
+	s := newTestSrv(t)
+	hdrs := authHdrWithIkey(alice, "ikey-create-001")
+
+	resp1 := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), hdrs)
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("first create: want 202, got %d", resp1.StatusCode)
+	}
+	var out1 CreateInstanceResponse
+	decodeBody(t, resp1, &out1)
+
+	// Repeat with the same idempotency key.
+	resp2 := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), hdrs)
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("duplicate create: want 202, got %d", resp2.StatusCode)
+	}
+	var out2 CreateInstanceResponse
+	decodeBody(t, resp2, &out2)
+
+	if out1.Instance.ID != out2.Instance.ID {
+		t.Errorf("idempotent create: want same instance_id %q, got %q", out1.Instance.ID, out2.Instance.ID)
+	}
+	// Only one instance should exist in the store.
+	if len(s.mem.instances) != 1 {
+		t.Errorf("want 1 instance in store, got %d", len(s.mem.instances))
+	}
+}
+
+// TestIdempotency_Create_DifferentKey verifies that a different key creates a new instance.
+// Source: JOB_MODEL_V1 §6.
+func TestIdempotency_Create_DifferentKey(t *testing.T) {
+	s := newTestSrv(t)
+
+	resp1 := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), authHdrWithIkey(alice, "key-A"))
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("first create: want 202, got %d", resp1.StatusCode)
+	}
+	var out1 CreateInstanceResponse
+	decodeBody(t, resp1, &out1)
+
+	resp2 := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), authHdrWithIkey(alice, "key-B"))
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("second create: want 202, got %d", resp2.StatusCode)
+	}
+	var out2 CreateInstanceResponse
+	decodeBody(t, resp2, &out2)
+
+	if out1.Instance.ID == out2.Instance.ID {
+		t.Error("different idempotency keys must produce distinct instances")
+	}
+}
+
+// TestIdempotency_Create_NoKey verifies that omitting Idempotency-Key preserves
+// current create behavior (no deduplication, no error).
+// Source: PASS 3 instruction: "If absent: preserve current behavior".
+func TestIdempotency_Create_NoKey(t *testing.T) {
+	s := newTestSrv(t)
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("create without ikey: want 202, got %d", resp.StatusCode)
+	}
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+	if out.Instance.ID == "" {
+		t.Error("want non-empty instance ID")
+	}
+}
+
+// ── PASS 3: Idempotency — Lifecycle actions ───────────────────────────────────
+
+// TestIdempotency_Stop_SameKey verifies repeated stop with same key returns same job_id.
+// Source: JOB_MODEL_V1 §6.
+func TestIdempotency_Stop_SameKey(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_idem_stop", "idem-stop", alice, "running")
+	hdrs := authHdrWithIkey(alice, "ikey-stop-001")
+
+	resp1 := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_idem_stop/stop", nil, hdrs)
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("first stop: want 202, got %d", resp1.StatusCode)
+	}
+	var out1 LifecycleResponse
+	decodeBody(t, resp1, &out1)
+
+	resp2 := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_idem_stop/stop", nil, hdrs)
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("duplicate stop: want 202, got %d", resp2.StatusCode)
+	}
+	var out2 LifecycleResponse
+	decodeBody(t, resp2, &out2)
+
+	if out1.JobID != out2.JobID {
+		t.Errorf("idempotent stop: want same job_id %q, got %q", out1.JobID, out2.JobID)
+	}
+	// Only one job should exist (ON CONFLICT DO NOTHING).
+	if len(s.mem.jobs) != 1 {
+		t.Errorf("want exactly 1 job in store, got %d", len(s.mem.jobs))
+	}
+}
+
+// TestIdempotency_Start_SameKey verifies repeated start with same key returns same job_id.
+func TestIdempotency_Start_SameKey(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_idem_start", "idem-start", alice, "stopped")
+	hdrs := authHdrWithIkey(alice, "ikey-start-001")
+
+	resp1 := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_idem_start/start", nil, hdrs)
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("first start: want 202, got %d", resp1.StatusCode)
+	}
+	var out1 LifecycleResponse
+	decodeBody(t, resp1, &out1)
+
+	resp2 := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_idem_start/start", nil, hdrs)
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("duplicate start: want 202, got %d", resp2.StatusCode)
+	}
+	var out2 LifecycleResponse
+	decodeBody(t, resp2, &out2)
+
+	if out1.JobID != out2.JobID {
+		t.Errorf("idempotent start: want same job_id %q, got %q", out1.JobID, out2.JobID)
+	}
+}
+
+// TestIdempotency_Reboot_SameKey verifies repeated reboot with same key returns same job_id.
+func TestIdempotency_Reboot_SameKey(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_idem_reboot", "idem-reboot", alice, "running")
+	hdrs := authHdrWithIkey(alice, "ikey-reboot-001")
+
+	resp1 := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_idem_reboot/reboot", nil, hdrs)
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("first reboot: want 202, got %d", resp1.StatusCode)
+	}
+	var out1 LifecycleResponse
+	decodeBody(t, resp1, &out1)
+
+	resp2 := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_idem_reboot/reboot", nil, hdrs)
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("duplicate reboot: want 202, got %d", resp2.StatusCode)
+	}
+	var out2 LifecycleResponse
+	decodeBody(t, resp2, &out2)
+
+	if out1.JobID != out2.JobID {
+		t.Errorf("idempotent reboot: want same job_id %q, got %q", out1.JobID, out2.JobID)
+	}
+}
+
+// TestIdempotency_Lifecycle_DifferentKey verifies a different key creates a distinct job.
+func TestIdempotency_Lifecycle_DifferentKey(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_idem_diff", "idem-diff", alice, "running")
+
+	resp1 := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_idem_diff/stop", nil, authHdrWithIkey(alice, "key-X"))
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("first stop (key-X): want 202, got %d", resp1.StatusCode)
+	}
+	var out1 LifecycleResponse
+	decodeBody(t, resp1, &out1)
+
+	// Reset state so the second stop is valid.
+	s.mem.instances["inst_idem_diff"].VMState = "running"
+
+	resp2 := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_idem_diff/stop", nil, authHdrWithIkey(alice, "key-Y"))
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("second stop (key-Y): want 202, got %d", resp2.StatusCode)
+	}
+	var out2 LifecycleResponse
+	decodeBody(t, resp2, &out2)
+
+	if out1.JobID == out2.JobID {
+		t.Error("different idempotency keys must produce distinct job IDs")
+	}
+}
+
+// TestIdempotency_Lifecycle_SameKeyDifferentInstance verifies 409 when the same
+// idempotency key is reused for a different instance.
+// Source: JOB_MODEL_V1 §6 (payload differs → reject with 409).
+func TestIdempotency_Lifecycle_SameKeyDifferentInstance(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_A", "inst-a", alice, "running")
+	seedInstance(s.mem, "inst_B", "inst-b", alice, "running")
+	hdrs := authHdrWithIkey(alice, "ikey-conflict-001")
+
+	// First stop on inst_A succeeds.
+	resp1 := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_A/stop", nil, hdrs)
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("stop inst_A: want 202, got %d", resp1.StatusCode)
+	}
+	resp1.Body.Close()
+
+	// Same key on inst_B must conflict.
+	resp2 := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_B/stop", nil, hdrs)
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("reuse key on different instance: want 409, got %d", resp2.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp2, &env)
+	if env.Error.Code != errIdempotencyMismatch {
+		t.Errorf("want code %q, got %q", errIdempotencyMismatch, env.Error.Code)
+	}
+	if env.Error.RequestID == "" {
+		t.Error("request_id must be present on 409")
+	}
+}
+
+// TestIdempotency_Lifecycle_NoKey verifies that omitting Idempotency-Key
+// preserves normal lifecycle behavior (no error, no deduplication).
+func TestIdempotency_Lifecycle_NoKey(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_nokey", "no-key", alice, "running")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_nokey/stop", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("stop without ikey: want 202, got %d", resp.StatusCode)
+	}
+	var out LifecycleResponse
+	decodeBody(t, resp, &out)
+	if out.JobID == "" {
+		t.Error("want non-empty job_id")
+	}
+}
+
+// ── PASS 3: Job status endpoint ───────────────────────────────────────────────
+
+// TestGetJob_Happy verifies GET /v1/instances/{id}/jobs/{job_id} returns
+// 202 + well-formed JobResponse.
+// Source: JOB_MODEL_V1 §1, 08-01 §job status endpoint.
+func TestGetJob_Happy(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_jq", "job-query", alice, "running")
+	s.mem.seedJob(&db.JobRow{
+		ID:         "job_abc123",
+		InstanceID: "inst_jq",
+		JobType:    jobTypeStop,
+		Status:     "pending",
+	})
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances/inst_jq/jobs/job_abc123", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202, got %d", resp.StatusCode)
+	}
+	var out JobResponse
+	decodeBody(t, resp, &out)
+
+	if out.ID != "job_abc123" {
+		t.Errorf("want id=job_abc123, got %q", out.ID)
+	}
+	if out.InstanceID != "inst_jq" {
+		t.Errorf("want instance_id=inst_jq, got %q", out.InstanceID)
+	}
+	if out.JobType != jobTypeStop {
+		t.Errorf("want job_type=%q, got %q", jobTypeStop, out.JobType)
+	}
+	if out.Status != "pending" {
+		t.Errorf("want status=pending, got %q", out.Status)
+	}
+	if out.CreatedAt.IsZero() {
+		t.Error("want non-zero created_at")
+	}
+	if out.UpdatedAt.IsZero() {
+		t.Error("want non-zero updated_at")
+	}
+}
+
+// TestGetJob_ResponseShape verifies all required JobResponse fields are present.
+func TestGetJob_ResponseShape(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_shape_j", "shape-job", alice, "running")
+	s.mem.seedJob(&db.JobRow{
+		ID:           "job_shape01",
+		InstanceID:   "inst_shape_j",
+		JobType:      jobTypeStart,
+		Status:       "completed",
+		AttemptCount: 1,
+		MaxAttempts:  5,
+	})
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances/inst_shape_j/jobs/job_shape01", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202, got %d", resp.StatusCode)
+	}
+	var out JobResponse
+	decodeBody(t, resp, &out)
+
+	if out.ID == "" {
+		t.Error("id must be present")
+	}
+	if out.InstanceID == "" {
+		t.Error("instance_id must be present")
+	}
+	if out.JobType == "" {
+		t.Error("job_type must be present")
+	}
+	if out.Status == "" {
+		t.Error("status must be present")
+	}
+	if out.MaxAttempts == 0 {
+		t.Error("max_attempts must be present and non-zero")
+	}
+	if out.CreatedAt.IsZero() {
+		t.Error("created_at must be present")
+	}
+	if out.UpdatedAt.IsZero() {
+		t.Error("updated_at must be present")
+	}
+}
+
+// TestGetJob_NotFound verifies 404 + job_not_found when the job_id does not exist.
+// Source: API_ERROR_CONTRACT_V1 §3.
+func TestGetJob_NotFound(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_jnf", "job-nf", alice, "running")
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances/inst_jnf/jobs/job_ghost", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errJobNotFound {
+		t.Errorf("want code %q, got %q", errJobNotFound, env.Error.Code)
+	}
+	if env.Error.RequestID == "" {
+		t.Error("request_id must be present on 404")
+	}
+}
+
+// TestGetJob_WrongInstanceJobPairing verifies 404 when a job exists but
+// belongs to a different instance than specified in the URL.
+// Source: JOB_MODEL_V1 §1 (instance_id FK), AUTH_OWNERSHIP_MODEL_V1 §3.
+func TestGetJob_WrongInstanceJobPairing(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_owner_j", "owner-j", alice, "running")
+	seedInstance(s.mem, "inst_other_j", "other-j", alice, "running")
+	// job belongs to inst_other_j, not inst_owner_j
+	s.mem.seedJob(&db.JobRow{
+		ID:         "job_other01",
+		InstanceID: "inst_other_j",
+		JobType:    jobTypeStop,
+		Status:     "pending",
+	})
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances/inst_owner_j/jobs/job_other01", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for wrong pairing, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errJobNotFound {
+		t.Errorf("want code %q, got %q", errJobNotFound, env.Error.Code)
+	}
+}
+
+// TestGetJob_WrongOwner verifies 404 when the instance exists but belongs to
+// a different principal. Resource existence must not be leaked.
+// Source: AUTH_OWNERSHIP_MODEL_V1 §3, API_ERROR_CONTRACT_V1 §3.
+func TestGetJob_WrongOwner(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_bob_j", "bob-j", bob, "running")
+	s.mem.seedJob(&db.JobRow{
+		ID:         "job_bobs01",
+		InstanceID: "inst_bob_j",
+		JobType:    jobTypeStop,
+		Status:     "pending",
+	})
+
+	// Alice tries to access Bob's instance and job.
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances/inst_bob_j/jobs/job_bobs01", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for cross-account job access, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	// Instance ownership check fires first; error code is instance_not_found.
+	if env.Error.Code != errInstanceNotFound {
+		t.Errorf("want code %q, got %q", errInstanceNotFound, env.Error.Code)
+	}
+}
+
+// TestGetJob_InstanceNotFound verifies 404 when the instance itself doesn't exist.
+func TestGetJob_InstanceNotFound(t *testing.T) {
+	s := newTestSrv(t)
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances/inst_ghost/jobs/job_any", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for non-existent instance, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// TestGetJob_MissingAuth verifies 401 when the auth header is absent.
+// Validates that requirePrincipal covers the new route.
+func TestGetJob_MissingAuth(t *testing.T) {
+	s := newTestSrv(t)
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances/inst_any/jobs/job_any", nil, nil)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errAuthRequired {
+		t.Errorf("want code %q, got %q", errAuthRequired, env.Error.Code)
+	}
+}
+
+// ── PASS 2: Auth tests (unchanged) ───────────────────────────────────────────
 
 // TestAuth_MissingHeader verifies 401 when X-Principal-ID is absent.
 // Source: AUTH_OWNERSHIP_MODEL_V1 §1, API_ERROR_CONTRACT_V1 §4.
@@ -332,11 +837,12 @@ func TestAuth_MissingHeader(t *testing.T) {
 		{http.MethodPost, "/v1/instances/inst_any/stop"},
 		{http.MethodPost, "/v1/instances/inst_any/start"},
 		{http.MethodPost, "/v1/instances/inst_any/reboot"},
+		{http.MethodGet, "/v1/instances/inst_any/jobs/job_any"},
 	}
 
 	for _, ep := range endpoints {
 		t.Run(ep.method+" "+ep.path, func(t *testing.T) {
-			resp := doReq(t, s.ts, ep.method, ep.path, nil, nil) // no header
+			resp := doReq(t, s.ts, ep.method, ep.path, nil, nil)
 			if resp.StatusCode != http.StatusUnauthorized {
 				t.Fatalf("want 401, got %d", resp.StatusCode)
 			}
@@ -353,10 +859,8 @@ func TestAuth_MissingHeader(t *testing.T) {
 }
 
 // TestAuth_ValidHeader verifies that a valid X-Principal-ID is accepted.
-// Source: AUTH_OWNERSHIP_MODEL_V1 §1.
 func TestAuth_ValidHeader(t *testing.T) {
 	s := newTestSrv(t)
-	// GET /v1/instances with a valid header must not return 401.
 	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances", nil, authHdr(alice))
 	if resp.StatusCode == http.StatusUnauthorized {
 		t.Fatal("valid X-Principal-ID must not produce 401")
@@ -364,10 +868,8 @@ func TestAuth_ValidHeader(t *testing.T) {
 	resp.Body.Close()
 }
 
-// ── PASS 2: Ownership tests ───────────────────────────────────────────────────
+// ── PASS 2: Ownership tests (unchanged) ──────────────────────────────────────
 
-// TestOwnership_OwnInstance verifies that a principal can access their own instance.
-// Source: AUTH_OWNERSHIP_MODEL_V1 §3.
 func TestOwnership_OwnInstance(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_mine", "mine", alice, "running")
@@ -379,9 +881,6 @@ func TestOwnership_OwnInstance(t *testing.T) {
 	resp.Body.Close()
 }
 
-// TestOwnership_OtherUsersInstance verifies 404 (not 403) when accessing another
-// user's instance. Resource existence must not be leaked.
-// Source: AUTH_OWNERSHIP_MODEL_V1 §3, API_ERROR_CONTRACT_V1 §3.
 func TestOwnership_OtherUsersInstance(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_bobs", "bobs-inst", bob, "running")
@@ -397,9 +896,6 @@ func TestOwnership_OtherUsersInstance(t *testing.T) {
 	}
 }
 
-// TestOwnership_LifecycleOnOtherUsersInstance verifies 404 on lifecycle actions
-// targeting another user's instance, across all action types.
-// Source: AUTH_OWNERSHIP_MODEL_V1 §3.
 func TestOwnership_LifecycleOnOtherUsersInstance(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_bobs2", "bobs-inst2", bob, "running")
@@ -425,10 +921,8 @@ func TestOwnership_LifecycleOnOtherUsersInstance(t *testing.T) {
 	}
 }
 
-// ── PASS 2: Lifecycle happy path tests ───────────────────────────────────────
+// ── PASS 2: Lifecycle happy path tests (unchanged) ────────────────────────────
 
-// TestStop_Happy verifies POST /stop returns 202 + job_id from running state.
-// Source: LIFECYCLE_STATE_MACHINE_V1 §running→stopping, JOB_MODEL_V1.
 func TestStop_Happy(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_run", "run-me", alice, "running")
@@ -448,14 +942,11 @@ func TestStop_Happy(t *testing.T) {
 	if out.Action != "stop" {
 		t.Errorf("want action=stop, got %q", out.Action)
 	}
-	// Verify job was recorded in the pool.
 	if _, ok := s.mem.jobs[out.JobID]; !ok {
 		t.Error("job must be recorded in the job store")
 	}
 }
 
-// TestStart_Happy verifies POST /start returns 202 + job_id from stopped state.
-// Source: LIFECYCLE_STATE_MACHINE_V1 §stopped→starting.
 func TestStart_Happy(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_stopped", "stopped-inst", alice, "stopped")
@@ -474,8 +965,6 @@ func TestStart_Happy(t *testing.T) {
 	}
 }
 
-// TestReboot_Happy verifies POST /reboot returns 202 + job_id from running state.
-// Source: LIFECYCLE_STATE_MACHINE_V1 §running→rebooting.
 func TestReboot_Happy(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_reboot", "reboot-me", alice, "running")
@@ -491,8 +980,6 @@ func TestReboot_Happy(t *testing.T) {
 	}
 }
 
-// TestDelete_Happy verifies DELETE returns 202 + job_id from running state.
-// Source: LIFECYCLE_STATE_MACHINE_V1 §running→deleting.
 func TestDelete_Happy(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_del", "del-me", alice, "running")
@@ -511,8 +998,6 @@ func TestDelete_Happy(t *testing.T) {
 	}
 }
 
-// TestDelete_FromFailed verifies DELETE is accepted from failed state.
-// Source: LIFECYCLE_STATE_MACHINE_V1 §failed→deleting.
 func TestDelete_FromFailed(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_failed", "failed-inst", alice, "failed")
@@ -524,8 +1009,6 @@ func TestDelete_FromFailed(t *testing.T) {
 	resp.Body.Close()
 }
 
-// TestDelete_FromStopped verifies DELETE is accepted from stopped state.
-// Source: LIFECYCLE_STATE_MACHINE_V1 §stopped→deleting.
 func TestDelete_FromStopped(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_stopsed", "stopped-del", alice, "stopped")
@@ -537,10 +1020,8 @@ func TestDelete_FromStopped(t *testing.T) {
 	resp.Body.Close()
 }
 
-// ── PASS 2: Illegal state transition tests ───────────────────────────────────
+// ── PASS 2: Illegal state transition tests (unchanged) ───────────────────────
 
-// TestIllegalTransition_StopOnStopped verifies 409 when stopping an already-stopped instance.
-// Source: LIFECYCLE_STATE_MACHINE_V1, API_ERROR_CONTRACT_V1 §4.
 func TestIllegalTransition_StopOnStopped(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_stopped2", "already-stopped", alice, "stopped")
@@ -559,7 +1040,6 @@ func TestIllegalTransition_StopOnStopped(t *testing.T) {
 	}
 }
 
-// TestIllegalTransition_StartOnRunning verifies 409 when starting an already-running instance.
 func TestIllegalTransition_StartOnRunning(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_running2", "already-running", alice, "running")
@@ -575,7 +1055,6 @@ func TestIllegalTransition_StartOnRunning(t *testing.T) {
 	}
 }
 
-// TestIllegalTransition_RebootOnStopped verifies 409 when rebooting a stopped instance.
 func TestIllegalTransition_RebootOnStopped(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_stopreboot", "stopped-reboot", alice, "stopped")
@@ -591,7 +1070,6 @@ func TestIllegalTransition_RebootOnStopped(t *testing.T) {
 	}
 }
 
-// TestIllegalTransition_DeleteOnDeleting verifies 409 when deleting an already-deleting instance.
 func TestIllegalTransition_DeleteOnDeleting(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_deleting", "being-deleted", alice, "deleting")
@@ -607,32 +1085,25 @@ func TestIllegalTransition_DeleteOnDeleting(t *testing.T) {
 	}
 }
 
-// TestIllegalTransition_Matrix exercises the full set of illegal transitions
-// from states where the action is not permitted.
-// Source: LIFECYCLE_STATE_MACHINE_V1 §transition table.
 func TestIllegalTransition_Matrix(t *testing.T) {
 	cases := []struct {
 		state  string
 		method string
 		action string
 	}{
-		// stop is only legal from running
 		{"stopped", http.MethodPost, "stop"},
 		{"requested", http.MethodPost, "stop"},
 		{"provisioning", http.MethodPost, "stop"},
 		{"deleting", http.MethodPost, "stop"},
 		{"failed", http.MethodPost, "stop"},
-		// start is only legal from stopped
 		{"running", http.MethodPost, "start"},
 		{"requested", http.MethodPost, "start"},
 		{"provisioning", http.MethodPost, "start"},
 		{"deleting", http.MethodPost, "start"},
 		{"failed", http.MethodPost, "start"},
-		// reboot is only legal from running
 		{"stopped", http.MethodPost, "reboot"},
 		{"requested", http.MethodPost, "reboot"},
 		{"failed", http.MethodPost, "reboot"},
-		// delete is illegal from deleting/deleted
 		{"deleting", http.MethodDelete, ""},
 	}
 
@@ -661,7 +1132,6 @@ func TestIllegalTransition_Matrix(t *testing.T) {
 	}
 }
 
-// TestLifecycle_NotFound verifies 404 when acting on a non-existent instance.
 func TestLifecycle_NotFound(t *testing.T) {
 	s := newTestSrv(t)
 
@@ -686,9 +1156,6 @@ func TestLifecycle_NotFound(t *testing.T) {
 	}
 }
 
-// TestLifecycle_JobEnqueued verifies that a successful lifecycle action actually
-// records a job in the job store (API enqueues, does not call runtime directly).
-// Source: JOB_MODEL_V1, core-architecture-blueprint §control-plane semantics.
 func TestLifecycle_JobEnqueued(t *testing.T) {
 	s := newTestSrv(t)
 	seedInstance(s.mem, "inst_enq", "enqueue-test", alice, "running")
@@ -715,10 +1182,8 @@ func TestLifecycle_JobEnqueued(t *testing.T) {
 	}
 }
 
-// ── PASS 1: POST /v1/instances ────────────────────────────────────────────────
+// ── PASS 1: POST /v1/instances (unchanged) ────────────────────────────────────
 
-// TestCreate_Happy verifies 202, response shape, and field values.
-// Source: INSTANCE_MODEL_V1 §2, 08-01 §CreateInstance response.
 func TestCreate_Happy(t *testing.T) {
 	s := newTestSrv(t)
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
@@ -750,8 +1215,6 @@ func TestCreate_Happy(t *testing.T) {
 	}
 }
 
-// TestCreate_MalformedJSON verifies 400 invalid_request on a bad body.
-// Source: API_ERROR_CONTRACT_V1 §4.
 func TestCreate_MalformedJSON(t *testing.T) {
 	s := newTestSrv(t)
 	req, _ := http.NewRequest(http.MethodPost, s.ts.URL+"/v1/instances",
@@ -775,8 +1238,6 @@ func TestCreate_MalformedJSON(t *testing.T) {
 	}
 }
 
-// TestCreate_AllFieldsMissing verifies 400 with populated details array.
-// Source: API_ERROR_CONTRACT_V1 §1 (details array).
 func TestCreate_AllFieldsMissing(t *testing.T) {
 	s := newTestSrv(t)
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
@@ -882,7 +1343,7 @@ func TestCreate_MissingSSHKey(t *testing.T) {
 	assertDetailCode(t, env, "ssh_key_name", errMissingField)
 }
 
-// ── PASS 1: GET /v1/instances/{id} ───────────────────────────────────────────
+// ── PASS 1: GET /v1/instances/{id} (unchanged) ───────────────────────────────
 
 func TestGetInstance_Happy(t *testing.T) {
 	s := newTestSrv(t)
@@ -935,7 +1396,7 @@ func TestGetInstance_WrongMethod(t *testing.T) {
 	resp.Body.Close()
 }
 
-// ── PASS 1: GET /v1/instances ─────────────────────────────────────────────────
+// ── PASS 1: GET /v1/instances (unchanged) ─────────────────────────────────────
 
 func TestListInstances_Empty(t *testing.T) {
 	s := newTestSrv(t)
@@ -1000,10 +1461,8 @@ func TestListInstances_ResponseShape(t *testing.T) {
 	}
 }
 
-// ── PASS 1: error envelope invariants ─────────────────────────────────────────
+// ── PASS 1: error envelope invariants (unchanged) ─────────────────────────────
 
-// TestErrorEnvelope_RequestIDAlwaysPresent checks the §7 invariant.
-// Source: API_ERROR_CONTRACT_V1 §7.
 func TestErrorEnvelope_RequestIDAlwaysPresent(t *testing.T) {
 	s := newTestSrv(t)
 
@@ -1047,8 +1506,6 @@ func TestErrorEnvelope_RequestIDAlwaysPresent(t *testing.T) {
 	}
 }
 
-// TestErrorEnvelope_DetailsEmptyNotNull verifies details is [] not null.
-// Source: API_ERROR_CONTRACT_V1 §1.
 func TestErrorEnvelope_DetailsEmptyNotNull(t *testing.T) {
 	s := newTestSrv(t)
 	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances/inst_nope", nil, authHdr(alice))
@@ -1073,7 +1530,7 @@ func TestErrorEnvelope_DetailsEmptyNotNull(t *testing.T) {
 	}
 }
 
-// ── PASS 1: validation unit ───────────────────────────────────────────────────
+// ── PASS 1: validation unit (unchanged) ───────────────────────────────────────
 
 func TestValidation_NameRegexp(t *testing.T) {
 	cases := []struct {

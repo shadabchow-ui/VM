@@ -8,7 +8,8 @@ package main
 //         POST   /v1/instances/{id}/stop
 //         POST   /v1/instances/{id}/start
 //         POST   /v1/instances/{id}/reboot
-// PASS 3 (not yet): idempotency, job status endpoint.
+// PASS 3: Idempotency-Key support for create and lifecycle actions.
+//         GET /v1/instances/{id}/jobs/{job_id} — job status endpoint.
 //
 // Control-plane rule: lifecycle handlers enqueue a job via InsertJob.
 // They never call runtime directly. Workers drive all state transitions.
@@ -41,6 +42,10 @@ var jobMaxAttempts = map[string]int{
 	jobTypeDelete: 5,
 }
 
+// idempotencyHeader is the canonical header name for request deduplication.
+// Source: JOB_MODEL_V1 §6, 03-02-async-job-model §idempotency.
+const idempotencyHeader = "Idempotency-Key"
+
 // ── Route registration ────────────────────────────────────────────────────────
 
 // registerInstanceRoutes registers the public instance API routes.
@@ -64,11 +69,13 @@ func (s *server) handleInstanceRoot(w http.ResponseWriter, r *http.Request) {
 
 // handleInstanceByID dispatches based on method and subpath.
 // Routes:
-//   GET    /v1/instances/{id}         → handleGetInstance
-//   DELETE /v1/instances/{id}         → handleDeleteInstance
-//   POST   /v1/instances/{id}/stop    → handleLifecycleAction(stop)
-//   POST   /v1/instances/{id}/start   → handleLifecycleAction(start)
-//   POST   /v1/instances/{id}/reboot  → handleLifecycleAction(reboot)
+//
+//	GET    /v1/instances/{id}                 → handleGetInstance
+//	DELETE /v1/instances/{id}                 → handleDeleteInstance
+//	POST   /v1/instances/{id}/stop            → handleLifecycleAction(stop)
+//	POST   /v1/instances/{id}/start           → handleLifecycleAction(start)
+//	POST   /v1/instances/{id}/reboot          → handleLifecycleAction(reboot)
+//	GET    /v1/instances/{id}/jobs/{job_id}   → handleGetJob  (PASS 3)
 func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/instances/")
 	if rest == "" {
@@ -76,7 +83,7 @@ func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parts := strings.SplitN(rest, "/", 2)
+	parts := strings.SplitN(rest, "/", 3)
 	id := parts[0]
 	if id == "" {
 		http.NotFound(w, r)
@@ -96,8 +103,24 @@ func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /v1/instances/{id}/{subpath}
+	// /v1/instances/{id}/{subpath}[/{rest}]
 	subpath := parts[1]
+
+	// GET /v1/instances/{id}/jobs/{job_id}  (PASS 3)
+	if subpath == "jobs" {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if len(parts) < 3 || parts[2] == "" {
+			http.NotFound(w, r)
+			return
+		}
+		s.handleGetJob(w, r, id, parts[2])
+		return
+	}
+
+	// POST lifecycle subpaths.
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -118,9 +141,40 @@ func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
 
 // handleCreateInstance handles POST /v1/instances.
 // Returns 202 Accepted + CreateInstanceResponse.
-// Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2.
+//
+// PASS 3 idempotency: if Idempotency-Key header is present, composite key
+// "{principalID}:{key}:create" is stored as an INSTANCE_CREATE sentinel job so
+// that a duplicate request returns the same instance without creating a new one.
+// If the header is absent, current behaviour is preserved unchanged.
+//
+// Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, JOB_MODEL_V1 §6.
 func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFromCtx(r.Context())
+
+	// PASS 3: idempotency check — must run before any DB write.
+	// Source: JOB_MODEL_V1 §10 "Idempotency key checked before job creation".
+	if ikey := r.Header.Get(idempotencyHeader); ikey != "" {
+		compositeKey := fmt.Sprintf("%s:%s:create", principal, ikey)
+		existing, err := s.repo.GetJobByIdempotencyKey(r.Context(), compositeKey)
+		if err != nil {
+			s.log.Error("GetJobByIdempotencyKey failed on create", "error", err)
+			writeInternalError(w)
+			return
+		}
+		if existing != nil {
+			// Duplicate: return the original instance response.
+			inst, err := s.repo.GetInstanceByID(r.Context(), existing.InstanceID)
+			if err != nil {
+				s.log.Error("idempotent create: GetInstanceByID failed", "error", err)
+				writeInternalError(w)
+				return
+			}
+			writeJSON(w, http.StatusAccepted, CreateInstanceResponse{
+				Instance: instanceToResponse(inst, s.region),
+			})
+			return
+		}
+	}
 
 	var req CreateInstanceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -149,6 +203,23 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("InsertInstance failed", "error", err)
 		writeInternalError(w)
 		return
+	}
+
+	// PASS 3: persist sentinel job so subsequent duplicate requests deduplicate.
+	// Non-fatal: log on failure but do not fail the create response.
+	// Source: JOB_MODEL_V1 §6.
+	if ikey := r.Header.Get(idempotencyHeader); ikey != "" {
+		compositeKey := fmt.Sprintf("%s:%s:create", principal, ikey)
+		sentinelID := idgen.New(idgen.PrefixJob)
+		if err := s.repo.InsertJob(r.Context(), &db.JobRow{
+			ID:             sentinelID,
+			InstanceID:     instanceID,
+			JobType:        "INSTANCE_CREATE",
+			MaxAttempts:    3,
+			IdempotencyKey: compositeKey,
+		}); err != nil {
+			s.log.Warn("InsertJob sentinel for create idempotency failed", "error", err)
+		}
 	}
 
 	created, err := s.repo.GetInstanceByID(r.Context(), instanceID)
@@ -220,7 +291,15 @@ func (s *server) handleDeleteInstance(w http.ResponseWriter, r *http.Request, id
 // handleLifecycleAction is the shared handler for stop, start, reboot, delete.
 // Validates transition, enqueues job, returns 202.
 // Never calls runtime directly — jobs consumed by worker.
-// Source: LIFECYCLE_STATE_MACHINE_V1, JOB_MODEL_V1, 04-02-lifecycle-action-flows.md.
+//
+// PASS 3 idempotency: if Idempotency-Key header is present, composite key
+// "{principalID}:{key}:{jobType}" is looked up. If an existing job is found:
+//   - same instance → return original LifecycleResponse (deduplicated)
+//   - different instance → 409 idempotency_key_mismatch
+//
+// If the header is absent, current behaviour is preserved unchanged.
+//
+// Source: LIFECYCLE_STATE_MACHINE_V1, JOB_MODEL_V1 §6, 04-02-lifecycle-action-flows.md.
 func (s *server) handleLifecycleAction(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -229,6 +308,34 @@ func (s *server) handleLifecycleAction(
 	jobType string,
 ) {
 	principal, _ := principalFromCtx(r.Context())
+
+	// PASS 3: idempotency check — before ownership or state checks.
+	// Source: JOB_MODEL_V1 §10 "Idempotency key checked before job creation".
+	if ikey := r.Header.Get(idempotencyHeader); ikey != "" {
+		compositeKey := fmt.Sprintf("%s:%s:%s", principal, ikey, jobType)
+		existing, err := s.repo.GetJobByIdempotencyKey(r.Context(), compositeKey)
+		if err != nil {
+			s.log.Error("GetJobByIdempotencyKey failed", "job_type", jobType, "error", err)
+			writeInternalError(w)
+			return
+		}
+		if existing != nil {
+			// Same key reused for a different instance → payload mismatch.
+			// Source: JOB_MODEL_V1 §6 "Key found, payload differs → Reject".
+			if existing.InstanceID != id {
+				writeAPIError(w, http.StatusConflict, errIdempotencyMismatch,
+					"The Idempotency-Key has been used with a different request.", idempotencyHeader)
+				return
+			}
+			// Duplicate request: return the original LifecycleResponse.
+			writeJSON(w, http.StatusAccepted, LifecycleResponse{
+				InstanceID: existing.InstanceID,
+				JobID:      existing.ID,
+				Action:     string(action),
+			})
+			return
+		}
+	}
 
 	row, ok := s.loadOwnedInstance(w, r, principal, id)
 	if !ok {
@@ -245,11 +352,20 @@ func (s *server) handleLifecycleAction(
 	}
 
 	jobID := idgen.New(idgen.PrefixJob)
+
+	// Build the idempotency key for the new job.
+	// Empty string when no header was provided — matches existing ON CONFLICT behaviour.
+	var idempKey string
+	if ikey := r.Header.Get(idempotencyHeader); ikey != "" {
+		idempKey = fmt.Sprintf("%s:%s:%s", principal, ikey, jobType)
+	}
+
 	if err := s.repo.InsertJob(r.Context(), &db.JobRow{
-		ID:          jobID,
-		InstanceID:  row.ID,
-		JobType:     jobType,
-		MaxAttempts: jobMaxAttempts[jobType],
+		ID:             jobID,
+		InstanceID:     row.ID,
+		JobType:        jobType,
+		MaxAttempts:    jobMaxAttempts[jobType],
+		IdempotencyKey: idempKey,
 	}); err != nil {
 		s.log.Error("InsertJob failed", "job_type", jobType, "error", err)
 		writeInternalError(w)
@@ -261,6 +377,41 @@ func (s *server) handleLifecycleAction(
 		JobID:      jobID,
 		Action:     string(action),
 	})
+}
+
+// ── GET /v1/instances/{id}/jobs/{job_id} ──────────────────────────────────────
+
+// handleGetJob handles GET /v1/instances/{id}/jobs/{job_id}.
+// Returns 202 + JobResponse or 404.
+//
+// Ownership is enforced: the instance must be owned by the calling principal.
+// The job must belong to the specified instance (instance_id FK validated in repo).
+// Neither the instance nor the job existence is leaked on ownership failures.
+//
+// Source: JOB_MODEL_V1 §1, AUTH_OWNERSHIP_MODEL_V1 §3, API_ERROR_CONTRACT_V1 §3.
+func (s *server) handleGetJob(w http.ResponseWriter, r *http.Request, instanceID, jobID string) {
+	principal, _ := principalFromCtx(r.Context())
+
+	// Step 1: enforce instance ownership — 404 on any miss or cross-account access.
+	_, ok := s.loadOwnedInstance(w, r, principal, instanceID)
+	if !ok {
+		return
+	}
+
+	// Step 2: fetch job, validating it belongs to this instance.
+	job, err := s.repo.GetJobByInstanceAndID(r.Context(), instanceID, jobID)
+	if err != nil {
+		s.log.Error("GetJobByInstanceAndID failed", "instance_id", instanceID, "job_id", jobID, "error", err)
+		writeInternalError(w)
+		return
+	}
+	if job == nil {
+		writeAPIError(w, http.StatusNotFound, errJobNotFound,
+			"The job does not exist or does not belong to this instance.", "job_id")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, jobToResponse(job))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -279,6 +430,24 @@ func instanceToResponse(row *db.InstanceRow, region string) InstanceResponse {
 		Labels:           map[string]string{},
 		CreatedAt:        row.CreatedAt,
 		UpdatedAt:        row.UpdatedAt,
+	}
+}
+
+// jobToResponse maps a db.JobRow to the canonical JobResponse.
+// Internal-only fields (idempotency_key, claimed_at) are not exposed.
+// Source: JOB_MODEL_V1 §1.
+func jobToResponse(row *db.JobRow) JobResponse {
+	return JobResponse{
+		ID:           row.ID,
+		InstanceID:   row.InstanceID,
+		JobType:      row.JobType,
+		Status:       row.Status,
+		AttemptCount: row.AttemptCount,
+		MaxAttempts:  row.MaxAttempts,
+		ErrorMessage: row.ErrorMessage,
+		CreatedAt:    row.CreatedAt,
+		UpdatedAt:    row.UpdatedAt,
+		CompletedAt:  row.CompletedAt,
 	}
 }
 
