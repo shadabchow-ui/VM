@@ -51,7 +51,7 @@ fi
 # P-7: Write probe works
 PROBE_SCRIPT="${PROBE_SCRIPT:-./ws-h1-write-probe.sh}"
 if [[ -f "$PROBE_SCRIPT" ]]; then
-  PROBE_RESULT=$(API_BASE_URL="${API_BASE_URL:-}" API_AUTH_HEADER="${API_AUTH_HEADER:-}" \
+  PROBE_RESULT=$(API_BASE_URL="${API_BASE_URL:-}" \
     API_PRINCIPAL="${API_PRINCIPAL:-probe}" bash "$PROBE_SCRIPT" 2>&1 || true)
   if echo "$PROBE_RESULT" | grep -q "SUCCESS"; then
     echo "  [PASS] P-7: Write probe returns SUCCESS"

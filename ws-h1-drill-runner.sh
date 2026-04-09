@@ -6,7 +6,7 @@
 #
 # Usage:
 #   export API_BASE_URL="https://api.internal/v1"
-#   export API_AUTH_HEADER="Bearer <token>"
+#   export API_AUTH_HEADER_REMOVED="Bearer <token>"
 #   export API_PRINCIPAL="probe-drilluser"
 #   export FAILOVER_CMD="patronictl failover mycluster --master db-primary --force"
 #   export EVIDENCE_DIR="evidence/ws-h1"
@@ -26,13 +26,15 @@ set -euo pipefail
 
 # ── Required environment ──────────────────────────────────────────────────────
 API_BASE_URL="${API_BASE_URL:?required}"
-API_AUTH_HEADER="${API_AUTH_HEADER:?required}"
+API_AUTH_HEADER_REMOVED="${API_AUTH_HEADER_REMOVED:?required}"
 API_PRINCIPAL="${API_PRINCIPAL:-probe-drilluser}"
 FAILOVER_CMD="${FAILOVER_CMD:?required — set to the failover trigger command}"
 EVIDENCE_DIR="${EVIDENCE_DIR:-evidence/ws-h1}"
 RUN_NUMBER="${RUN_NUMBER:-1}"
-PROBE_SHAPE="${PROBE_SHAPE:-cx1.small}"
-PROBE_IMAGE="${PROBE_IMAGE:-ubuntu-22.04}"
+PROBE_SHAPE="${PROBE_SHAPE:-gp1.small}"
+PROBE_IMAGE="${PROBE_IMAGE:-img_ubuntu2204}"
+PROBE_AZ="${PROBE_AZ:-us-east-1a}"
+PROBE_SSH_KEY="${PROBE_SSH_KEY:-probe-key}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROBE_SCRIPT="${PROBE_SCRIPT:-${SCRIPT_DIR}/ws-h1-write-probe.sh}"
 
@@ -50,7 +52,7 @@ log "FAILOVER_CMD=${FAILOVER_CMD}"
 log "--- Step 6: Pre-drill API check ---"
 PRE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
   -X POST "${API_BASE_URL}/instances" \
-  -H "Authorization: ${API_AUTH_HEADER}" \
+  -H "Authorization: ${API_AUTH_HEADER_REMOVED}" \
   -H "X-Principal-ID: ${API_PRINCIPAL}" \
   -H "Content-Type: application/json" \
   -d "{\"name\":\"probe-pre-drill\",\"shape\":\"${PROBE_SHAPE}\",\"image_id\":\"${PROBE_IMAGE}\"}")

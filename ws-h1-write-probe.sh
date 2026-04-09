@@ -28,10 +28,11 @@
 set -euo pipefail
 
 API_BASE_URL="${API_BASE_URL:?API_BASE_URL is required}"
-API_AUTH_HEADER="${API_AUTH_HEADER:?API_AUTH_HEADER is required}"
 PROBE_PRINCIPAL="${PROBE_PRINCIPAL:-probe-drilluser}"
-PROBE_SHAPE="${PROBE_SHAPE:-cx1.small}"
-PROBE_IMAGE="${PROBE_IMAGE:-ubuntu-22.04}"
+PROBE_SHAPE="${PROBE_SHAPE:-gp1.small}"
+PROBE_IMAGE="${PROBE_IMAGE:-img_ubuntu2204}"
+PROBE_AZ="${PROBE_AZ:-us-east-1a}"
+PROBE_SSH_KEY="${PROBE_SSH_KEY:-probe-key}"
 
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -40,8 +41,7 @@ TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
   --max-time 3 \
   -X POST "${API_BASE_URL}/instances" \
-  -H "Authorization: ${API_AUTH_HEADER}" \
-  -H "X-Principal-ID: ${PROBE_PRINCIPAL}" \
+    -H "X-Principal-ID: ${PROBE_PRINCIPAL}" \
   -H "Content-Type: application/json" \
   -d "{\"name\":\"probe-$(date +%s)\",\"shape\":\"${PROBE_SHAPE}\",\"image_id\":\"${PROBE_IMAGE}\"}" \
   2>&1) || {
@@ -60,8 +60,7 @@ if [[ "$HTTP_STATUS" == "202" ]]; then
   if [[ -n "$INSTANCE_ID" ]]; then
     curl -s --max-time 3 \
       -X DELETE "${API_BASE_URL}/instances/${INSTANCE_ID}" \
-      -H "Authorization: ${API_AUTH_HEADER}" \
-      -H "X-Principal-ID: ${PROBE_PRINCIPAL}" \
+            -H "X-Principal-ID: ${PROBE_PRINCIPAL}" \
       > /dev/null 2>&1 || true
   fi
 elif [[ "$HTTP_STATUS" == "503" ]]; then
