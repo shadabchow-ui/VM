@@ -10,6 +10,10 @@ package main
 //         POST   /v1/instances/{id}/reboot
 // PASS 3: Idempotency-Key support for create and lifecycle actions.
 //         GET /v1/instances/{id}/jobs/{job_id} — job status endpoint.
+// P2-M1/WS-H1: All DB-error paths now call writeDBError(w, s.log, err) which
+//         returns 503 for transient connectivity failures and 500 for all others.
+//         Gate item DB-6: API must return 503 (not 500, not hang) with request_id
+//         during the PostgreSQL primary failover window.
 //
 // Control-plane rule: lifecycle handlers enqueue a job via InsertJob.
 // They never call runtime directly. Workers drive all state transitions.
@@ -168,7 +172,7 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		existing, err := s.repo.GetJobByIdempotencyKey(r.Context(), compositeKey)
 		if err != nil {
 			s.log.Error("GetJobByIdempotencyKey failed on create", "error", err)
-			writeInternalError(w)
+			writeDBError(w, err)
 			return
 		}
 		if existing != nil {
@@ -176,12 +180,12 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 			inst, err := s.repo.GetInstanceByID(r.Context(), existing.InstanceID)
 			if err != nil {
 				s.log.Error("idempotent create: GetInstanceByID failed", "error", err)
-				writeInternalError(w)
+				writeDBError(w, err)
 				return
 			}
-			ip183, _ := s.repo.GetIPByInstance(r.Context(), existing.InstanceID)
+			ip, _ := s.repo.GetIPByInstance(r.Context(), existing.InstanceID)
 			writeJSON(w, http.StatusAccepted, CreateInstanceResponse{
-				Instance: instanceToResponse(inst, s.region, ip183),
+				Instance: instanceToResponse(inst, s.region, ip),
 			})
 			return
 		}
@@ -212,7 +216,7 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.repo.InsertInstance(r.Context(), row); err != nil {
 		s.log.Error("InsertInstance failed", "error", err)
-		writeInternalError(w)
+		writeDBError(w, err)
 		return
 	}
 
@@ -236,13 +240,13 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	created, err := s.repo.GetInstanceByID(r.Context(), instanceID)
 	if err != nil {
 		s.log.Error("GetInstanceByID after insert failed", "error", err)
-		writeInternalError(w)
+		writeDBError(w, err)
 		return
 	}
 
-	ip242, _ := s.repo.GetIPByInstance(r.Context(), created.ID)
+	ip, _ := s.repo.GetIPByInstance(r.Context(), created.ID)
 	writeJSON(w, http.StatusAccepted, CreateInstanceResponse{
-		Instance: instanceToResponse(created, s.region, ip242),
+		Instance: instanceToResponse(created, s.region, ip),
 	})
 }
 
@@ -257,14 +261,14 @@ func (s *server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.repo.ListInstancesByOwner(r.Context(), principal)
 	if err != nil {
 		s.log.Error("ListInstancesByOwner failed", "error", err)
-		writeInternalError(w)
+		writeDBError(w, err)
 		return
 	}
 
 	out := make([]InstanceResponse, 0, len(rows))
 	for _, row := range rows {
-		ip264, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
-		out = append(out, instanceToResponse(row, s.region, ip264))
+		ip, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
+		out = append(out, instanceToResponse(row, s.region, ip))
 	}
 
 	writeJSON(w, http.StatusOK, ListInstancesResponse{
@@ -287,8 +291,8 @@ func (s *server) handleGetInstance(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 
-	ip287, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
-	writeJSON(w, http.StatusOK, instanceToResponse(row, s.region, ip287))
+	ip, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
+	writeJSON(w, http.StatusOK, instanceToResponse(row, s.region, ip))
 }
 
 // ── DELETE /v1/instances/{id} ─────────────────────────────────────────────────
@@ -330,7 +334,7 @@ func (s *server) handleLifecycleAction(
 		existing, err := s.repo.GetJobByIdempotencyKey(r.Context(), compositeKey)
 		if err != nil {
 			s.log.Error("GetJobByIdempotencyKey failed", "job_type", jobType, "error", err)
-			writeInternalError(w)
+			writeDBError(w, err)
 			return
 		}
 		if existing != nil {
@@ -382,7 +386,7 @@ func (s *server) handleLifecycleAction(
 		IdempotencyKey: idempKey,
 	}); err != nil {
 		s.log.Error("InsertJob failed", "job_type", jobType, "error", err)
-		writeInternalError(w)
+		writeDBError(w, err)
 		return
 	}
 
@@ -416,7 +420,7 @@ func (s *server) handleGetJob(w http.ResponseWriter, r *http.Request, instanceID
 	job, err := s.repo.GetJobByInstanceAndID(r.Context(), instanceID, jobID)
 	if err != nil {
 		s.log.Error("GetJobByInstanceAndID failed", "instance_id", instanceID, "job_id", jobID, "error", err)
-		writeInternalError(w)
+		writeDBError(w, err)
 		return
 	}
 	if job == nil {
@@ -429,6 +433,22 @@ func (s *server) handleGetJob(w http.ResponseWriter, r *http.Request, instanceID
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// writeDBError selects the correct HTTP error response for a DB error.
+// Transient connectivity failures (primary failover) → 503 writeServiceUnavailable.
+// All other DB errors → 500 writeInternalError.
+//
+// This is the single call site for all repo-layer errors in this package.
+// Do not call writeInternalError directly for DB errors — always use writeDBError.
+//
+// Source: P2_M1_WS_H1_DB_HA_RUNBOOK §6 Step 11 (gate item DB-6).
+func writeDBError(w http.ResponseWriter, err error) {
+	if isDBUnavailableError(err) {
+		writeServiceUnavailable(w)
+	} else {
+		writeInternalError(w)
+	}
+}
 
 // instanceToResponse maps a db.InstanceRow to the canonical InstanceResponse.
 // M7: ip param carries the allocated IP from GetIPByInstance (empty string = nil fields).

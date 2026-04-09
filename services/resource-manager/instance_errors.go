@@ -6,14 +6,20 @@ package main
 // Internal details (DB errors, stack traces) are never written to responses.
 //
 // PASS 3: Added errJobNotFound, errIdempotencyMismatch error codes.
+// P2-M1/WS-H1: Added errServiceUnavailable, writeServiceUnavailable, isDBUnavailableError.
+//   Gate item DB-6 requires HTTP 503 (not 500, not hang) with request_id when the
+//   PostgreSQL primary is unavailable during a failover drill. Without this change
+//   all DB connectivity errors produce HTTP 500, which fails DB-6.
 //
 // Source: API_ERROR_CONTRACT_V1 §1 (envelope shape),
 //         §2 (HTTP status mapping),
 //         §4 (error code catalog),
-//         §7 (invariant: request_id always present).
+//         §7 (invariant: request_id always present),
+//         P2_M1_WS_H1_DB_HA_RUNBOOK §6 Step 11 (DB-6 pass conditions).
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/compute-platform/compute-platform/packages/idgen"
 )
@@ -33,6 +39,10 @@ const (
 	errAuthRequired        = "authentication_required"
 	errIllegalTransition   = "illegal_state_transition"
 	errIdempotencyMismatch = "idempotency_key_mismatch"
+	// errServiceUnavailable is returned when the PostgreSQL primary is unreachable.
+	// Maps to HTTP 503. Source: API_ERROR_CONTRACT_V1 §2 and §4.
+	// Added: P2-M1/WS-H1 gate item DB-6.
+	errServiceUnavailable = "service_unavailable"
 )
 
 // apiError is the structured error envelope sent in every error response.
@@ -108,4 +118,76 @@ func writeInternalError(w http.ResponseWriter) {
 		},
 	}
 	writeJSON(w, http.StatusInternalServerError, env)
+}
+
+// writeServiceUnavailable writes an HTTP 503 response with request_id.
+//
+// Called by any handler whose repo call returns an error that
+// isDBUnavailableError classifies as a transient connectivity failure.
+//
+// DB-6 pass conditions (P2_M1_WS_H1_DB_HA_RUNBOOK §6 Step 11):
+//   - HTTP status is 503 (not 500, not 502, not hang).
+//   - Response completes within 2 seconds (non-blocking — writeJSON does not block).
+//   - Response body contains request_id field.
+//
+// Source: API_ERROR_CONTRACT_V1 §2 (503), §4 (service_unavailable code), §7 (request_id).
+func writeServiceUnavailable(w http.ResponseWriter) {
+	reqID := idgen.New("req")
+	env := apiError{
+		Error: apiErrorBody{
+			Code:      errServiceUnavailable,
+			Message:   "Database unavailable. Please retry.",
+			RequestID: reqID,
+			Details:   []apiErrorBody{},
+		},
+	}
+	writeJSON(w, http.StatusServiceUnavailable, env)
+}
+
+// isDBUnavailableError reports whether err represents a transient database
+// connectivity failure — the class of errors produced during a PostgreSQL
+// primary failover (connection refused, TCP reset, broken pipe, dial timeout,
+// server restarting).
+//
+// Design constraints:
+//   - lib/pq (the only driver; see go.mod) does not expose typed structs for
+//     connection-class failures. They arrive as plain error values whose
+//     message contains the relevant substrings.
+//   - We match on the minimum conservative set of substrings that cover the
+//     primary-failover failure surface. We intentionally do NOT match
+//     application-level constraint errors (duplicate key, foreign key, syntax)
+//     — those must remain 500/400.
+//   - Matching is case-insensitive via strings.ToLower.
+//   - If err is nil, returns false.
+//
+// Source: P2_M1_WS_H1_DB_HA_RUNBOOK §6 Step 11 (gate item DB-6),
+//         P2_M1_INFRASTRUCTURE_HARDENING_PLAN §3.1.
+func isDBUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, sub := range dbUnavailableSubstrings {
+		if strings.Contains(msg, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// dbUnavailableSubstrings are the lowercase fragments that identify a transient
+// DB connectivity failure vs. an application-level DB error.
+// Keep this list minimal. False negatives (500 when 503 is correct) are safer
+// than false positives (503 for logic bugs).
+var dbUnavailableSubstrings = []string{
+	"connection refused",
+	"connection reset by peer",
+	"broken pipe",
+	"unexpected eof",
+	"dial tcp",
+	"no such host",
+	"connection timed out",
+	"i/o timeout",
+	"server closed the connection unexpectedly",
+	"the database system is starting up",
 }
