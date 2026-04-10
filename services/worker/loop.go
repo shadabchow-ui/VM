@@ -9,7 +9,7 @@ package main
 //  2. Atomically claims a job (status pending → in_progress).
 //  3. Routes by job_type to the appropriate handler.
 //  4. On success: marks the job completed.
-//  5. On failure: increments attempt_count; if max_attempts reached, marks dead.
+//  5. On failure: requeues to pending if attempts remain; marks dead if exhausted.
 //
 // Idempotency guarantee: each handler is responsible for idempotent execution.
 // The job model guarantees at-least-once delivery; handlers must tolerate replay.
@@ -153,7 +153,12 @@ func (w *WorkerLoop) execute(ctx context.Context, job *db.JobRow) {
 	w.finaliseJob(ctx, job, execErr)
 }
 
-// finaliseJob marks the job completed or failed/dead.
+// finaliseJob marks the job completed, requeues it for retry, or marks it dead.
+//
+// Retry semantics:
+//   - Success → completed
+//   - Failure with attempts remaining → requeue to pending (preserves error_message)
+//   - Failure with attempts exhausted → dead (terminal, moves to DLQ)
 func (w *WorkerLoop) finaliseJob(ctx context.Context, job *db.JobRow, execErr error) {
 	log := w.log.With("job_id", job.ID)
 
@@ -169,18 +174,26 @@ func (w *WorkerLoop) finaliseJob(ctx context.Context, job *db.JobRow, execErr er
 	log.Warn("job failed", "error", execErr)
 	errMsg := execErr.Error()
 
-	// Determine terminal status.
-	status := "failed"
-	if job.AttemptCount >= job.MaxAttempts {
-		status = "dead"
-		log.Error("job exhausted max attempts — moving to dead letter",
+	// Check if retries remain. attempt_count was already incremented by claimNext.
+	if job.AttemptCount < job.MaxAttempts {
+		log.Warn("job failed — requeueing for retry",
 			"attempt_count", job.AttemptCount,
 			"max_attempts", job.MaxAttempts,
 		)
+		// Requeue to pending: clears claimed_at, preserves attempt_count, stores error.
+		if err := w.repo.RequeueFailedAttempt(ctx, job.ID, &errMsg); err != nil {
+			log.Error("failed to requeue job after failure", "error", err)
+		}
+		return
 	}
 
-	if err := w.repo.UpdateJobStatus(ctx, job.ID, status, &errMsg); err != nil {
-		log.Error("failed to update job status after failure", "error", err)
+	// All attempts exhausted — move to dead letter queue.
+	log.Error("job exhausted max attempts — moving to dead letter",
+		"attempt_count", job.AttemptCount,
+		"max_attempts", job.MaxAttempts,
+	)
+	if err := w.repo.UpdateJobStatus(ctx, job.ID, "dead", &errMsg); err != nil {
+		log.Error("failed to update job status after terminal failure", "error", err)
 	}
 }
 

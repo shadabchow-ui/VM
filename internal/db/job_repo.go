@@ -218,6 +218,37 @@ func (r *Repo) RequeueTimedOutJob(ctx context.Context, id string) error {
 	return nil
 }
 
+// RequeueFailedAttempt returns a failed in_progress job back to pending for retry.
+//
+// This is called when a job fails but has remaining attempts (attempt_count < max_attempts).
+// The method:
+//   - Sets status back to 'pending' so the job will be picked up again
+//   - Preserves attempt_count (already incremented by claimNext)
+//   - Stores the most recent error_message for debugging
+//   - Clears claimed_at so the job can be claimed again
+//   - Clears completed_at since the job is not complete
+//
+// Source: JOB_MODEL_V1 §retry semantics.
+func (r *Repo) RequeueFailedAttempt(ctx context.Context, id string, errMsg *string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE jobs
+		SET status        = 'pending',
+		    error_message = $2,
+		    claimed_at    = NULL,
+		    completed_at  = NULL,
+		    updated_at    = NOW()
+		WHERE id = $1
+		  AND status = 'in_progress'
+	`, id, errMsg)
+	if err != nil {
+		return fmt.Errorf("RequeueFailedAttempt: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("RequeueFailedAttempt: job %s not found or not in_progress", id)
+	}
+	return nil
+}
+
 // HasActivePendingJob returns true when the instance already has a pending or
 // in_progress job of the given type.
 // Source: 03-03-reconciliation-loops §Job-Based Architecture (idempotency check).
@@ -269,11 +300,15 @@ func (r *Repo) ListActiveInstances(ctx context.Context) ([]*InstanceRow, error) 
 }
 
 // UpdateJobStatus updates a job's status and optionally sets error_message.
+// For terminal statuses (completed, dead), also sets completed_at.
 // Source: JOB_MODEL_V1 §2 (status transitions).
 func (r *Repo) UpdateJobStatus(ctx context.Context, id, status string, errMsg *string) error {
 	now := time.Now().UTC()
 	var completedAt *time.Time
-	if status == "completed" || status == "failed" || status == "dead" {
+	// Only set completed_at for terminal states.
+	// Note: 'failed' is NOT a terminal state in the retry model — jobs that fail
+	// with attempts remaining are requeued via RequeueFailedAttempt, not this method.
+	if status == "completed" || status == "dead" {
 		completedAt = &now
 	}
 	tag, err := r.pool.Exec(ctx, `

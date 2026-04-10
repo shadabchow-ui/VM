@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -26,26 +27,51 @@ import (
 
 // ── Stub repo for loop tests ──────────────────────────────────────────────────
 // Satisfies the db.Repo-shaped interface needed by WorkerLoop.
-// We achieve this by providing a fakePool that captures UpdateJobStatus calls.
+// We achieve this by providing a fakePool that captures UpdateJobStatus and
+// RequeueFailedAttempt calls.
 
 type loopTestPool struct {
 	mu           sync.Mutex
-	statusUpdate map[string]string  // jobID → status set
-	errMsgUpdate map[string]string  // jobID → errMsg set
+	statusUpdate map[string]string // jobID → status set
+	errMsgUpdate map[string]string // jobID → errMsg set
+	requeuedJobs map[string]bool   // jobID → true if RequeueFailedAttempt was called
 }
 
 func newLoopTestPool() *loopTestPool {
 	return &loopTestPool{
 		statusUpdate: make(map[string]string),
 		errMsgUpdate: make(map[string]string),
+		requeuedJobs: make(map[string]bool),
 	}
 }
 
-// Exec captures UPDATE jobs SET status=... WHERE id=...
-// UpdateJobStatus calls: Exec(ctx, "UPDATE jobs SET status=$2 ... WHERE id=$1", id, status, ...)
+// Exec captures UPDATE jobs SET ... calls.
+// Distinguishes between:
+//   - UpdateJobStatus:      args = (id, status, errMsg, completedAt, updatedAt)
+//   - RequeueFailedAttempt: args = (id, errMsg) with SQL containing "status = 'pending'"
 func (p *loopTestPool) Exec(_ context.Context, query string, args ...any) (db.CommandTag, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Detect RequeueFailedAttempt by its SQL pattern: status hardcoded as 'pending'
+	// and claimed_at = NULL in the query itself.
+	if strings.Contains(query, "status") && strings.Contains(query, "'pending'") &&
+		strings.Contains(query, "claimed_at") && strings.Contains(query, "NULL") {
+		// RequeueFailedAttempt signature: (id, errMsg)
+		if len(args) >= 1 {
+			if id, ok := args[0].(string); ok {
+				p.requeuedJobs[id] = true
+				p.statusUpdate[id] = "pending"
+				if len(args) >= 2 {
+					if msg, ok := args[1].(*string); ok && msg != nil {
+						p.errMsgUpdate[id] = *msg
+					}
+				}
+			}
+		}
+		return &stubTag{1}, nil
+	}
+
 	// UpdateJobStatus signature: (id, status, errMsg, completedAt, updatedAt)
 	if len(args) >= 2 {
 		if id, ok := args[0].(string); ok {
@@ -71,15 +97,18 @@ func (p *loopTestPool) QueryRow(_ context.Context, _ string, _ ...any) db.Row {
 func (p *loopTestPool) Close() {}
 
 type stubTag struct{ n int64 }
+
 func (t *stubTag) RowsAffected() int64 { return t.n }
 
 type emptyRows struct{}
-func (r *emptyRows) Next() bool            { return false }
-func (r *emptyRows) Scan(...any) error     { return nil }
-func (r *emptyRows) Close()               {}
-func (r *emptyRows) Err() error           { return nil }
+
+func (r *emptyRows) Next() bool        { return false }
+func (r *emptyRows) Scan(...any) error { return nil }
+func (r *emptyRows) Close()            {}
+func (r *emptyRows) Err() error        { return nil }
 
 type noRow struct{}
+
 func (r *noRow) Scan(...any) error { return fmt.Errorf("no rows") }
 
 // ── fakeHandler ───────────────────────────────────────────────────────────────
@@ -151,20 +180,45 @@ func TestWorkerLoop_Execute_MarksCompleted_OnSuccess(t *testing.T) {
 	}
 }
 
-func TestWorkerLoop_Execute_MarksFailedOnError_WhenAttemptsRemain(t *testing.T) {
+func TestWorkerLoop_Execute_RequeuesPending_WhenAttemptsRemain(t *testing.T) {
 	pool := newLoopTestPool()
 	h := &loopFakeHandler{failWith: errors.New("transient error")}
 	loop := makeLoop(t, pool, map[string]handlers.Handler{"INSTANCE_CREATE": h})
 
-	// attempt=1, max=3 → still retriable → "failed"
-	job := makeJob("job-fail-001", "inst-fail", "INSTANCE_CREATE", 1, 3)
+	// attempt=1, max=3 → still retriable → requeue to "pending"
+	job := makeJob("job-retry-001", "inst-retry", "INSTANCE_CREATE", 1, 3)
 	loop.execute(context.Background(), job)
 
 	pool.mu.Lock()
-	status := pool.statusUpdate["job-fail-001"]
+	status := pool.statusUpdate["job-retry-001"]
+	requeued := pool.requeuedJobs["job-retry-001"]
 	pool.mu.Unlock()
-	if status != "failed" {
-		t.Errorf("job status = %q, want failed", status)
+	if status != "pending" {
+		t.Errorf("job status = %q, want pending (requeued for retry)", status)
+	}
+	if !requeued {
+		t.Error("RequeueFailedAttempt was not called")
+	}
+}
+
+func TestWorkerLoop_Execute_RequeuesPending_WhenAttempt2Of3(t *testing.T) {
+	pool := newLoopTestPool()
+	h := &loopFakeHandler{failWith: errors.New("transient error")}
+	loop := makeLoop(t, pool, map[string]handlers.Handler{"INSTANCE_CREATE": h})
+
+	// attempt=2, max=3 → still retriable → requeue to "pending"
+	job := makeJob("job-retry-002", "inst-retry", "INSTANCE_CREATE", 2, 3)
+	loop.execute(context.Background(), job)
+
+	pool.mu.Lock()
+	status := pool.statusUpdate["job-retry-002"]
+	requeued := pool.requeuedJobs["job-retry-002"]
+	pool.mu.Unlock()
+	if status != "pending" {
+		t.Errorf("job status = %q, want pending (requeued for retry)", status)
+	}
+	if !requeued {
+		t.Error("RequeueFailedAttempt was not called for attempt 2")
 	}
 }
 
@@ -179,9 +233,13 @@ func TestWorkerLoop_Execute_MarksDeadWhenMaxAttemptsExhausted(t *testing.T) {
 
 	pool.mu.Lock()
 	status := pool.statusUpdate["job-dead-001"]
+	requeued := pool.requeuedJobs["job-dead-001"]
 	pool.mu.Unlock()
 	if status != "dead" {
 		t.Errorf("job status = %q, want dead", status)
+	}
+	if requeued {
+		t.Error("RequeueFailedAttempt should not be called when attempts exhausted")
 	}
 }
 
@@ -200,19 +258,45 @@ func TestWorkerLoop_Execute_MarksDeadForUnknownJobType(t *testing.T) {
 	}
 }
 
-func TestWorkerLoop_Execute_ErrorMessageRecorded(t *testing.T) {
+func TestWorkerLoop_Execute_ErrorMessageRecorded_OnRequeue(t *testing.T) {
 	pool := newLoopTestPool()
 	h := &loopFakeHandler{failWith: errors.New("handler blew up")}
 	loop := makeLoop(t, pool, map[string]handlers.Handler{"INSTANCE_DELETE": h})
 
+	// attempt=1, max=3 → requeue with error message preserved
 	job := makeJob("job-errmsg-001", "inst-e", "INSTANCE_DELETE", 1, 3)
 	loop.execute(context.Background(), job)
 
 	pool.mu.Lock()
 	msg := pool.errMsgUpdate["job-errmsg-001"]
+	status := pool.statusUpdate["job-errmsg-001"]
 	pool.mu.Unlock()
 	if msg == "" {
 		t.Error("error message not recorded in job update")
+	}
+	if status != "pending" {
+		t.Errorf("job status = %q, want pending (requeued)", status)
+	}
+}
+
+func TestWorkerLoop_Execute_ErrorMessageRecorded_OnDead(t *testing.T) {
+	pool := newLoopTestPool()
+	h := &loopFakeHandler{failWith: errors.New("final failure")}
+	loop := makeLoop(t, pool, map[string]handlers.Handler{"INSTANCE_DELETE": h})
+
+	// attempt=3, max=3 → dead with error message
+	job := makeJob("job-errmsg-dead-001", "inst-e", "INSTANCE_DELETE", 3, 3)
+	loop.execute(context.Background(), job)
+
+	pool.mu.Lock()
+	msg := pool.errMsgUpdate["job-errmsg-dead-001"]
+	status := pool.statusUpdate["job-errmsg-dead-001"]
+	pool.mu.Unlock()
+	if msg == "" {
+		t.Error("error message not recorded for dead job")
+	}
+	if status != "dead" {
+		t.Errorf("job status = %q, want dead", status)
 	}
 }
 
@@ -228,5 +312,22 @@ func TestWorkerLoop_Execute_DeleteHandlerRouted(t *testing.T) {
 	defer h.mu.Unlock()
 	if len(h.called) == 0 {
 		t.Error("DELETE handler was not called")
+	}
+}
+
+func TestWorkerLoop_Execute_MaxAttempts1_FailsImmediatelyToDead(t *testing.T) {
+	pool := newLoopTestPool()
+	h := &loopFakeHandler{failWith: errors.New("one-shot failure")}
+	loop := makeLoop(t, pool, map[string]handlers.Handler{"INSTANCE_CREATE": h})
+
+	// max=1, attempt=1 → immediately dead (no retry possible)
+	job := makeJob("job-oneshot-001", "inst-oneshot", "INSTANCE_CREATE", 1, 1)
+	loop.execute(context.Background(), job)
+
+	pool.mu.Lock()
+	status := pool.statusUpdate["job-oneshot-001"]
+	pool.mu.Unlock()
+	if status != "dead" {
+		t.Errorf("job status = %q, want dead (max_attempts=1)", status)
 	}
 }
