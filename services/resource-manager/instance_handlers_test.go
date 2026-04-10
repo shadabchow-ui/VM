@@ -380,8 +380,8 @@ func decodeBody(t *testing.T, resp *http.Response, out any) {
 func validCreateBody() CreateInstanceRequest {
 	return CreateInstanceRequest{
 		Name:             "my-instance",
-		InstanceType:     "gp1.small",
-		ImageID:          "img_ubuntu2204",
+		InstanceType:     "c1.small",
+		ImageID:          "00000000-0000-0000-0000-000000000010",
 		AvailabilityZone: "us-east-1a",
 		SSHKeyName:       "my-key",
 	}
@@ -399,8 +399,8 @@ func seedInstance(mem *memPool, id, name, owner, vmState string) {
 		Name:             name,
 		OwnerPrincipalID: owner,
 		VMState:          vmState,
-		InstanceTypeID:   "gp1.small",
-		ImageID:          "img_ubuntu2204",
+		InstanceTypeID:   "c1.small",
+		ImageID:          "00000000-0000-0000-0000-000000000010",
 		AvailabilityZone: "us-east-1a",
 	})
 }
@@ -1201,7 +1201,7 @@ func TestCreate_Happy(t *testing.T) {
 	if out.Instance.Status != "requested" {
 		t.Errorf("want status=requested, got %q", out.Instance.Status)
 	}
-	if out.Instance.InstanceType != "gp1.small" {
+	if out.Instance.InstanceType != "c1.small" {
 		t.Errorf("want instance_type=gp1.small, got %q", out.Instance.InstanceType)
 	}
 	if out.Instance.Region != "us-east-1" {
@@ -1294,7 +1294,7 @@ func TestCreate_InvalidName(t *testing.T) {
 func TestCreate_InvalidInstanceType(t *testing.T) {
 	s := newTestSrv(t)
 	body := validCreateBody()
-	body.InstanceType = "gp99.enormous"
+	body.InstanceType = "gp1.small"
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", resp.StatusCode)
@@ -1349,8 +1349,8 @@ func TestGetInstance_Happy(t *testing.T) {
 	s := newTestSrv(t)
 	s.mem.seed(&db.InstanceRow{
 		ID: "inst_abc123", Name: "test-inst", OwnerPrincipalID: alice,
-		VMState: "running", InstanceTypeID: "gp1.medium",
-		ImageID: "img_debian12", AvailabilityZone: "us-east-1b",
+		VMState: "running", InstanceTypeID: "c1.medium",
+		ImageID: "00000000-0000-0000-0000-000000000011", AvailabilityZone: "us-east-1b",
 	})
 
 	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances/inst_abc123", nil, authHdr(alice))

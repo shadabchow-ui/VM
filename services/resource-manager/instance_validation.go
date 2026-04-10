@@ -4,8 +4,26 @@ package main
 //
 // PASS 1 scope: validateCreateRequest only.
 //
+// P2-M1/WS-H1 fix: aligned image_id and instance_type catalogs with schema seed values.
+//
+//   BEFORE (broken):
+//     validImageIDs:     {"img_ubuntu2204", "img_debian12"}          — opaque strings
+//     validInstanceTypes: {"gp1.small", "gp1.medium", ...}           — invented prefix
+//   These values are not in the DB. The instances.image_id column is
+//   UUID NOT NULL REFERENCES images(id) and instances.instance_type_id is
+//   VARCHAR(64) REFERENCES instance_types(id). Passing the old values to
+//   InsertInstance produces a FK violation → 500.
+//
+//   AFTER (correct):
+//     validImageIDs:     schema seed UUIDs from db/migrations/001_initial.up.sql §images
+//     validInstanceTypes: schema seed IDs from db/migrations/001_initial.up.sql §instance_types
+//
+//   The human-readable "name" for each image is preserved as a comment so the
+//   mapping to the migration is explicit and auditable.
+//
 // Source: 08-02-validation-rules-and-error-contracts.md,
-//         INSTANCE_MODEL_V1 §2 (field constraints), §6 (shape catalog), §7 (image catalog).
+//         INSTANCE_MODEL_V1 §2 (field constraints), §6 (shape catalog), §7 (image catalog),
+//         db/migrations/001_initial.up.sql (authoritative seed values).
 
 import (
 	"regexp"
@@ -13,21 +31,25 @@ import (
 )
 
 // ── Instance type catalog ─────────────────────────────────────────────────────
+// Values must match instance_types.id seeded in db/migrations/001_initial.up.sql.
 // Source: INSTANCE_MODEL_V1 §6 (Phase 1 shape catalog).
 
 var validInstanceTypes = map[string]bool{
-	"gp1.small":  true,
-	"gp1.medium": true,
-	"gp1.large":  true,
-	"gp1.xlarge": true,
+	"c1.small":  true, // 2 vCPU, 4 GB RAM, 50 GB disk
+	"c1.medium": true, // 4 vCPU, 8 GB RAM, 100 GB disk
+	"c1.large":  true, // 8 vCPU, 16 GB RAM, 200 GB disk
+	"c1.xlarge": true, // 16 vCPU, 32 GB RAM, 500 GB disk
 }
 
 // ── Image catalog ─────────────────────────────────────────────────────────────
+// Values must be UUID strings matching images.id seeded in 001_initial.up.sql.
+// The instances.image_id column is UUID NOT NULL REFERENCES images(id) — passing
+// any other string produces a PostgreSQL FK violation at INSERT time.
 // Source: INSTANCE_MODEL_V1 §7 (Phase 1 curated platform images).
 
 var validImageIDs = map[string]bool{
-	"img_ubuntu2204": true,
-	"img_debian12":   true,
+	"00000000-0000-0000-0000-000000000010": true, // ubuntu-22.04-lts
+	"00000000-0000-0000-0000-000000000011": true, // debian-12
 }
 
 // ── AZ catalog ────────────────────────────────────────────────────────────────
