@@ -1,0 +1,30 @@
+=== RUN   TestIdempotency_INSTANCE_CREATE_SecondDeliveryIsNoOp
+--- PASS: TestIdempotency_INSTANCE_CREATE_SecondDeliveryIsNoOp (0.00s)
+=== RUN   TestIdempotency_INSTANCE_CREATE_AlreadyProvisioningResumes
+--- PASS: TestIdempotency_INSTANCE_CREATE_AlreadyProvisioningResumes (0.00s)
+=== RUN   TestIdempotency_INSTANCE_START_SecondDeliveryIsNoOp
+--- PASS: TestIdempotency_INSTANCE_START_SecondDeliveryIsNoOp (0.00s)
+=== RUN   TestIdempotency_INSTANCE_START_AlreadyRunningReturnsNil
+--- PASS: TestIdempotency_INSTANCE_START_AlreadyRunningReturnsNil (0.00s)
+=== RUN   TestIdempotency_INSTANCE_STOP_SecondDeliveryIsNoOp
+--- PASS: TestIdempotency_INSTANCE_STOP_SecondDeliveryIsNoOp (0.00s)
+=== RUN   TestIdempotency_INSTANCE_STOP_AlreadyStoppedReturnsNil
+--- PASS: TestIdempotency_INSTANCE_STOP_AlreadyStoppedReturnsNil (0.00s)
+=== RUN   TestIdempotency_INSTANCE_STOP_AlreadyDeletedReturnsNil
+--- PASS: TestIdempotency_INSTANCE_STOP_AlreadyDeletedReturnsNil (0.00s)
+=== RUN   TestIdempotency_INSTANCE_REBOOT_SecondDeliveryCompletesFromRebooting
+--- PASS: TestIdempotency_INSTANCE_REBOOT_SecondDeliveryCompletesFromRebooting (0.00s)
+=== RUN   TestIdempotency_INSTANCE_REBOOT_ReentrantFromRebootingState
+--- PASS: TestIdempotency_INSTANCE_REBOOT_ReentrantFromRebootingState (0.00s)
+=== RUN   TestIdempotency_INSTANCE_DELETE_SecondDeliveryIsNoOp
+--- PASS: TestIdempotency_INSTANCE_DELETE_SecondDeliveryIsNoOp (0.00s)
+=== RUN   TestIdempotency_INSTANCE_DELETE_AlreadyDeletedReturnsNil
+--- PASS: TestIdempotency_INSTANCE_DELETE_AlreadyDeletedReturnsNil (0.00s)
+=== RUN   TestIdempotency_INSTANCE_DELETE_ResourcesFreedOnce
+--- PASS: TestIdempotency_INSTANCE_DELETE_ResourcesFreedOnce (0.00s)
+=== RUN   TestIdempotency_NoDuplicateInstances_OnRetry
+--- PASS: TestIdempotency_NoDuplicateInstances_OnRetry (0.00s)
+=== RUN   TestIdempotency_NoDuplicateIPs_OnRetry
+--- PASS: TestIdempotency_NoDuplicateIPs_OnRetry (0.00s)
+PASS
+ok  	github.com/compute-platform/compute-platform/services/worker/handlers	0.377s

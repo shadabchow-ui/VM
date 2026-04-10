@@ -1,0 +1,18 @@
+=== RUN   TestClaimNext_NoPendingJob_ReturnsNil
+--- PASS: TestClaimNext_NoPendingJob_ReturnsNil (0.00s)
+=== RUN   TestClaimNext_ClaimsPendingJob
+--- PASS: TestClaimNext_ClaimsPendingJob (0.00s)
+=== RUN   TestClaimNext_BeginError
+--- PASS: TestClaimNext_BeginError (0.00s)
+=== RUN   TestClaimNext_QueryError
+--- PASS: TestClaimNext_QueryError (0.00s)
+=== RUN   TestClaimNext_UpdateError
+--- PASS: TestClaimNext_UpdateError (0.00s)
+=== RUN   TestClaimNext_CommitError
+--- PASS: TestClaimNext_CommitError (0.00s)
+=== RUN   TestComplete_UpdatesCompletedStatus
+--- PASS: TestComplete_UpdatesCompletedStatus (0.00s)
+=== RUN   TestFail_UpdatesPendingOrDeadStatus
+--- PASS: TestFail_UpdatesPendingOrDeadStatus (0.00s)
+PASS
+ok  	github.com/compute-platform/compute-platform/packages/queue	0.215s
