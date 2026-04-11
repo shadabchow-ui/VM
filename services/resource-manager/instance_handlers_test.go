@@ -55,6 +55,8 @@ import (
 //   - GetJobByInstanceAndID   (FROM jobs WHERE id = $1 AND instance_id = $2)
 // M9 Slice 4: extended for networking queries:
 //   - VPCs, Subnets, SecurityGroups, NetworkInterfaces
+// M10 Slice 1: extended for project queries:
+//   - Projects, Principals
 type memPool struct {
 	instances          map[string]*db.InstanceRow
 	jobs               map[string]*db.JobRow
@@ -66,6 +68,8 @@ type memPool struct {
 	nicSecurityGroups  map[string][]string // nic_id → []sg_id
 	subnetIPAllocations map[string]string  // "subnet:ip" → instance_id (for allocated IPs)
 	nextSubnetIP       map[string]int      // subnet_id → next available IP offset
+	projects           map[string]*db.ProjectRow // M10 Slice 1
+	principals         map[string]string          // id → principal_type (M10 Slice 1)
 }
 
 func newMemPool() *memPool {
@@ -80,6 +84,8 @@ func newMemPool() *memPool {
 		nicSecurityGroups:  make(map[string][]string),
 		subnetIPAllocations: make(map[string]string),
 		nextSubnetIP:       make(map[string]int),
+		projects:           make(map[string]*db.ProjectRow),
+		principals:         make(map[string]string),
 	}
 }
 
@@ -272,6 +278,63 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 			return &fakeTag{1}, nil
 		}
 		return &fakeTag{1}, nil
+
+	// M10 Slice 1: Project operations
+	case strings.Contains(sql, "INSERT INTO principals"):
+		// $1=id, $2=principal_type
+		id := asStr(args[0])
+		principalType := asStr(args[1])
+		p.principals[id] = principalType
+		return &fakeTag{1}, nil
+
+	case strings.Contains(sql, "INSERT INTO projects"):
+		// $1=id, $2=principal_id, $3=created_by, $4=name, $5=display_name, $6=description, $7=status
+		id := asStr(args[0])
+		now := time.Now()
+		p.projects[id] = &db.ProjectRow{
+			ID:          id,
+			PrincipalID: asStr(args[1]),
+			CreatedBy:   asStr(args[2]),
+			Name:        asStr(args[3]),
+			DisplayName: asStr(args[4]),
+			Description: asStrPtr(args[5]),
+			Status:      asStr(args[6]),
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		return &fakeTag{1}, nil
+
+	case strings.Contains(sql, "UPDATE projects") && strings.Contains(sql, "SET deleted_at = NOW()"):
+		// SoftDeleteProject
+		id := asStr(args[0])
+		if proj, ok := p.projects[id]; ok && proj.DeletedAt == nil {
+			now := time.Now()
+			proj.DeletedAt = &now
+			proj.Status = "deleted"
+			proj.UpdatedAt = now
+			return &fakeTag{1}, nil
+		}
+		return &fakeTag{0}, nil
+
+	case strings.Contains(sql, "UPDATE projects") && strings.Contains(sql, "name = $2"):
+		// UpdateProject: $1=id, $2=name, $3=display_name, $4=description
+		id := asStr(args[0])
+		if proj, ok := p.projects[id]; ok && proj.DeletedAt == nil {
+			proj.Name = asStr(args[1])
+			proj.DisplayName = asStr(args[2])
+			if args[3] == nil {
+                proj.Description = nil
+            } else {
+                if v, ok := args[3].(*string); ok {
+                    proj.Description = v
+                } else if v, ok := args[3].(string); ok {
+                    proj.Description = &v
+                }
+            }
+			proj.UpdatedAt = time.Now()
+			return &fakeTag{1}, nil
+		}
+		return &fakeTag{0}, nil
 	}
 	return &fakeTag{0}, nil
 }
@@ -293,6 +356,17 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 		nicID := asStr(args[0])
 		sgIDs := p.nicSecurityGroups[nicID]
 		return &stringRows{values: sgIDs}, nil
+
+	// M10 Slice 1: ListProjectsByCreator
+	case strings.Contains(sql, "FROM projects") && strings.Contains(sql, "created_by"):
+		createdBy := asStr(args[0])
+		var out []*db.ProjectRow
+		for _, r := range p.projects {
+			if r.CreatedBy == createdBy && r.DeletedAt == nil {
+				out = append(out, r)
+			}
+		}
+		return &projRows{rows: out}, nil
 	}
 	return &instRows{}, nil
 }
@@ -389,6 +463,39 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 		p.nextSubnetIP[subnetID] = offset + 1
 		ip := fmt.Sprintf("10.0.0.%d", offset)
 		return &stringValueRow{value: ip}
+
+	// M10 Slice 1: GetProjectByID
+	case strings.Contains(sql, "FROM projects") && strings.Contains(sql, "id = $1"):
+		id := asStr(args[0])
+		proj, ok := p.projects[id]
+		if !ok || proj.DeletedAt != nil {
+			return &errRow{fmt.Errorf("no rows in result set")}
+		}
+		return &projRow{r: proj}
+
+	// M10 Slice 1: GetProjectByPrincipalID
+	case strings.Contains(sql, "FROM projects") && strings.Contains(sql, "principal_id = $1"):
+		principalID := asStr(args[0])
+		for _, proj := range p.projects {
+			if proj.PrincipalID == principalID && proj.DeletedAt == nil {
+				return &projRow{r: proj}
+			}
+		}
+		return &errRow{fmt.Errorf("no rows in result set")}
+
+	// M10 Slice 1: CheckProjectNameExists
+	case strings.Contains(sql, "SELECT EXISTS") && strings.Contains(sql, "FROM projects"):
+		createdBy := asStr(args[0])
+		name := asStr(args[1])
+		excludeID := asStr(args[2])
+		exists := false
+		for _, proj := range p.projects {
+			if proj.CreatedBy == createdBy && proj.Name == name && proj.ID != excludeID && proj.DeletedAt == nil {
+				exists = true
+				break
+			}
+		}
+		return &boolRow{value: exists}
 	}
 
 	return &errRow{fmt.Errorf("no rows in result set")}
@@ -606,6 +713,73 @@ func (r *stringRows) Scan(dest ...any) error {
 func (r *stringRows) Close() {}
 func (r *stringRows) Err() error { return nil }
 
+// M10 Slice 1: projRow scans a single ProjectRow.
+type projRow struct{ r *db.ProjectRow }
+
+func (row *projRow) Scan(dest ...any) error {
+	r := row.r
+	if len(dest) < 10 {
+		return fmt.Errorf("projRow.Scan: need 10 dest, got %d", len(dest))
+	}
+	*dest[0].(*string) = r.ID
+	*dest[1].(*string) = r.PrincipalID
+	*dest[2].(*string) = r.CreatedBy
+	*dest[3].(*string) = r.Name
+	*dest[4].(*string) = r.DisplayName
+	*dest[5].(**string) = r.Description
+	*dest[6].(*string) = r.Status
+	*dest[7].(*time.Time) = r.CreatedAt
+	*dest[8].(*time.Time) = r.UpdatedAt
+	*dest[9].(**time.Time) = r.DeletedAt
+	return nil
+}
+
+// M10 Slice 1: projRows iterates a slice for ListProjectsByCreator.
+type projRows struct {
+	rows []*db.ProjectRow
+	pos  int
+}
+
+func (r *projRows) Next() bool {
+	if r.pos >= len(r.rows) {
+		return false
+	}
+	r.pos++
+	return true
+}
+
+func (r *projRows) Scan(dest ...any) error {
+	row := r.rows[r.pos-1]
+	if len(dest) < 10 {
+		return fmt.Errorf("projRows.Scan: need 10 dest, got %d", len(dest))
+	}
+	*dest[0].(*string) = row.ID
+	*dest[1].(*string) = row.PrincipalID
+	*dest[2].(*string) = row.CreatedBy
+	*dest[3].(*string) = row.Name
+	*dest[4].(*string) = row.DisplayName
+	*dest[5].(**string) = row.Description
+	*dest[6].(*string) = row.Status
+	*dest[7].(*time.Time) = row.CreatedAt
+	*dest[8].(*time.Time) = row.UpdatedAt
+	*dest[9].(**time.Time) = row.DeletedAt
+	return nil
+}
+
+func (r *projRows) Close() {}
+func (r *projRows) Err() error { return nil }
+
+// M10 Slice 1: boolRow returns a single bool value.
+type boolRow struct{ value bool }
+
+func (row *boolRow) Scan(dest ...any) error {
+	if len(dest) < 1 {
+		return fmt.Errorf("boolRow.Scan: need 1 dest")
+	}
+	*dest[0].(*bool) = row.value
+	return nil
+}
+
 // ── Test server ───────────────────────────────────────────────────────────────
 
 type testSrv struct {
@@ -624,6 +798,7 @@ func newTestSrv(t *testing.T) *testSrv {
 	}
 	mux := http.NewServeMux()
 	srv.registerInstanceRoutes(mux)
+	srv.registerProjectRoutes(mux) // M10 Slice 1
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return &testSrv{ts: ts, mem: mem}
@@ -693,6 +868,21 @@ func validCreateBody() CreateInstanceRequest {
 func asStr(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// asStrPtr extracts a *string from an any value.
+// Handles both *string (from repo layer) and string types.
+func asStrPtr(v any) *string {
+	if v == nil {
+		return nil
+	}
+	if sp, ok := v.(*string); ok {
+		return sp
+	}
+	if s, ok := v.(string); ok && s != "" {
+		return &s
+	}
+	return nil
 }
 
 // seedInstance adds a ready-to-use instance owned by principal into memPool.
