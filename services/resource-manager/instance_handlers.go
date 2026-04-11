@@ -14,6 +14,10 @@ package main
 //         returns 503 for transient connectivity failures and 500 for all others.
 //         Gate item DB-6: API must return 503 (not 500, not hang) with request_id
 //         during the PostgreSQL primary failover window.
+// M10 Slice 4: block_devices support in create path.
+//         - Synthesizes default block_devices when omitted (backward compat).
+//         - Passes delete_on_termination through to root disk creation in worker.
+//         - Includes block_devices in InstanceResponse.
 //
 // Control-plane rule: lifecycle handlers enqueue a job via InsertJob.
 // They never call runtime directly. Workers drive all state transitions.
@@ -161,7 +165,14 @@ func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
 // that a duplicate request returns the same instance without creating a new one.
 // If the header is absent, current behaviour is preserved unchanged.
 //
-// Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, JOB_MODEL_V1 §6.
+// M10 Slice 4: block_devices synthesis and wiring.
+//   - If block_devices is omitted/nil, synthesize default from image_id + shape disk size.
+//   - Validate block_devices after synthesis.
+//   - block_devices[0].delete_on_termination is available for downstream use
+//     by the worker (stored via the root_disks table).
+//
+// Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, JOB_MODEL_V1 §6,
+//         execution_blueprint §7.7, P2_VOLUME_MODEL §1.
 func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFromCtx(r.Context())
 
@@ -196,6 +207,26 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, errInvalidRequest,
 			"Request body is not valid JSON.", "")
 		return
+	}
+
+	// M10 Slice 4: synthesize default block_devices when omitted.
+	// This preserves backward compatibility: existing clients that do not send
+	// block_devices get the same behavior as before.
+	// Source: INSTANCE_MODEL_V1 §2, execution_blueprint §7.7.
+	if len(req.BlockDevices) == 0 {
+		defaultSizeGB := shapeDiskSizeGB[req.InstanceType]
+		if defaultSizeGB == 0 {
+			// If instance type is invalid, set a placeholder. Validation will
+			// reject the instance_type field separately.
+			defaultSizeGB = 50
+		}
+		req.BlockDevices = []BlockDeviceMapping{
+			{
+				ImageID:             req.ImageID,
+				SizeGB:              defaultSizeGB,
+				DeleteOnTermination: true, // Phase 1 default
+			},
+		}
 	}
 
 	if errs := validateCreateRequest(&req); len(errs) > 0 {
@@ -258,6 +289,9 @@ if req.Networking != nil && req.Networking.SubnetID != "" {
 	ip, _ := s.repo.GetIPByInstance(r.Context(), created.ID)
 	resp := instanceToResponse(created, s.region, ip)
 
+	// M10 Slice 4: attach the block_devices from the request to the response.
+	resp.BlockDevices = req.BlockDevices
+
 	if nic != nil {
 		// Fetch SG IDs for consistent response shape with GET/LIST
 		sgIDs, _ := s.repo.ListSecurityGroupIDsByNIC(r.Context(), nic.ID)
@@ -304,6 +338,8 @@ func (s *server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 		ip, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
 		resp := instanceToResponse(row, s.region, ip)
 s.enrichResponseWithNetworking(r.Context(), &resp, row.ID)
+		// M10 Slice 4: enrich with block_devices from root_disks table.
+		s.enrichResponseWithBlockDevices(r.Context(), &resp, row.ID)
 out = append(out, resp)
 	}
 
@@ -330,6 +366,8 @@ func (s *server) handleGetInstance(w http.ResponseWriter, r *http.Request, id st
 	ip, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
 	resp := instanceToResponse(row, s.region, ip)
 s.enrichResponseWithNetworking(r.Context(), &resp, row.ID)
+	// M10 Slice 4: enrich with block_devices from root_disks table.
+	s.enrichResponseWithBlockDevices(r.Context(), &resp, row.ID)
 writeJSON(w, http.StatusOK, resp)
 }
 
@@ -490,6 +528,7 @@ func writeDBError(w http.ResponseWriter, err error) {
 
 // instanceToResponse maps a db.InstanceRow to the canonical InstanceResponse.
 // M7: ip param carries the allocated IP from GetIPByInstance (empty string = nil fields).
+// M10 Slice 4: BlockDevices initialized to empty slice (populated by caller or enrichment).
 // Source: INSTANCE_MODEL_V1 §2, §4.
 func instanceToResponse(row *db.InstanceRow, region, ip string) InstanceResponse {
 	resp := InstanceResponse{
@@ -501,6 +540,7 @@ func instanceToResponse(row *db.InstanceRow, region, ip string) InstanceResponse
 		AvailabilityZone: row.AvailabilityZone,
 		Region:           region,
 		Labels:           map[string]string{},
+		BlockDevices:     []BlockDeviceMapping{},
 		CreatedAt:        row.CreatedAt,
 		UpdatedAt:        row.UpdatedAt,
 	}
@@ -511,6 +551,37 @@ func instanceToResponse(row *db.InstanceRow, region, ip string) InstanceResponse
 		resp.PrivateIP = &ip
 	}
 	return resp
+}
+
+// enrichResponseWithBlockDevices populates block_devices from the root_disks table.
+// For instances created before M10 Slice 4 (no root_disk record), synthesizes
+// the Phase 1 default from image_id + shape disk size + delete_on_termination=true.
+// Source: INSTANCE_MODEL_V1 §2, 06-01-root-disk-model-and-persistence-semantics.md.
+func (s *server) enrichResponseWithBlockDevices(ctx context.Context, resp *InstanceResponse, instanceID string) {
+	disk, err := s.repo.GetRootDiskByInstanceID(ctx, instanceID)
+	if err != nil || disk == nil {
+		// No root disk record: pre-Slice-4 instance or disk already deleted.
+		// Synthesize default block_devices for API consistency.
+		defaultSize := shapeDiskSizeGB[resp.InstanceType]
+		if defaultSize == 0 {
+			defaultSize = 50
+		}
+		resp.BlockDevices = []BlockDeviceMapping{
+			{
+				ImageID:             resp.ImageID,
+				SizeGB:              defaultSize,
+				DeleteOnTermination: true,
+			},
+		}
+		return
+	}
+	resp.BlockDevices = []BlockDeviceMapping{
+		{
+			ImageID:             disk.SourceImageID,
+			SizeGB:              disk.SizeGB,
+			DeleteOnTermination: disk.DeleteOnTermination,
+		},
+	}
 }
 
 // jobToResponse maps a db.JobRow to the canonical JobResponse.

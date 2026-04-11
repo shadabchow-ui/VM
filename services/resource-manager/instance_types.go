@@ -8,6 +8,10 @@ package main
 // M7:     Added PublicIP, PrivateIP to InstanceResponse.
 //         Added SSHKeyResponse, CreateSSHKeyRequest, ListSSHKeysResponse.
 //         Added EventResponse, ListEventsResponse.
+// M10 Slice 4: Added BlockDeviceMapping, BlockDevices field on create request
+//         and InstanceResponse. Source: INSTANCE_MODEL_V1 §2 (block_devices),
+//         execution_blueprint §7.7 (block_devices: [{image_id, size_gb, delete_on_termination}]),
+//         P2_VOLUME_MODEL §1, P2_MIGRATION_COMPATIBILITY_RULES §7.2.
 //
 // Source: INSTANCE_MODEL_V1 §2, JOB_MODEL_V1 §1, 08-01 §3,
 //         09-01 §detail card, 10-02 §SSH key handling.
@@ -18,35 +22,54 @@ import "time"
 
 // InstanceResponse is the canonical JSON shape returned by instance endpoints.
 // M7: added PublicIP, PrivateIP from ip_allocations join.
+// M10 Slice 4: added BlockDevices.
 // Source: INSTANCE_MODEL_V1 §2.
 type InstanceResponse struct {
-	ID               string            `json:"id"`
-	Name             string            `json:"name"`
-	Status           string            `json:"status"`
-	InstanceType     string            `json:"instance_type"`
-	ImageID          string            `json:"image_id"`
-	AvailabilityZone string            `json:"availability_zone"`
-	Region           string            `json:"region"`
-	Labels           map[string]string `json:"labels"`
-	Networking       *InstanceNetworkingResponse `json:"networking,omitempty"`
-	PublicIP         *string           `json:"public_ip"`
-	PrivateIP        *string           `json:"private_ip"`
-	CreatedAt        time.Time         `json:"created_at"`
-	UpdatedAt        time.Time         `json:"updated_at"`
+	ID               string                       `json:"id"`
+	Name             string                       `json:"name"`
+	Status           string                       `json:"status"`
+	InstanceType     string                       `json:"instance_type"`
+	ImageID          string                       `json:"image_id"`
+	AvailabilityZone string                       `json:"availability_zone"`
+	Region           string                       `json:"region"`
+	Labels           map[string]string             `json:"labels"`
+	BlockDevices     []BlockDeviceMapping          `json:"block_devices"`
+	Networking       *InstanceNetworkingResponse   `json:"networking,omitempty"`
+	PublicIP         *string                       `json:"public_ip"`
+	PrivateIP        *string                       `json:"private_ip"`
+	CreatedAt        time.Time                     `json:"created_at"`
+	UpdatedAt        time.Time                     `json:"updated_at"`
+}
+
+// ── Block device mapping (M10 Slice 4) ──────────────────────────────────────
+
+// BlockDeviceMapping represents a single block device in the create request
+// and instance response. Phase 1: exactly one entry (root disk).
+// Phase 1 constraint: delete_on_termination must be true.
+// Source: INSTANCE_MODEL_V1 §2 (block_devices item shape),
+//         execution_blueprint §7.7, 12-03-risks-and-phase-2-expansion.md.
+type BlockDeviceMapping struct {
+	ImageID              string `json:"image_id"`
+	SizeGB               int    `json:"size_gb"`
+	DeleteOnTermination  bool   `json:"delete_on_termination"`
 }
 
 // ── Create ────────────────────────────────────────────────────────────────────
 
 // CreateInstanceRequest is the payload for POST /v1/instances.
-// Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, 08-02 §validation.
+// M10 Slice 4: added BlockDevices. When omitted, the handler synthesizes
+// a default entry from image_id + shape disk size + delete_on_termination=true.
+// Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, 08-02 §validation,
+//         execution_blueprint §7.7.
 type CreateInstanceRequest struct {
-	Name             string            `json:"name"`
-	InstanceType     string            `json:"instance_type"`
-	ImageID          string            `json:"image_id"`
-	AvailabilityZone string            `json:"availability_zone"`
-	SSHKeyName       string            `json:"ssh_key_name"`
-	Labels           map[string]string `json:"labels"`
-	Networking       *NetworkingConfig `json:"networking,omitempty"`
+	Name             string              `json:"name"`
+	InstanceType     string              `json:"instance_type"`
+	ImageID          string              `json:"image_id"`
+	AvailabilityZone string              `json:"availability_zone"`
+	SSHKeyName       string              `json:"ssh_key_name"`
+	Labels           map[string]string   `json:"labels"`
+	Networking       *NetworkingConfig   `json:"networking,omitempty"`
+	BlockDevices     []BlockDeviceMapping `json:"block_devices,omitempty"`
 }
 
 // CreateInstanceResponse is returned from POST /v1/instances with 202 Accepted.

@@ -10,6 +10,8 @@ package main
 //   Gate item DB-6 requires HTTP 503 (not 500, not hang) with request_id when the
 //   PostgreSQL primary is unavailable during a failover drill. Without this change
 //   all DB connectivity errors produce HTTP 500, which fails DB-6.
+// M10 Slice 4: Added errInvalidBlockDeviceMapping, errDeleteOnTerminationRequired.
+//   Source: API_ERROR_CONTRACT_V1 §4 (error code catalog).
 //
 // Source: API_ERROR_CONTRACT_V1 §1 (envelope shape),
 //         §2 (HTTP status mapping),
@@ -43,6 +45,10 @@ const (
 	// Maps to HTTP 503. Source: API_ERROR_CONTRACT_V1 §2 and §4.
 	// Added: P2-M1/WS-H1 gate item DB-6.
 	errServiceUnavailable = "service_unavailable"
+	// M10 Slice 4: block device mapping error codes.
+	// Source: API_ERROR_CONTRACT_V1 §4 (invalid_block_device_mapping, delete_on_termination_required).
+	errInvalidBlockDeviceMapping    = "invalid_block_device_mapping"
+	errDeleteOnTerminationRequired  = "delete_on_termination_required"
 )
 
 // apiError is the structured error envelope sent in every error response.
