@@ -259,14 +259,20 @@ if req.Networking != nil && req.Networking.SubnetID != "" {
 	resp := instanceToResponse(created, s.region, ip)
 
 	if nic != nil {
+		// Fetch SG IDs for consistent response shape with GET/LIST
+		sgIDs, _ := s.repo.ListSecurityGroupIDsByNIC(r.Context(), nic.ID)
+		if sgIDs == nil {
+			sgIDs = []string{}
+		}
 		resp.Networking = &InstanceNetworkingResponse{
 			VPCID:    nic.VPCID,
 			SubnetID: nic.SubnetID,
 			PrimaryInterface: &NetworkInterfaceResponse{
-				ID:         nic.ID,
-				PrivateIP:  nic.PrivateIP,
-				MACAddress: nic.MACAddress,
-				Status:     nic.Status,
+				ID:               nic.ID,
+				PrivateIP:        nic.PrivateIP,
+				MACAddress:       nic.MACAddress,
+				Status:           nic.Status,
+				SecurityGroupIDs: sgIDs,
 			},
 		}
 		resp.PrivateIP = &nic.PrivateIP

@@ -798,6 +798,53 @@ func TestCreate_VPCInstance_WithSubnet(t *testing.T) {
 	}
 }
 
+func TestCreate_VPCInstance_SecurityGroupIDsInResponse(t *testing.T) {
+	s := newTestSrv(t)
+	seedVPCInfrastructure(s.mem, "vpc_sgtest", "subnet_sgtest", alice)
+
+	// Add additional security groups
+	s.mem.seedSecurityGroup(&db.SecurityGroupRow{
+		ID:               "sg_custom_1",
+		VPCID:            "vpc_sgtest",
+		OwnerPrincipalID: alice,
+		Name:             "custom-sg-1",
+		IsDefault:        false,
+	})
+	s.mem.seedSecurityGroup(&db.SecurityGroupRow{
+		ID:               "sg_custom_2",
+		VPCID:            "vpc_sgtest",
+		OwnerPrincipalID: alice,
+		Name:             "custom-sg-2",
+		IsDefault:        false,
+	})
+
+	body := validCreateBody()
+	body.Networking = &NetworkingConfig{
+		SubnetID:         "subnet_sgtest",
+		SecurityGroupIDs: []string{"sg_custom_1", "sg_custom_2"},
+	}
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202, got %d", resp.StatusCode)
+	}
+
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+
+	if out.Instance.Networking == nil {
+		t.Fatal("expected networking info")
+	}
+	if out.Instance.Networking.PrimaryInterface == nil {
+		t.Fatal("expected primary interface")
+	}
+	// Verify SecurityGroupIDs are in CREATE response (not just GET)
+	if len(out.Instance.Networking.PrimaryInterface.SecurityGroupIDs) != 2 {
+		t.Errorf("want 2 security groups in create response, got %d",
+			len(out.Instance.Networking.PrimaryInterface.SecurityGroupIDs))
+	}
+}
+
 func TestCreate_VPCInstance_SubnetNotFound(t *testing.T) {
 	s := newTestSrv(t)
 
