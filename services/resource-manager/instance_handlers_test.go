@@ -57,6 +57,8 @@ import (
 //   - VPCs, Subnets, SecurityGroups, NetworkInterfaces
 // M10 Slice 1: extended for project queries:
 //   - Projects, Principals
+// M10 Slice 2: extended for root disk queries:
+//   - RootDisks
 type memPool struct {
 	instances          map[string]*db.InstanceRow
 	jobs               map[string]*db.JobRow
@@ -70,6 +72,7 @@ type memPool struct {
 	nextSubnetIP       map[string]int      // subnet_id → next available IP offset
 	projects           map[string]*db.ProjectRow // M10 Slice 1
 	principals         map[string]string          // id → principal_type (M10 Slice 1)
+	rootDisks          map[string]*db.RootDiskRow // M10 Slice 2
 }
 
 func newMemPool() *memPool {
@@ -86,6 +89,7 @@ func newMemPool() *memPool {
 		nextSubnetIP:       make(map[string]int),
 		projects:           make(map[string]*db.ProjectRow),
 		principals:         make(map[string]string),
+		rootDisks:          make(map[string]*db.RootDiskRow),
 	}
 }
 
@@ -164,6 +168,17 @@ func (p *memPool) seedSecurityGroup(row *db.SecurityGroupRow) {
 		row.UpdatedAt = now
 	}
 	p.securityGroups[row.ID] = row
+}
+
+// seedRootDisk adds a RootDisk directly (M10 Slice 2).
+func (p *memPool) seedRootDisk(row *db.RootDiskRow) {
+	if row.CreatedAt.IsZero() {
+		row.CreatedAt = time.Now()
+	}
+	if row.Status == "" {
+		row.Status = db.RootDiskStatusAttached
+	}
+	p.rootDisks[row.DiskID] = row
 }
 
 // seedNetworkInterface adds a NIC directly.
@@ -335,6 +350,61 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 			return &fakeTag{1}, nil
 		}
 		return &fakeTag{0}, nil
+
+	// M10 Slice 2: Root disk operations
+	case strings.Contains(sql, "INSERT INTO root_disks"):
+		// $1=disk_id, $2=instance_id, $3=source_image_id, $4=storage_pool_id,
+		// $5=storage_path, $6=size_gb, $7=delete_on_termination, $8=status
+		diskID := asStr(args[0])
+		now := time.Now()
+		var instID *string
+		if args[1] != nil {
+			if s, ok := args[1].(string); ok && s != "" {
+				instID = &s
+			} else if sp, ok := args[1].(*string); ok {
+				instID = sp
+			}
+		}
+		p.rootDisks[diskID] = &db.RootDiskRow{
+			DiskID:              diskID,
+			InstanceID:          instID,
+			SourceImageID:       asStr(args[2]),
+			StoragePoolID:       asStr(args[3]),
+			StoragePath:         asStr(args[4]),
+			SizeGB:              args[5].(int),
+			DeleteOnTermination: args[6].(bool),
+			Status:              asStr(args[7]),
+			CreatedAt:           now,
+		}
+		return &fakeTag{1}, nil
+
+	case strings.Contains(sql, "UPDATE root_disks") && strings.Contains(sql, "instance_id = NULL"):
+		// DetachRootDisk: $1=disk_id, $2=status (DETACHED)
+		diskID := asStr(args[0])
+		if disk, ok := p.rootDisks[diskID]; ok {
+			disk.InstanceID = nil
+			disk.Status = asStr(args[1])
+			return &fakeTag{1}, nil
+		}
+		return &fakeTag{0}, nil
+
+	case strings.Contains(sql, "UPDATE root_disks") && strings.Contains(sql, "status = $2"):
+		// UpdateRootDiskStatus: $1=disk_id, $2=status
+		diskID := asStr(args[0])
+		if disk, ok := p.rootDisks[diskID]; ok {
+			disk.Status = asStr(args[1])
+			return &fakeTag{1}, nil
+		}
+		return &fakeTag{0}, nil
+
+	case strings.Contains(sql, "DELETE FROM root_disks"):
+		// DeleteRootDisk: $1=disk_id
+		diskID := asStr(args[0])
+		if _, ok := p.rootDisks[diskID]; ok {
+			delete(p.rootDisks, diskID)
+			return &fakeTag{1}, nil
+		}
+		return &fakeTag{0}, nil
 	}
 	return &fakeTag{0}, nil
 }
@@ -367,6 +437,26 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 			}
 		}
 		return &projRows{rows: out}, nil
+
+	// M10 Slice 2: ListDetachedRootDisks
+	case strings.Contains(sql, "FROM root_disks") && strings.Contains(sql, "status = $1"):
+		status := asStr(args[0])
+		limit := 100
+		if len(args) > 1 {
+			if l, ok := args[1].(int); ok {
+				limit = l
+			}
+		}
+		var out []*db.RootDiskRow
+		for _, r := range p.rootDisks {
+			if r.Status == status {
+				out = append(out, r)
+				if len(out) >= limit {
+					break
+				}
+			}
+		}
+		return &rootDiskRows{rows: out}, nil
 	}
 	return &instRows{}, nil
 }
@@ -496,6 +586,25 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 			}
 		}
 		return &boolRow{value: exists}
+
+	// M10 Slice 2: GetRootDiskByID
+	case strings.Contains(sql, "FROM root_disks") && strings.Contains(sql, "disk_id = $1"):
+		diskID := asStr(args[0])
+		disk, ok := p.rootDisks[diskID]
+		if !ok {
+			return &errRow{fmt.Errorf("no rows in result set")}
+		}
+		return &rootDiskRow{r: disk}
+
+	// M10 Slice 2: GetRootDiskByInstanceID
+	case strings.Contains(sql, "FROM root_disks") && strings.Contains(sql, "instance_id = $1"):
+		instanceID := asStr(args[0])
+		for _, disk := range p.rootDisks {
+			if disk.InstanceID != nil && *disk.InstanceID == instanceID {
+				return &rootDiskRow{r: disk}
+			}
+		}
+		return &errRow{fmt.Errorf("no rows in result set")}
 	}
 
 	return &errRow{fmt.Errorf("no rows in result set")}
@@ -779,6 +888,60 @@ func (row *boolRow) Scan(dest ...any) error {
 	*dest[0].(*bool) = row.value
 	return nil
 }
+
+// M10 Slice 2: rootDiskRow scans a single RootDiskRow.
+type rootDiskRow struct{ r *db.RootDiskRow }
+
+func (row *rootDiskRow) Scan(dest ...any) error {
+	r := row.r
+	if len(dest) < 9 {
+		return fmt.Errorf("rootDiskRow.Scan: need 9 dest, got %d", len(dest))
+	}
+	*dest[0].(*string) = r.DiskID
+	*dest[1].(**string) = r.InstanceID
+	*dest[2].(*string) = r.SourceImageID
+	*dest[3].(*string) = r.StoragePoolID
+	*dest[4].(*string) = r.StoragePath
+	*dest[5].(*int) = r.SizeGB
+	*dest[6].(*bool) = r.DeleteOnTermination
+	*dest[7].(*string) = r.Status
+	*dest[8].(*time.Time) = r.CreatedAt
+	return nil
+}
+
+// M10 Slice 2: rootDiskRows iterates a slice for ListDetachedRootDisks.
+type rootDiskRows struct {
+	rows []*db.RootDiskRow
+	pos  int
+}
+
+func (r *rootDiskRows) Next() bool {
+	if r.pos >= len(r.rows) {
+		return false
+	}
+	r.pos++
+	return true
+}
+
+func (r *rootDiskRows) Scan(dest ...any) error {
+	row := r.rows[r.pos-1]
+	if len(dest) < 9 {
+		return fmt.Errorf("rootDiskRows.Scan: need 9 dest, got %d", len(dest))
+	}
+	*dest[0].(*string) = row.DiskID
+	*dest[1].(**string) = row.InstanceID
+	*dest[2].(*string) = row.SourceImageID
+	*dest[3].(*string) = row.StoragePoolID
+	*dest[4].(*string) = row.StoragePath
+	*dest[5].(*int) = row.SizeGB
+	*dest[6].(*bool) = row.DeleteOnTermination
+	*dest[7].(*string) = row.Status
+	*dest[8].(*time.Time) = row.CreatedAt
+	return nil
+}
+
+func (r *rootDiskRows) Close() {}
+func (r *rootDiskRows) Err() error { return nil }
 
 // ── Test server ───────────────────────────────────────────────────────────────
 
