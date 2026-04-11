@@ -6,6 +6,11 @@ package handlers
 //
 // InstanceStore and NetworkController are interfaces so tests can inject fakes
 // without touching the real database or network controller.
+//
+// M10 Slice 3: InstanceStore extended with root disk methods required by
+// lifecycle wiring (create → CreateRootDisk/UpdateRootDiskStatus,
+// delete → GetRootDiskByInstanceID + DeleteRootDisk/DetachRootDisk).
+// *db.Repo satisfies all methods (CRUD added in Slice 2).
 
 import (
 	"context"
@@ -21,10 +26,11 @@ type Handler interface {
 }
 
 // ── InstanceStore ─────────────────────────────────────────────────────────────
-// Subset of *db.Repo used by the create and delete handlers.
+// Subset of *db.Repo used by create, delete, stop, start, and reboot handlers.
 // *db.Repo satisfies this interface. Tests inject a fake.
 
 type InstanceStore interface {
+	// Instance operations
 	GetInstanceByID(ctx context.Context, id string) (*db.InstanceRow, error)
 	UpdateInstanceState(ctx context.Context, id, expectedState, newState string, version int) error
 	AssignHost(ctx context.Context, instanceID, hostID string, version int) error
@@ -32,6 +38,15 @@ type InstanceStore interface {
 	GetAvailableHosts(ctx context.Context) ([]*db.HostRecord, error)
 	InsertEvent(ctx context.Context, row *db.EventRow) error
 	GetIPByInstance(ctx context.Context, instanceID string) (string, error)
+
+	// Root disk operations (M10 Slice 3)
+	// Source: 06-01-root-disk-model-and-persistence-semantics.md,
+	//         P2_VOLUME_MODEL.md §1.
+	CreateRootDisk(ctx context.Context, row *db.RootDiskRow) error
+	GetRootDiskByInstanceID(ctx context.Context, instanceID string) (*db.RootDiskRow, error)
+	UpdateRootDiskStatus(ctx context.Context, diskID, status string) error
+	DeleteRootDisk(ctx context.Context, diskID string) error
+	DetachRootDisk(ctx context.Context, diskID string) error
 }
 
 // ── NetworkController ─────────────────────────────────────────────────────────

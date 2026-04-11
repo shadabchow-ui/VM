@@ -9,10 +9,14 @@ package handlers
 //  1. DB: transition requested → provisioning. Write provisioning.start event.
 //  2. Scheduler: select host (first-fit by free CPU from InstanceStore.GetAvailableHosts).
 //  3. DB: assign host_id.
+//  3b. DB: create root_disks record (status=CREATING). Idempotent: skip if already exists.
+//       Source: 06-01-root-disk-model-and-persistence-semantics.md (root disk object model),
+//               P2_VOLUME_MODEL.md §1 (Phase 1: delete_on_termination always true).
 //  4. Network: allocate IP (SELECT FOR UPDATE SKIP LOCKED via network controller).
 //  5. Host Agent: CreateInstance (rootfs + TAP + NAT + Firecracker).
 //  6. Readiness: wait for SSH port (up to 120s). Mockable via readinessFn for tests.
-//  7. DB: transition provisioning → running. Write usage.start + provisioning.done events.
+//  7. DB: transition provisioning → running. Update root disk status to ATTACHED.
+//         Write usage.start + provisioning.done events.
 //
 // Failure at any step triggers rollback in reverse order.
 // All Host Agent operations are idempotent — safe to replay on retry.
@@ -36,7 +40,20 @@ const (
 	readinessPoll    = 3 * time.Second
 	sshPort          = "22"
 	phase1VPCID      = "00000000-0000-0000-0000-000000000001"
+
+	// phase1StoragePoolID is the fixed NFS pool ID for Phase 1.
+	// All root disks are stored on the shared NFS export.
+	// Source: 06-01-root-disk-model-and-persistence-semantics.md §Phase 1 Storage Backend.
+	phase1StoragePoolID = "00000000-0000-0000-0000-000000000002"
 )
+
+// rootDiskIDFromInstance derives a deterministic disk ID from the instance ID.
+// Phase 1: exactly one root disk per instance. Deterministic ID makes
+// CreateRootDisk idempotent on job retry.
+// Format: "disk_" + instance_id (matches existing test data conventions).
+func rootDiskIDFromInstance(instanceID string) string {
+	return "disk_" + instanceID
+}
 
 // CreateHandler handles INSTANCE_CREATE jobs.
 type CreateHandler struct {
@@ -103,6 +120,43 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	}
 	log.Info("step3: host assigned", "host_id", selectedHost.ID)
 
+	// ── Step 3b: Create root disk record ──────────────────────────────────────
+	// A root_disks row is inserted here so the control plane tracks the disk
+	// as a first-class object independent of the instance row.
+	// Phase 1 contract: delete_on_termination is always true.
+	// Source: 06-01-root-disk-model-and-persistence-semantics.md §Root Disk Object Model,
+	//         P2_VOLUME_MODEL.md §1.
+	diskID := rootDiskIDFromInstance(inst.ID)
+	diskSizeGB := int(shapeDiskGB(inst.InstanceTypeID))
+	storagePath := fmt.Sprintf("nfs://filer/vol/%s.qcow2", diskID)
+
+	// Idempotent: if the disk row already exists (job retry), skip insert.
+	existingDisk, err := h.deps.Store.GetRootDiskByInstanceID(ctx, inst.ID)
+	if err != nil {
+		return h.failInstance(ctx, inst, fmt.Errorf("step3b check existing disk: %w", err))
+	}
+	if existingDisk == nil {
+		instIDCopy := inst.ID
+		diskRow := &db.RootDiskRow{
+			DiskID:              diskID,
+			InstanceID:          &instIDCopy,
+			SourceImageID:       inst.ImageID,
+			StoragePoolID:       phase1StoragePoolID,
+			StoragePath:         storagePath,
+			SizeGB:              diskSizeGB,
+			DeleteOnTermination: true, // Phase 1 immutable default
+			Status:              db.RootDiskStatusCreating,
+		}
+		if err := h.deps.Store.CreateRootDisk(ctx, diskRow); err != nil {
+			return h.failInstance(ctx, inst, fmt.Errorf("step3b create root disk: %w", err))
+		}
+		log.Info("step3b: root disk record created", "disk_id", diskID, "storage_path", storagePath)
+	} else {
+		diskID = existingDisk.DiskID
+		storagePath = existingDisk.StoragePath
+		log.Info("step3b: root disk record already exists (retry)", "disk_id", diskID)
+	}
+
 	// ── Step 4: Allocate IP ───────────────────────────────────────────────────
 	vpcID := phase1VPCID
 	allocatedIP, err := h.deps.Network.AllocateIP(ctx, vpcID, inst.ID)
@@ -123,7 +177,9 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 		CPUCores:       shapeCPU(inst.InstanceTypeID),
 		MemoryMB:       shapeMemMB(inst.InstanceTypeID),
 		DiskGB:         shapeDiskGB(inst.InstanceTypeID),
-		RootfsPath:     fmt.Sprintf("/mnt/nfs/vols/%s.qcow2", inst.ID),
+		// RootfsPath derives from disk storage path (NFS-backed qcow2).
+		// Source: 06-01-root-disk-model-and-persistence-semantics.md §CoW Implementation.
+		RootfsPath: fmt.Sprintf("/mnt/nfs/vols/%s.qcow2", diskID),
 		Network: runtimeclient.NetworkConfig{
 			PrivateIP:  allocatedIP,
 			TapDevice:  "tap-" + inst.ID[:8],
@@ -132,6 +188,8 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	}
 	if _, err := rtClient.CreateInstance(ctx, createReq); err != nil {
 		// Rollback: release IP, then fail instance.
+		// Root disk record is left as CREATING; it will be cleaned up by
+		// the reconciler's orphan GC or on next delete job.
 		if relErr := h.deps.Network.ReleaseIP(ctx, allocatedIP, vpcID, inst.ID); relErr != nil {
 			log.Error("rollback: IP release failed", "error", relErr)
 		}
@@ -150,13 +208,20 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	}
 	log.Info("step6: VM ready")
 
-	// ── Step 7: Transition to running ────────────────────────────────────────
+	// ── Step 7: Transition to running + mark disk ATTACHED ───────────────────
 	if err := h.deps.Store.UpdateInstanceState(ctx, inst.ID, "provisioning", "running", inst.Version); err != nil {
 		return fmt.Errorf("step7 transition to running: %w", err)
 	}
+	// Update root disk status to ATTACHED now that the VM is live.
+	// Source: 06-01-root-disk-model-and-persistence-semantics.md §status values.
+	if err := h.deps.Store.UpdateRootDiskStatus(ctx, diskID, db.RootDiskStatusAttached); err != nil {
+		// Non-fatal: instance is running. Log and continue.
+		// The reconciler can repair status drift.
+		log.Error("step7: UpdateRootDiskStatus to ATTACHED failed — non-fatal", "disk_id", diskID, "error", err)
+	}
 	h.writeEvent(ctx, inst.ID, db.EventInstanceProvisioningDone, "Provisioning complete")
 	h.writeEvent(ctx, inst.ID, db.EventUsageStart, "Usage billing started")
-	log.Info("INSTANCE_CREATE: completed — instance running", "ip", allocatedIP)
+	log.Info("INSTANCE_CREATE: completed — instance running", "ip", allocatedIP, "disk_id", diskID)
 	return nil
 }
 

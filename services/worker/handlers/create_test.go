@@ -7,6 +7,9 @@ package handlers
 // readinessFn is overridden to return immediately (no TCP dial).
 //
 // Source: 11-02-phase-1-test-strategy-and-lifecycle-test-matrix.md §Unit.
+//
+// M10 Slice 3: fakeStore extended with root disk methods to satisfy the updated
+// InstanceStore interface. Four new tests added for root disk lifecycle wiring.
 
 import (
 	"context"
@@ -30,12 +33,14 @@ type fakeStore struct {
 	events    []*db.EventRow
 	hosts     []*db.HostRecord
 	ips       map[string]string // instanceID → ip
+	rootDisks map[string]*db.RootDiskRow // diskID → disk (M10 Slice 3)
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		instances: make(map[string]*db.InstanceRow),
 		ips:       make(map[string]string),
+		rootDisks: make(map[string]*db.RootDiskRow),
 	}
 }
 
@@ -119,6 +124,64 @@ func (s *fakeStore) GetIPByInstance(_ context.Context, instanceID string) (strin
 	return s.ips[instanceID], nil
 }
 
+// ── Root disk methods (M10 Slice 3) ──────────────────────────────────────────
+// These satisfy the InstanceStore interface extension added in Slice 3.
+// Source: 06-01-root-disk-model-and-persistence-semantics.md.
+
+func (s *fakeStore) CreateRootDisk(_ context.Context, row *db.RootDiskRow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if row.CreatedAt.IsZero() {
+		row.CreatedAt = time.Now()
+	}
+	s.rootDisks[row.DiskID] = row
+	return nil
+}
+
+func (s *fakeStore) GetRootDiskByInstanceID(_ context.Context, instanceID string) (*db.RootDiskRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, disk := range s.rootDisks {
+		if disk.InstanceID != nil && *disk.InstanceID == instanceID {
+			cp := *disk
+			return &cp, nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *fakeStore) UpdateRootDiskStatus(_ context.Context, diskID, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	disk, ok := s.rootDisks[diskID]
+	if !ok {
+		return fmt.Errorf("disk %s not found", diskID)
+	}
+	disk.Status = status
+	return nil
+}
+
+func (s *fakeStore) DeleteRootDisk(_ context.Context, diskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.rootDisks, diskID)
+	return nil
+}
+
+func (s *fakeStore) DetachRootDisk(_ context.Context, diskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	disk, ok := s.rootDisks[diskID]
+	if !ok {
+		return fmt.Errorf("disk %s not found", diskID)
+	}
+	disk.InstanceID = nil
+	disk.Status = db.RootDiskStatusDetached
+	return nil
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
 // eventTypes returns the list of event types written so far (for assertions).
 func (s *fakeStore) eventTypes() []string {
 	s.mu.Lock()
@@ -128,6 +191,31 @@ func (s *fakeStore) eventTypes() []string {
 		out[i] = e.EventType
 	}
 	return out
+}
+
+// getDisk returns the root disk for an instance ID (for test assertions).
+func (s *fakeStore) getDiskByInstance(instanceID string) *db.RootDiskRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, disk := range s.rootDisks {
+		if disk.InstanceID != nil && *disk.InstanceID == instanceID {
+			cp := *disk
+			return &cp
+		}
+	}
+	return nil
+}
+
+// getDiskByID returns a disk by disk ID (for test assertions).
+func (s *fakeStore) getDiskByID(diskID string) *db.RootDiskRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	disk, ok := s.rootDisks[diskID]
+	if !ok {
+		return nil
+	}
+	cp := *disk
+	return &cp
 }
 
 // ── fakeNetwork — implements NetworkController ────────────────────────────────
@@ -162,9 +250,10 @@ func (n *fakeNetwork) ReleaseIP(_ context.Context, ip, _, _ string) error {
 // ── fakeRuntimeClient — implements RuntimeClient ──────────────────────────────
 
 type fakeRuntime struct {
-	mu           sync.Mutex
-	createFail   bool
-	deletedInsts []string
+	mu             sync.Mutex
+	createFail     bool
+	deletedInsts   []string
+	lastDeleteReq  *runtimeclient.DeleteInstanceRequest // M10 Slice 3: capture delete flags
 }
 
 func (r *fakeRuntime) CreateInstance(_ context.Context, req *runtimeclient.CreateInstanceRequest) (*runtimeclient.CreateInstanceResponse, error) {
@@ -184,6 +273,8 @@ func (r *fakeRuntime) DeleteInstance(_ context.Context, req *runtimeclient.Delet
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.deletedInsts = append(r.deletedInsts, req.InstanceID)
+	reqCopy := *req
+	r.lastDeleteReq = &reqCopy
 	return &runtimeclient.DeleteInstanceResponse{InstanceID: req.InstanceID, State: "DELETED"}, nil
 }
 
@@ -465,6 +556,259 @@ func TestDeleteHandler_UsageEndEventWritten(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("usage.end event not written; got %v", evts)
+	}
+}
+
+// ── M10 Slice 3: Root disk lifecycle wiring tests ─────────────────────────────
+//
+// Source: 06-01-root-disk-model-and-persistence-semantics.md §Delete Semantics,
+//         P2_VOLUME_MODEL.md §1.
+
+// TestCreateHandler_RootDiskCreatedAndAttached verifies that a successful
+// INSTANCE_CREATE creates a root_disks record in CREATING status and advances
+// it to ATTACHED once the VM is running.
+func TestCreateHandler_RootDiskCreatedAndAttached(t *testing.T) {
+	store := newFakeStore()
+	store.hosts = []*db.HostRecord{newReadyHost()}
+	net := &fakeNetwork{nextIP: "10.0.0.20"}
+	rt := &fakeRuntime{}
+
+	const id = "inst_disk_create"
+	store.instances[id] = newRequestedInstance(id)
+
+	h := newTestCreateHandler(store, net, rt)
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_CREATE")); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// Instance must be running.
+	if store.instances[id].VMState != "running" {
+		t.Errorf("vm_state = %q, want running", store.instances[id].VMState)
+	}
+
+	// A root disk record must exist with status ATTACHED.
+	disk := store.getDiskByInstance(id)
+	if disk == nil {
+		t.Fatal("no root disk record created for instance")
+	}
+	if disk.Status != db.RootDiskStatusAttached {
+		t.Errorf("disk status = %q, want ATTACHED", disk.Status)
+	}
+	if !disk.DeleteOnTermination {
+		t.Error("delete_on_termination should be true (Phase 1 default)")
+	}
+	if disk.SourceImageID != "00000000-0000-0000-0000-000000000010" {
+		t.Errorf("source_image_id = %q, want instance image ID", disk.SourceImageID)
+	}
+	if disk.StoragePoolID != phase1StoragePoolID {
+		t.Errorf("storage_pool_id = %q, want phase1StoragePoolID", disk.StoragePoolID)
+	}
+}
+
+// TestCreateHandler_RootDisk_Idempotent verifies that re-running INSTANCE_CREATE
+// when a root disk already exists (job retry) does not create a duplicate.
+func TestCreateHandler_RootDisk_Idempotent(t *testing.T) {
+	store := newFakeStore()
+	store.hosts = []*db.HostRecord{newReadyHost()}
+	net := &fakeNetwork{nextIP: "10.0.0.21"}
+	rt := &fakeRuntime{}
+
+	const id = "inst_disk_retry"
+	inst := newRequestedInstance(id)
+	inst.VMState = "provisioning"
+	inst.Version = 1
+	store.instances[id] = inst
+
+	// Pre-seed a CREATING disk as if step 3b ran but the job died before step 5.
+	diskID := rootDiskIDFromInstance(id)
+	instIDCopy := id
+	store.rootDisks[diskID] = &db.RootDiskRow{
+		DiskID:              diskID,
+		InstanceID:          &instIDCopy,
+		SourceImageID:       inst.ImageID,
+		StoragePoolID:       phase1StoragePoolID,
+		StoragePath:         "nfs://filer/vol/" + diskID + ".qcow2",
+		SizeGB:              50,
+		DeleteOnTermination: true,
+		Status:              db.RootDiskStatusCreating,
+	}
+
+	h := newTestCreateHandler(store, net, rt)
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_CREATE")); err != nil {
+		t.Fatalf("Execute on retry: %v", err)
+	}
+
+	// Exactly one disk record should exist.
+	count := 0
+	for _, disk := range store.rootDisks {
+		if disk.InstanceID != nil && *disk.InstanceID == id {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("want 1 root disk record, got %d", count)
+	}
+
+	// Disk must be ATTACHED after successful run.
+	disk := store.getDiskByInstance(id)
+	if disk == nil {
+		t.Fatal("root disk record not found after retry")
+	}
+	if disk.Status != db.RootDiskStatusAttached {
+		t.Errorf("disk status = %q after retry, want ATTACHED", disk.Status)
+	}
+}
+
+// TestDeleteHandler_DeleteOnTerminationTrue_DiskDeleted verifies that when
+// delete_on_termination=true, the root disk DB record is removed after instance
+// deletion and DeleteRootDisk=true is passed to the host agent.
+func TestDeleteHandler_DeleteOnTerminationTrue_DiskDeleted(t *testing.T) {
+	store := newFakeStore()
+	net := &fakeNetwork{}
+	rt := &fakeRuntime{}
+
+	const id = "inst_dot_true"
+	hostID := "host-001"
+	inst := newRequestedInstance(id)
+	inst.VMState = "running"
+	inst.HostID = &hostID
+	inst.Version = 2
+	store.instances[id] = inst
+
+	// Seed a root disk with delete_on_termination=true.
+	diskID := rootDiskIDFromInstance(id)
+	instIDCopy := id
+	store.rootDisks[diskID] = &db.RootDiskRow{
+		DiskID:              diskID,
+		InstanceID:          &instIDCopy,
+		SourceImageID:       inst.ImageID,
+		StoragePoolID:       phase1StoragePoolID,
+		StoragePath:         "nfs://filer/vol/" + diskID + ".qcow2",
+		SizeGB:              50,
+		DeleteOnTermination: true,
+		Status:              db.RootDiskStatusAttached,
+	}
+
+	h := newTestDeleteHandler(store, net, rt)
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_DELETE")); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// Instance must be deleted.
+	if store.instances[id].VMState != "deleted" {
+		t.Errorf("vm_state = %q, want deleted", store.instances[id].VMState)
+	}
+
+	// Root disk DB record must be gone.
+	if d := store.getDiskByID(diskID); d != nil {
+		t.Errorf("root disk record should be deleted when delete_on_termination=true, got status=%q", d.Status)
+	}
+
+	// Host agent must have been told to delete the root disk file.
+	if rt.lastDeleteReq == nil {
+		t.Fatal("no DeleteInstance call recorded")
+	}
+	if !rt.lastDeleteReq.DeleteRootDisk {
+		t.Error("DeleteRootDisk=false sent to host agent, want true for delete_on_termination=true")
+	}
+}
+
+// TestDeleteHandler_DeleteOnTerminationFalse_DiskDetached verifies that when
+// delete_on_termination=false, the root disk DB record is detached (not deleted)
+// and DeleteRootDisk=false is passed to the host agent, preserving the qcow2 file.
+// This is the Phase 2 persistent volume entry point.
+// Source: P2_VOLUME_MODEL.md §1, 06-01-root-disk-model-and-persistence-semantics.md.
+func TestDeleteHandler_DeleteOnTerminationFalse_DiskDetached(t *testing.T) {
+	store := newFakeStore()
+	net := &fakeNetwork{}
+	rt := &fakeRuntime{}
+
+	const id = "inst_dot_false"
+	hostID := "host-001"
+	inst := newRequestedInstance(id)
+	inst.VMState = "running"
+	inst.HostID = &hostID
+	inst.Version = 2
+	store.instances[id] = inst
+
+	// Seed a root disk with delete_on_termination=false.
+	diskID := rootDiskIDFromInstance(id)
+	instIDCopy := id
+	store.rootDisks[diskID] = &db.RootDiskRow{
+		DiskID:              diskID,
+		InstanceID:          &instIDCopy,
+		SourceImageID:       inst.ImageID,
+		StoragePoolID:       phase1StoragePoolID,
+		StoragePath:         "nfs://filer/vol/" + diskID + ".qcow2",
+		SizeGB:              100,
+		DeleteOnTermination: false, // retain as detached volume
+		Status:              db.RootDiskStatusAttached,
+	}
+
+	h := newTestDeleteHandler(store, net, rt)
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_DELETE")); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// Instance must be deleted.
+	if store.instances[id].VMState != "deleted" {
+		t.Errorf("vm_state = %q, want deleted", store.instances[id].VMState)
+	}
+
+	// Root disk DB record must still exist with DETACHED status and no instance_id.
+	d := store.getDiskByID(diskID)
+	if d == nil {
+		t.Fatal("root disk record should be retained when delete_on_termination=false")
+	}
+	if d.Status != db.RootDiskStatusDetached {
+		t.Errorf("disk status = %q, want DETACHED", d.Status)
+	}
+	if d.InstanceID != nil {
+		t.Errorf("disk instance_id = %q, want nil after detach", *d.InstanceID)
+	}
+
+	// Host agent must have been told NOT to delete the root disk file.
+	if rt.lastDeleteReq == nil {
+		t.Fatal("no DeleteInstance call recorded")
+	}
+	if rt.lastDeleteReq.DeleteRootDisk {
+		t.Error("DeleteRootDisk=true sent to host agent, want false for delete_on_termination=false")
+	}
+}
+
+// TestDeleteHandler_NoDiskRecord_StillCompletes verifies backward compatibility:
+// instances created before Slice 3 have no root_disks row. The delete handler
+// must complete without error, defaulting to DeleteRootDisk=true for the host agent.
+func TestDeleteHandler_NoDiskRecord_StillCompletes(t *testing.T) {
+	store := newFakeStore()
+	net := &fakeNetwork{}
+	rt := &fakeRuntime{}
+
+	const id = "inst_no_disk"
+	hostID := "host-001"
+	inst := newRequestedInstance(id)
+	inst.VMState = "running"
+	inst.HostID = &hostID
+	inst.Version = 2
+	store.instances[id] = inst
+	// No root disk seeded — simulates pre-Slice-3 instance.
+
+	h := newTestDeleteHandler(store, net, rt)
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_DELETE")); err != nil {
+		t.Fatalf("Execute with no disk record: %v", err)
+	}
+
+	// Instance must be deleted.
+	if store.instances[id].VMState != "deleted" {
+		t.Errorf("vm_state = %q, want deleted", store.instances[id].VMState)
+	}
+
+	// Host agent must have been called with DeleteRootDisk=true (safe default).
+	if rt.lastDeleteReq == nil {
+		t.Fatal("no DeleteInstance call recorded")
+	}
+	if !rt.lastDeleteReq.DeleteRootDisk {
+		t.Error("DeleteRootDisk=false, want true as default for instances with no disk record")
 	}
 }
 
