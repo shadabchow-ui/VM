@@ -24,6 +24,7 @@ package main
 // Source: JOB_MODEL_V1, core-architecture-blueprint §control-plane semantics.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -172,7 +173,8 @@ func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
 //     by the worker (stored via the root_disks table).
 //
 // Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, JOB_MODEL_V1 §6,
-//         execution_blueprint §7.7, P2_VOLUME_MODEL §1.
+//
+//	execution_blueprint §7.7, P2_VOLUME_MODEL §1.
 func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFromCtx(r.Context())
 
@@ -251,16 +253,16 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-// M9: create networking if requested
-var nic *db.NetworkInterfaceRow
-if req.Networking != nil && req.Networking.SubnetID != "" {
-	var err error
-	nic, err = s.createInstanceNetworking(w, r, instanceID, principal, req.Networking)
-	if err != nil {
-		// rollback instance on failure
-		return
+	// M9: create networking if requested
+	var nic *db.NetworkInterfaceRow
+	if req.Networking != nil && req.Networking.SubnetID != "" {
+		var err error
+		nic, err = s.createInstanceNetworking(w, r, instanceID, principal, req.Networking)
+		if err != nil {
+			// rollback instance on failure
+			return
+		}
 	}
-}
 
 	// PASS 3: persist sentinel job so subsequent duplicate requests deduplicate.
 	// Non-fatal: log on failure but do not fail the create response.
@@ -337,10 +339,10 @@ func (s *server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		ip, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
 		resp := instanceToResponse(row, s.region, ip)
-s.enrichResponseWithNetworking(r.Context(), &resp, row.ID)
+		s.enrichResponseWithNetworking(r.Context(), &resp, row.ID)
 		// M10 Slice 4: enrich with block_devices from root_disks table.
 		s.enrichResponseWithBlockDevices(r.Context(), &resp, row.ID)
-out = append(out, resp)
+		out = append(out, resp)
 	}
 
 	writeJSON(w, http.StatusOK, ListInstancesResponse{
@@ -365,10 +367,10 @@ func (s *server) handleGetInstance(w http.ResponseWriter, r *http.Request, id st
 
 	ip, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
 	resp := instanceToResponse(row, s.region, ip)
-s.enrichResponseWithNetworking(r.Context(), &resp, row.ID)
+	s.enrichResponseWithNetworking(r.Context(), &resp, row.ID)
 	// M10 Slice 4: enrich with block_devices from root_disks table.
 	s.enrichResponseWithBlockDevices(r.Context(), &resp, row.ID)
-writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ── DELETE /v1/instances/{id} ─────────────────────────────────────────────────
