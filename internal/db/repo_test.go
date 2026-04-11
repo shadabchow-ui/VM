@@ -87,6 +87,13 @@ func (r *fakeRow) Scan(dest ...any) error {
 			if v, ok := r.values[i].(int); ok {
 				*dst = v
 			}
+		case *bool:
+			switch v := r.values[i].(type) {
+			case bool:
+				*dst = v
+			case int:
+				*dst = v != 0
+			}
 		case **string:
 			if v, ok := r.values[i].(string); ok {
 				*dst = &v
@@ -130,6 +137,13 @@ func (r *fakeRows) Scan(dest ...any) error {
 		case *int:
 			if v, ok := row[i].(int); ok {
 				*dst = v
+			}
+		case *bool:
+			switch v := row[i].(type) {
+			case bool:
+				*dst = v
+			case int:
+				*dst = v != 0
 			}
 		case **string:
 			if v, ok := row[i].(string); ok {

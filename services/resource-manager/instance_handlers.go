@@ -220,6 +220,17 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+// M9: create networking if requested
+var nic *db.NetworkInterfaceRow
+if req.Networking != nil && req.Networking.SubnetID != "" {
+	var err error
+	nic, err = s.createInstanceNetworking(w, r, instanceID, principal, req.Networking)
+	if err != nil {
+		// rollback instance on failure
+		return
+	}
+}
+
 	// PASS 3: persist sentinel job so subsequent duplicate requests deduplicate.
 	// Non-fatal: log on failure but do not fail the create response.
 	// Source: JOB_MODEL_V1 §6.
@@ -245,8 +256,25 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip, _ := s.repo.GetIPByInstance(r.Context(), created.ID)
+	resp := instanceToResponse(created, s.region, ip)
+
+	if nic != nil {
+		resp.Networking = &InstanceNetworkingResponse{
+			VPCID:    nic.VPCID,
+			SubnetID: nic.SubnetID,
+			PrimaryInterface: &NetworkInterfaceResponse{
+				ID:         nic.ID,
+				PrivateIP:  nic.PrivateIP,
+				MACAddress: nic.MACAddress,
+				Status:     nic.Status,
+			},
+		}
+		resp.PrivateIP = &nic.PrivateIP
+		resp.PublicIP = nil
+	}
+
 	writeJSON(w, http.StatusAccepted, CreateInstanceResponse{
-		Instance: instanceToResponse(created, s.region, ip),
+		Instance: resp,
 	})
 }
 
@@ -268,7 +296,9 @@ func (s *server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	out := make([]InstanceResponse, 0, len(rows))
 	for _, row := range rows {
 		ip, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
-		out = append(out, instanceToResponse(row, s.region, ip))
+		resp := instanceToResponse(row, s.region, ip)
+s.enrichResponseWithNetworking(r.Context(), &resp, row.ID)
+out = append(out, resp)
 	}
 
 	writeJSON(w, http.StatusOK, ListInstancesResponse{
@@ -292,7 +322,9 @@ func (s *server) handleGetInstance(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	ip, _ := s.repo.GetIPByInstance(r.Context(), row.ID)
-	writeJSON(w, http.StatusOK, instanceToResponse(row, s.region, ip))
+	resp := instanceToResponse(row, s.region, ip)
+s.enrichResponseWithNetworking(r.Context(), &resp, row.ID)
+writeJSON(w, http.StatusOK, resp)
 }
 
 // ── DELETE /v1/instances/{id} ─────────────────────────────────────────────────

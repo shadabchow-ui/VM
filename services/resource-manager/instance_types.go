@@ -28,6 +28,7 @@ type InstanceResponse struct {
 	AvailabilityZone string            `json:"availability_zone"`
 	Region           string            `json:"region"`
 	Labels           map[string]string `json:"labels"`
+	Networking       *InstanceNetworkingResponse `json:"networking,omitempty"`
 	PublicIP         *string           `json:"public_ip"`
 	PrivateIP        *string           `json:"private_ip"`
 	CreatedAt        time.Time         `json:"created_at"`
@@ -45,6 +46,7 @@ type CreateInstanceRequest struct {
 	AvailabilityZone string            `json:"availability_zone"`
 	SSHKeyName       string            `json:"ssh_key_name"`
 	Labels           map[string]string `json:"labels"`
+	Networking       *NetworkingConfig `json:"networking,omitempty"`
 }
 
 // CreateInstanceResponse is returned from POST /v1/instances with 202 Accepted.
@@ -134,4 +136,29 @@ type EventResponse struct {
 type ListEventsResponse struct {
 	Events []EventResponse `json:"events"`
 	Total  int             `json:"total"`
+}
+
+
+// ── M9 Slice 4: Networking types ──────────────────────────────────────────────
+
+// NetworkingConfig holds optional networking config for instance creation.
+type NetworkingConfig struct {
+    SubnetID         string   `json:"subnet_id,omitempty"`
+    SecurityGroupIDs []string `json:"security_group_ids,omitempty"`
+}
+
+// InstanceNetworkingResponse holds networking info in responses.
+type InstanceNetworkingResponse struct {
+    VPCID            string                    `json:"vpc_id"`
+    SubnetID         string                    `json:"subnet_id"`
+    PrimaryInterface *NetworkInterfaceResponse `json:"primary_interface,omitempty"`
+}
+
+// NetworkInterfaceResponse represents a NIC in API responses.
+type NetworkInterfaceResponse struct {
+    ID               string   `json:"id"`
+    PrivateIP        string   `json:"private_ip"`
+    MACAddress       string   `json:"mac_address"`
+    Status           string   `json:"status"`
+    SecurityGroupIDs []string `json:"security_group_ids,omitempty"`
 }

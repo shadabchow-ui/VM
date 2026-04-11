@@ -153,11 +153,13 @@ type NetworkRepo interface {
 	CreateVPC(ctx context.Context, row *db.VPCRow) error
 	GetVPCByID(ctx context.Context, id string) (*db.VPCRow, error)
 	ListVPCsByOwner(ctx context.Context, ownerPrincipalID string) ([]*db.VPCRow, error)
+	SoftDeleteVPC(ctx context.Context, id string) error
 
 	// Subnet methods
 	CreateSubnet(ctx context.Context, row *db.SubnetRow) error
 	GetSubnetByID(ctx context.Context, id string) (*db.SubnetRow, error)
 	ListSubnetsByVPC(ctx context.Context, vpcID string) ([]*db.SubnetRow, error)
+	SoftDeleteSubnet(ctx context.Context, id string) error
 
 	// SecurityGroup methods
 	CreateSecurityGroup(ctx context.Context, row *db.SecurityGroupRow) error
@@ -320,6 +322,37 @@ func (h *NetworkHandlers) HandleListVPCs(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(map[string]interface{}{"vpcs": vpcs})
 }
 
+// HandleDeleteVPC handles DELETE /v1/vpcs/{vpc_id}.
+func (h *NetworkHandlers) HandleDeleteVPC(w http.ResponseWriter, r *http.Request, vpcID string) {
+	ctx := r.Context()
+	requestID := getNetworkRequestID(ctx)
+	principalID := getNetworkPrincipalID(ctx)
+
+	// Verify VPC exists and is owned by principal
+	vpc, err := h.repo.GetVPCByID(ctx, vpcID)
+	if err != nil {
+		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
+		return
+	}
+	if vpc == nil {
+		writeNetworkError(w, http.StatusNotFound, "vpc_not_found", "VPC not found", "", requestID)
+		return
+	}
+
+	// Ownership check: return 404 for non-owned resources (prevents enumeration)
+	if vpc.OwnerPrincipalID != principalID {
+		writeNetworkError(w, http.StatusNotFound, "vpc_not_found", "VPC not found", "", requestID)
+		return
+	}
+
+	if err := h.repo.SoftDeleteVPC(ctx, vpcID); err != nil {
+		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to delete VPC", "", requestID)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ── Subnet Handlers ──────────────────────────────────────────────────────────
 
 // HandleCreateSubnet handles POST /v1/vpcs/{vpc_id}/subnets.
@@ -478,6 +511,42 @@ func (h *NetworkHandlers) HandleListSubnets(w http.ResponseWriter, r *http.Reque
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"subnets": subnets})
+}
+
+// HandleDeleteSubnet handles DELETE /v1/vpcs/{vpc_id}/subnets/{subnet_id}.
+func (h *NetworkHandlers) HandleDeleteSubnet(w http.ResponseWriter, r *http.Request, vpcID, subnetID string) {
+	ctx := r.Context()
+	requestID := getNetworkRequestID(ctx)
+	principalID := getNetworkPrincipalID(ctx)
+
+	// Verify VPC ownership first
+	vpc, err := h.repo.GetVPCByID(ctx, vpcID)
+	if err != nil {
+		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
+		return
+	}
+	if vpc == nil || vpc.OwnerPrincipalID != principalID {
+		writeNetworkError(w, http.StatusNotFound, "vpc_not_found", "VPC not found", "", requestID)
+		return
+	}
+
+	// Verify subnet exists and belongs to VPC
+	subnet, err := h.repo.GetSubnetByID(ctx, subnetID)
+	if err != nil {
+		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve subnet", "", requestID)
+		return
+	}
+	if subnet == nil || subnet.VPCID != vpcID {
+		writeNetworkError(w, http.StatusNotFound, "subnet_not_found", "Subnet not found", "", requestID)
+		return
+	}
+
+	if err := h.repo.SoftDeleteSubnet(ctx, subnetID); err != nil {
+		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to delete subnet", "", requestID)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── Security Group Handlers ──────────────────────────────────────────────────

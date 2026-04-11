@@ -22,18 +22,20 @@ import (
 
 type mockNetworkRepo struct {
 	// VPC
-	createVPCErr  error
-	getVPCByIDRow *db.VPCRow
-	getVPCByIDErr error
-	listVPCsRows  []*db.VPCRow
-	listVPCsErr   error
+	createVPCErr     error
+	getVPCByIDRow    *db.VPCRow
+	getVPCByIDErr    error
+	listVPCsRows     []*db.VPCRow
+	listVPCsErr      error
+	softDeleteVPCErr error
 
 	// Subnet
-	createSubnetErr  error
-	getSubnetByIDRow *db.SubnetRow
-	getSubnetByIDErr error
-	listSubnetsRows  []*db.SubnetRow
-	listSubnetsErr   error
+	createSubnetErr     error
+	getSubnetByIDRow    *db.SubnetRow
+	getSubnetByIDErr    error
+	listSubnetsRows     []*db.SubnetRow
+	listSubnetsErr      error
+	softDeleteSubnetErr error
 
 	// SecurityGroup
 	createSGErr  error
@@ -77,6 +79,10 @@ func (m *mockNetworkRepo) ListVPCsByOwner(_ context.Context, _ string) ([]*db.VP
 	return m.listVPCsRows, m.listVPCsErr
 }
 
+func (m *mockNetworkRepo) SoftDeleteVPC(_ context.Context, _ string) error {
+	return m.softDeleteVPCErr
+}
+
 func (m *mockNetworkRepo) CreateSubnet(_ context.Context, _ *db.SubnetRow) error {
 	return m.createSubnetErr
 }
@@ -87,6 +93,10 @@ func (m *mockNetworkRepo) GetSubnetByID(_ context.Context, _ string) (*db.Subnet
 
 func (m *mockNetworkRepo) ListSubnetsByVPC(_ context.Context, _ string) ([]*db.SubnetRow, error) {
 	return m.listSubnetsRows, m.listSubnetsErr
+}
+
+func (m *mockNetworkRepo) SoftDeleteSubnet(_ context.Context, _ string) error {
+	return m.softDeleteSubnetErr
 }
 
 func (m *mockNetworkRepo) CreateSecurityGroup(_ context.Context, _ *db.SecurityGroupRow) error {
@@ -1074,5 +1084,235 @@ func TestNetworkHandlers_HandleDeleteRouteEntry_NotFound(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+// ── VPC Delete Tests ─────────────────────────────────────────────────────────
+
+func TestNetworkHandlers_HandleDeleteVPC_Success(t *testing.T) {
+	now := time.Now()
+	repo := &mockNetworkRepo{
+		getVPCByIDRow: &db.VPCRow{
+			ID:               "vpc_001",
+			OwnerPrincipalID: "princ_001",
+			Name:             "my-vpc",
+			CIDRIPv4:         "10.0.0.0/16",
+			Status:           "active",
+			CreatedAt:        now,
+		},
+	}
+	h := NewNetworkHandlers(repo)
+
+	req := testNetworkRequest("DELETE", "/v1/vpcs/vpc_001", nil, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleDeleteVPC(w, req, "vpc_001")
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+}
+
+func TestNetworkHandlers_HandleDeleteVPC_NotFound(t *testing.T) {
+	repo := &mockNetworkRepo{getVPCByIDRow: nil}
+	h := NewNetworkHandlers(repo)
+
+	req := testNetworkRequest("DELETE", "/v1/vpcs/vpc_missing", nil, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleDeleteVPC(w, req, "vpc_missing")
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestNetworkHandlers_HandleDeleteVPC_NotOwned_Returns404(t *testing.T) {
+	now := time.Now()
+	repo := &mockNetworkRepo{
+		getVPCByIDRow: &db.VPCRow{
+			ID:               "vpc_001",
+			OwnerPrincipalID: "princ_other", // Different owner
+			Name:             "other-vpc",
+			CIDRIPv4:         "10.0.0.0/16",
+			Status:           "active",
+			CreatedAt:        now,
+		},
+	}
+	h := NewNetworkHandlers(repo)
+
+	req := testNetworkRequest("DELETE", "/v1/vpcs/vpc_001", nil, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleDeleteVPC(w, req, "vpc_001")
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (non-owned returns 404)", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestNetworkHandlers_HandleDeleteVPC_RepoError(t *testing.T) {
+	now := time.Now()
+	repo := &mockNetworkRepo{
+		getVPCByIDRow: &db.VPCRow{
+			ID:               "vpc_001",
+			OwnerPrincipalID: "princ_001",
+			Name:             "my-vpc",
+			CIDRIPv4:         "10.0.0.0/16",
+			Status:           "active",
+			CreatedAt:        now,
+		},
+		softDeleteVPCErr: errors.New("db error"),
+	}
+	h := NewNetworkHandlers(repo)
+
+	req := testNetworkRequest("DELETE", "/v1/vpcs/vpc_001", nil, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleDeleteVPC(w, req, "vpc_001")
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+}
+
+// ── Subnet Delete Tests ──────────────────────────────────────────────────────
+
+func TestNetworkHandlers_HandleDeleteSubnet_Success(t *testing.T) {
+	now := time.Now()
+	repo := &mockNetworkRepo{
+		getVPCByIDRow: &db.VPCRow{
+			ID:               "vpc_001",
+			OwnerPrincipalID: "princ_001",
+			Name:             "my-vpc",
+			CIDRIPv4:         "10.0.0.0/16",
+			Status:           "active",
+			CreatedAt:        now,
+		},
+		getSubnetByIDRow: &db.SubnetRow{
+			ID:               "subnet_001",
+			VPCID:            "vpc_001",
+			Name:             "my-subnet",
+			CIDRIPv4:         "10.0.1.0/24",
+			AvailabilityZone: "us-east-1a",
+			Status:           "active",
+			CreatedAt:        now,
+		},
+	}
+	h := NewNetworkHandlers(repo)
+
+	req := testNetworkRequest("DELETE", "/v1/vpcs/vpc_001/subnets/subnet_001", nil, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleDeleteSubnet(w, req, "vpc_001", "subnet_001")
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+}
+
+func TestNetworkHandlers_HandleDeleteSubnet_VPCNotFound(t *testing.T) {
+	repo := &mockNetworkRepo{getVPCByIDRow: nil}
+	h := NewNetworkHandlers(repo)
+
+	req := testNetworkRequest("DELETE", "/v1/vpcs/vpc_missing/subnets/subnet_001", nil, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleDeleteSubnet(w, req, "vpc_missing", "subnet_001")
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestNetworkHandlers_HandleDeleteSubnet_SubnetNotFound(t *testing.T) {
+	now := time.Now()
+	repo := &mockNetworkRepo{
+		getVPCByIDRow: &db.VPCRow{
+			ID:               "vpc_001",
+			OwnerPrincipalID: "princ_001",
+			Name:             "my-vpc",
+			CIDRIPv4:         "10.0.0.0/16",
+			Status:           "active",
+			CreatedAt:        now,
+		},
+		getSubnetByIDRow: nil,
+	}
+	h := NewNetworkHandlers(repo)
+
+	req := testNetworkRequest("DELETE", "/v1/vpcs/vpc_001/subnets/subnet_missing", nil, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleDeleteSubnet(w, req, "vpc_001", "subnet_missing")
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestNetworkHandlers_HandleDeleteSubnet_WrongVPC(t *testing.T) {
+	now := time.Now()
+	repo := &mockNetworkRepo{
+		getVPCByIDRow: &db.VPCRow{
+			ID:               "vpc_001",
+			OwnerPrincipalID: "princ_001",
+			Name:             "my-vpc",
+			CIDRIPv4:         "10.0.0.0/16",
+			Status:           "active",
+			CreatedAt:        now,
+		},
+		getSubnetByIDRow: &db.SubnetRow{
+			ID:               "subnet_001",
+			VPCID:            "vpc_other", // Different VPC
+			Name:             "other-subnet",
+			CIDRIPv4:         "10.0.1.0/24",
+			AvailabilityZone: "us-east-1a",
+			Status:           "active",
+			CreatedAt:        now,
+		},
+	}
+	h := NewNetworkHandlers(repo)
+
+	req := testNetworkRequest("DELETE", "/v1/vpcs/vpc_001/subnets/subnet_001", nil, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleDeleteSubnet(w, req, "vpc_001", "subnet_001")
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (subnet belongs to different VPC)", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestNetworkHandlers_HandleDeleteSubnet_RepoError(t *testing.T) {
+	now := time.Now()
+	repo := &mockNetworkRepo{
+		getVPCByIDRow: &db.VPCRow{
+			ID:               "vpc_001",
+			OwnerPrincipalID: "princ_001",
+			Name:             "my-vpc",
+			CIDRIPv4:         "10.0.0.0/16",
+			Status:           "active",
+			CreatedAt:        now,
+		},
+		getSubnetByIDRow: &db.SubnetRow{
+			ID:               "subnet_001",
+			VPCID:            "vpc_001",
+			Name:             "my-subnet",
+			CIDRIPv4:         "10.0.1.0/24",
+			AvailabilityZone: "us-east-1a",
+			Status:           "active",
+			CreatedAt:        now,
+		},
+		softDeleteSubnetErr: errors.New("db error"),
+	}
+	h := NewNetworkHandlers(repo)
+
+	req := testNetworkRequest("DELETE", "/v1/vpcs/vpc_001/subnets/subnet_001", nil, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleDeleteSubnet(w, req, "vpc_001", "subnet_001")
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
 	}
 }
