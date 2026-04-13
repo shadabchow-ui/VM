@@ -1316,3 +1316,214 @@ func TestNetworkHandlers_HandleDeleteSubnet_RepoError(t *testing.T) {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
 	}
 }
+
+// ── VM-P2A-S3: Port Range and Protocol-Port Compatibility Tests ───────────────
+//
+// These tests cover the validation rules added in VM-P2A-S3:
+//   SG-I-4a: port_from/port_to must be in [0, 65535]
+//   SG-I-4b: port_from must be <= port_to
+//   SG-I-4c: icmp and all must not carry port fields
+//   SG-I-2:  max 50 rules per security group
+
+func testSGForRules(t *testing.T) (*mockNetworkRepo, *NetworkHandlers) {
+	t.Helper()
+	repo := &mockNetworkRepo{
+		getSGByIDRow: &db.SecurityGroupRow{
+			ID:               "sg_001",
+			VPCID:            "vpc_001",
+			OwnerPrincipalID: "princ_001",
+			Name:             "my-sg",
+		},
+	}
+	return repo, NewNetworkHandlers(repo)
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_PortOutOfRange_Low(t *testing.T) {
+	_, h := testSGForRules(t)
+
+	body := []byte(`{"direction":"ingress","protocol":"tcp","port_from":-1,"port_to":80}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d (SG-I-4a: port_from below 0)", w.Code, http.StatusBadRequest)
+	}
+	var errResp NetworkAPIError
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if errResp.Error.Target != "port_from" {
+		t.Errorf("error target = %q, want port_from", errResp.Error.Target)
+	}
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_PortOutOfRange_High(t *testing.T) {
+	_, h := testSGForRules(t)
+
+	body := []byte(`{"direction":"ingress","protocol":"tcp","port_from":80,"port_to":99999}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d (SG-I-4a: port_to above 65535)", w.Code, http.StatusBadRequest)
+	}
+	var errResp NetworkAPIError
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if errResp.Error.Target != "port_to" {
+		t.Errorf("error target = %q, want port_to", errResp.Error.Target)
+	}
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_PortFromGtPortTo(t *testing.T) {
+	_, h := testSGForRules(t)
+
+	// port_from=443 > port_to=80 — invalid ordering
+	body := []byte(`{"direction":"ingress","protocol":"tcp","port_from":443,"port_to":80}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d (SG-I-4b: port_from > port_to)", w.Code, http.StatusBadRequest)
+	}
+	var errResp NetworkAPIError
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if errResp.Error.Target != "port_from" {
+		t.Errorf("error target = %q, want port_from", errResp.Error.Target)
+	}
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_ICMPWithPorts(t *testing.T) {
+	_, h := testSGForRules(t)
+
+	// SG-I-4c: icmp must not carry port fields
+	body := []byte(`{"direction":"ingress","protocol":"icmp","port_from":0,"port_to":0}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want %d (SG-I-4c: icmp does not use ports)", w.Code, http.StatusUnprocessableEntity)
+	}
+	var errResp NetworkAPIError
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if errResp.Error.Code != "invalid_rule" {
+		t.Errorf("error code = %q, want invalid_rule", errResp.Error.Code)
+	}
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_AllWithPorts(t *testing.T) {
+	_, h := testSGForRules(t)
+
+	// SG-I-4c: 'all' must not carry port fields
+	body := []byte(`{"direction":"egress","protocol":"all","port_from":80,"port_to":80}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want %d (SG-I-4c: 'all' does not use ports)", w.Code, http.StatusUnprocessableEntity)
+	}
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_ValidPortRange(t *testing.T) {
+	_, h := testSGForRules(t)
+
+	// Valid TCP rule with legal port range
+	cidr := "0.0.0.0/0"
+	body := []byte(`{"direction":"ingress","protocol":"tcp","port_from":8080,"port_to":8090,"cidr":"0.0.0.0/0"}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	_ = cidr
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d (valid tcp port range 8080-8090 should be accepted)", w.Code, http.StatusCreated)
+	}
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_ICMPNoPorts_Accepted(t *testing.T) {
+	_, h := testSGForRules(t)
+
+	// ICMP rule without port fields — must be accepted
+	cidr := "0.0.0.0/0"
+	_ = cidr
+	body := []byte(`{"direction":"ingress","protocol":"icmp","cidr":"0.0.0.0/0"}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d (icmp rule without ports should be accepted)", w.Code, http.StatusCreated)
+	}
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_RuleLimit(t *testing.T) {
+	// Build 50 existing rules in the mock — next add should be rejected.
+	existingRules := make([]*db.SecurityGroupRuleRow, 50)
+	for i := range existingRules {
+		existingRules[i] = &db.SecurityGroupRuleRow{
+			ID:              "sgr_existing",
+			SecurityGroupID: "sg_001",
+			Direction:       "ingress",
+			Protocol:        "tcp",
+		}
+	}
+	repo := &mockNetworkRepo{
+		getSGByIDRow: &db.SecurityGroupRow{
+			ID:               "sg_001",
+			VPCID:            "vpc_001",
+			OwnerPrincipalID: "princ_001",
+			Name:             "my-sg",
+		},
+		listRulesRows: existingRules,
+	}
+	h := NewNetworkHandlers(repo)
+
+	body := []byte(`{"direction":"ingress","protocol":"tcp","cidr":"10.0.0.0/8"}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want %d (SG-I-2: 50-rule limit)", w.Code, http.StatusUnprocessableEntity)
+	}
+	var errResp NetworkAPIError
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if errResp.Error.Code != "rule_limit_exceeded" {
+		t.Errorf("error code = %q, want rule_limit_exceeded", errResp.Error.Code)
+	}
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_UDPPortRange_BoundaryValues(t *testing.T) {
+	_, h := testSGForRules(t)
+
+	// UDP with port_from=0 and port_to=65535 — boundary values, must be accepted
+	body := []byte(`{"direction":"egress","protocol":"udp","port_from":0,"port_to":65535}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d (udp 0-65535 must be accepted)", w.Code, http.StatusCreated)
+	}
+}

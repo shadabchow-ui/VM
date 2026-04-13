@@ -766,6 +766,60 @@ func (h *NetworkHandlers) HandleAddSecurityGroupRule(w http.ResponseWriter, r *h
 		return
 	}
 
+	// VM-P2A-S3: Port range and protocol-port compatibility validation.
+	//
+	// Ownership: resource-manager owns API admission validation.
+	// The actual enforcement model (host-agent SG policy application) is a
+	// separate seam defined in services/host-agent/runtime/network.go.
+	//
+	// Rules:
+	//   SG-I-4a: port_from and port_to must be in [0, 65535] when set.
+	//   SG-I-4b: port_from must be <= port_to when both are set.
+	//   SG-I-4c: protocol 'icmp' and 'all' must not carry port fields.
+	if req.Protocol == "tcp" || req.Protocol == "udp" {
+		if req.PortFrom != nil {
+			if *req.PortFrom < 0 || *req.PortFrom > 65535 {
+				writeNetworkError(w, http.StatusBadRequest, "invalid_value",
+					"Field 'port_from' must be between 0 and 65535", "port_from", requestID)
+				return
+			}
+		}
+		if req.PortTo != nil {
+			if *req.PortTo < 0 || *req.PortTo > 65535 {
+				writeNetworkError(w, http.StatusBadRequest, "invalid_value",
+					"Field 'port_to' must be between 0 and 65535", "port_to", requestID)
+				return
+			}
+		}
+		if req.PortFrom != nil && req.PortTo != nil && *req.PortFrom > *req.PortTo {
+			writeNetworkError(w, http.StatusBadRequest, "invalid_value",
+				"Field 'port_from' must be less than or equal to 'port_to'", "port_from", requestID)
+			return
+		}
+	} else {
+		// SG-I-4c: 'icmp' and 'all' do not use port numbers.
+		if req.PortFrom != nil || req.PortTo != nil {
+			writeNetworkError(w, http.StatusUnprocessableEntity, "invalid_rule",
+				"Protocol '"+req.Protocol+"' does not use port numbers; omit 'port_from' and 'port_to'",
+				"protocol", requestID)
+			return
+		}
+	}
+
+	// SG-I-2: Max 50 rules per security group.
+	// Checked at admission time to keep the rule set bounded.
+	// Source: vm-14-02 skill §enforcement model.
+	existingRules, err := h.repo.ListSecurityGroupRulesBySecurityGroup(ctx, sgID)
+	if err != nil {
+		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to check rule count", "", requestID)
+		return
+	}
+	if len(existingRules) >= 50 {
+		writeNetworkError(w, http.StatusUnprocessableEntity, "rule_limit_exceeded",
+			"Security group cannot have more than 50 rules", "", requestID)
+		return
+	}
+
 	ruleID := generateID("sgr_")
 	now := time.Now().UTC()
 	row := &db.SecurityGroupRuleRow{
