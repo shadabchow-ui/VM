@@ -118,6 +118,18 @@ func assertState(t *testing.T, store *fakeStore, id, want string) {
 	}
 }
 
+// newRunningInstance constructs an *db.InstanceRow already in "running" state
+// with a host assigned. Used by reboot tests and any test that needs to start
+// from a live instance without running the full create provisioning sequence.
+func newRunningInstance(id string) *db.InstanceRow {
+	inst := newRequestedInstance(id)
+	hostID := "host-001"
+	inst.VMState = "running"
+	inst.HostID = &hostID
+	inst.Version = 1
+	return inst
+}
+
 // ── Lifecycle sequence tests ──────────────────────────────────────────────────
 
 func TestLifecycle_Create_Stop_Start_Delete(t *testing.T) {
@@ -131,6 +143,8 @@ func TestLifecycle_Create_Stop_Start_Delete(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	assertState(t, f.store, id, "running")
+	// Seed retained IP: stop no longer releases it; start reads it via GetIPByInstance.
+	f.store.ips[id] = f.net.nextIP
 
 	// Stop
 	if err := f.newStopHandler().Execute(ctx, testJob(id, "INSTANCE_STOP")); err != nil {
@@ -180,19 +194,49 @@ func TestLifecycle_Create_Stop_Start_Reboot_Delete(t *testing.T) {
 	ctx := context.Background()
 
 	// Full golden path: create → stop → start → reboot → delete
+	// Seed retained IP after create so stop and start both find it via GetIPByInstance.
 	steps := []struct {
-		name    string
-		handler func() error
-		want    string
+		name   string
+		setup  func() // optional pre-step hook
+		exec   func() error
+		want   string
 	}{
-		{"create", func() error { return f.newCreateHandler().Execute(ctx, testJob(id, "INSTANCE_CREATE")) }, "running"},
-		{"stop", func() error { return f.newStopHandler().Execute(ctx, testJob(id, "INSTANCE_STOP")) }, "stopped"},
-		{"start", func() error { return f.newStartHandler().Execute(ctx, testJob(id, "INSTANCE_START")) }, "running"},
-		{"reboot", func() error { return f.newRebootHandler().Execute(ctx, testJob(id, "INSTANCE_REBOOT")) }, "running"},
-		{"delete", func() error { return f.newDeleteHandler().Execute(ctx, testJob(id, "INSTANCE_DELETE")) }, "deleted"},
+		{
+			name:  "create",
+			setup: func() {},
+			exec:  func() error { return f.newCreateHandler().Execute(ctx, testJob(id, "INSTANCE_CREATE")) },
+			want:  "running",
+		},
+		{
+			// Seed retained IP before stop so GetIPByInstance (stop step 6 NIC path)
+			// and start step 5 (GetIPByInstance for retained IP) both work.
+			name:  "stop",
+			setup: func() { f.store.ips[id] = f.net.nextIP },
+			exec:  func() error { return f.newStopHandler().Execute(ctx, testJob(id, "INSTANCE_STOP")) },
+			want:  "stopped",
+		},
+		{
+			name:  "start",
+			setup: func() {},
+			exec:  func() error { return f.newStartHandler().Execute(ctx, testJob(id, "INSTANCE_START")) },
+			want:  "running",
+		},
+		{
+			name:  "reboot",
+			setup: func() {},
+			exec:  func() error { return f.newRebootHandler().Execute(ctx, testJob(id, "INSTANCE_REBOOT")) },
+			want:  "running",
+		},
+		{
+			name:  "delete",
+			setup: func() {},
+			exec:  func() error { return f.newDeleteHandler().Execute(ctx, testJob(id, "INSTANCE_DELETE")) },
+			want:  "deleted",
+		},
 	}
 	for _, step := range steps {
-		if err := step.handler(); err != nil {
+		step.setup()
+		if err := step.exec(); err != nil {
 			t.Fatalf("step %q: %v", step.name, err)
 		}
 		assertState(t, f.store, id, step.want)
@@ -225,6 +269,8 @@ func TestLifecycle_Delete_FromStopped(t *testing.T) {
 	if err := f.newCreateHandler().Execute(ctx, testJob(id, "INSTANCE_CREATE")); err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	// Seed retained IP: stop no longer releases it; delete needs it for ReleaseIP.
+	f.store.ips[id] = f.net.nextIP
 	if err := f.newStopHandler().Execute(ctx, testJob(id, "INSTANCE_STOP")); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
@@ -269,6 +315,8 @@ func TestLifecycle_StartFailure_TransitionsToFailed(t *testing.T) {
 	if err := f.newCreateHandler().Execute(ctx, testJob(id, "INSTANCE_CREATE")); err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	// Seed retained IP before stop so start can find it via GetIPByInstance.
+	f.store.ips[id] = f.net.nextIP
 	if err := f.newStopHandler().Execute(ctx, testJob(id, "INSTANCE_STOP")); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
@@ -281,6 +329,11 @@ func TestLifecycle_StartFailure_TransitionsToFailed(t *testing.T) {
 		t.Fatal("expected start error, got nil")
 	}
 	assertState(t, f.store, id, "failed")
+	// Retained IP must still be present: start failure does not release it
+	// (the IP stays reserved for the next start attempt per IP_ALLOCATION_CONTRACT_V1 §5).
+	if f.store.ips[id] == "" {
+		t.Error("retained IP cleared on start failure — should remain for retry")
+	}
 }
 
 func TestLifecycle_RebootFailure_TransitionsToFailed(t *testing.T) {
@@ -311,6 +364,7 @@ func TestLifecycle_UsageEvents_StopAndStart(t *testing.T) {
 	ctx := context.Background()
 
 	_ = f.newCreateHandler().Execute(ctx, testJob(id, "INSTANCE_CREATE"))
+	f.store.ips[id] = f.net.nextIP // seed retained IP so stop and start both work
 	_ = f.newStopHandler().Execute(ctx, testJob(id, "INSTANCE_STOP"))
 	_ = f.newStartHandler().Execute(ctx, testJob(id, "INSTANCE_START"))
 
@@ -330,8 +384,9 @@ func TestLifecycle_UsageEvents_StopAndStart(t *testing.T) {
 	}
 }
 
-func TestLifecycle_IPReleaseAndReallocate_StopThenStart(t *testing.T) {
-	// Stop releases IP; start allocates a new one.
+func TestLifecycle_IP_RetainedThroughStopStart(t *testing.T) {
+	// IP_ALLOCATION_CONTRACT_V1 §5: private IP is stable across stop/start.
+	// Stop does NOT release the IP; start reuses the retained allocation.
 	f := newLifecycleFixture()
 	f.net.nextIP = "10.0.2.1"
 	const id = "inst_lc_ip"
@@ -341,24 +396,36 @@ func TestLifecycle_IPReleaseAndReallocate_StopThenStart(t *testing.T) {
 	_ = f.newCreateHandler().Execute(ctx, testJob(id, "INSTANCE_CREATE"))
 	assertState(t, f.store, id, "running")
 
-	// CreateHandler called AllocateIP which returned f.net.nextIP ("10.0.2.1"),
-	// but the fake store's ip map is not automatically populated by the handler
-	// (the real DB ip_allocations table would be — here we seed it manually
-	// so GetIPByInstance returns the right value when StopHandler calls it).
+	// Seed the retained IP so stop's GetPrimaryNetworkInterfaceByInstance
+	// and start's GetIPByInstance can find it (mirrors the real DB state
+	// where ip_allocations.owner_instance_id remains set after stop).
 	f.store.ips[id] = "10.0.2.1"
 
 	_ = f.newStopHandler().Execute(ctx, testJob(id, "INSTANCE_STOP"))
+	assertState(t, f.store, id, "stopped")
 
-	// IP must have been released.
-	if len(f.net.released) == 0 {
-		t.Fatal("IP not released on stop")
+	// IP must NOT have been released on stop.
+	if len(f.net.released) != 0 {
+		t.Errorf("IP released on stop (got %v) — violates IP_ALLOCATION_CONTRACT_V1 §5 (private IP retained)", f.net.released)
 	}
-	if f.net.released[0] != "10.0.2.1" {
-		t.Errorf("released IP = %q, want 10.0.2.1", f.net.released[0])
+	if f.store.ips[id] == "" {
+		t.Error("IP cleared from store on stop — should be retained")
 	}
 
-	// Change what the fake allocates next.
-	f.net.nextIP = "10.0.2.99"
+	// Start reuses the retained IP — no new AllocateIP call on the main path.
+	// We verify this by confirming net.released does not grow during start
+	// (retained IP is reused, not released and re-allocated).
+	releasedBeforeStart := len(f.net.released)
 	_ = f.newStartHandler().Execute(ctx, testJob(id, "INSTANCE_START"))
 	assertState(t, f.store, id, "running")
+
+	// No IP released during start.
+	if len(f.net.released) != releasedBeforeStart {
+		t.Errorf("start released IP(s) %v — retained IP should be reused with no release",
+			f.net.released[releasedBeforeStart:])
+	}
+	// The retained IP value is unchanged.
+	if f.store.ips[id] != "10.0.2.1" {
+		t.Errorf("IP after start = %q, want 10.0.2.1 (retained)", f.store.ips[id])
+	}
 }
