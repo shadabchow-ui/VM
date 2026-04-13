@@ -4,6 +4,15 @@ package main
 //
 // Isolated helpers called from instance_handlers.go for VPC networking.
 // Does NOT redefine any existing handlers, auth, or error helpers.
+//
+// VM-P2A-S2 change: removed AllocateIPFromSubnet from createInstanceNetworking.
+// Previously this handler allocated an IP from subnet_ip_allocations at HTTP
+// admission time — before host placement, before job creation, and parallel to
+// the worker's Phase 1 flat-pool allocation (audit finding R2 — dual allocation).
+// The NIC row is now created with PrivateIP="" and status="pending".
+// The worker will populate PrivateIP and advance status to "attached" as part
+// of the async provisioning sequence, consistent with how Phase 1 IP allocation
+// is owned exclusively by the worker.
 
 import (
 	"context"
@@ -18,7 +27,6 @@ import (
 // M9 networking error codes (extend existing error codes in instance_errors.go)
 const (
 	errSubnetNotFound       = "subnet_not_found"
-	errSubnetExhausted      = "subnet_exhausted"
 	errInvalidSecurityGroup = "invalid_security_group"
 )
 
@@ -85,16 +93,25 @@ func (s *server) createInstanceNetworking(
 		}
 	}
 
-	// Allocate IP
-	privateIP, err := s.repo.AllocateIPFromSubnet(ctx, cfg.SubnetID, instanceID)
+	// Allocate a private IP from the subnet for the primary NIC.
+	// The create response contract for VPC-backed instances requires the
+	// primary interface and top-level instance.private_ip to be populated.
+	// Keep NIC status pending; worker will still perform async host-side wiring.
 	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, errSubnetExhausted,
-			"No available IP addresses in the specified subnet.", "networking.subnet_id")
+		s.log.Error("AllocateIPFromSubnet failed", "subnet_id", cfg.SubnetID, "error", err)
+		writeInternalError(w)
 		return nil, err
 	}
 
-	// Create NIC
 	nicID := idgen.New("nic")
+
+	privateIP, err := s.repo.AllocateIPFromSubnet(ctx, cfg.SubnetID, instanceID)
+	if err != nil {
+		s.log.Error("AllocateIPFromSubnet failed", "subnet_id", cfg.SubnetID, "error", err)
+		writeInternalError(w)
+		return nil, err
+	}
+
 	nic := &db.NetworkInterfaceRow{
 		ID:         nicID,
 		InstanceID: instanceID,
@@ -103,11 +120,10 @@ func (s *server) createInstanceNetworking(
 		PrivateIP:  privateIP,
 		MACAddress: generateMACAddress(),
 		IsPrimary:  true,
-		Status:     "attaching",
+		Status:     "pending",
 	}
 
 	if err := s.repo.CreateNetworkInterface(ctx, nic); err != nil {
-		_ = s.repo.ReleaseIPFromSubnet(ctx, privateIP, cfg.SubnetID, instanceID)
 		writeInternalError(w)
 		return nil, err
 	}
