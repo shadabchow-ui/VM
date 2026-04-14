@@ -11,6 +11,9 @@ package handlers
 // lifecycle wiring (create → CreateRootDisk/UpdateRootDiskStatus,
 // delete → GetRootDiskByInstanceID + DeleteRootDisk/DetachRootDisk).
 // *db.Repo satisfies all methods (CRUD added in Slice 2).
+//
+// VM-P2B-S2: Added SnapshotStore interface + SnapshotDeps for snapshot
+// job handlers (SNAPSHOT_CREATE, SNAPSHOT_DELETE, VOLUME_RESTORE).
 
 import (
 	"context"
@@ -77,6 +80,56 @@ type Deps struct {
 	Network      NetworkController
 	Runtime      func(hostID, address string) *runtimeclient.Client // factory (production)
 	DefaultVPCID string                                             // Phase 1: all instances share one VPC
+}
+
+// ── VolumeStore ───────────────────────────────────────────────────────────────
+// Subset of *db.Repo used by volume job handlers (VOLUME_ATTACH, VOLUME_DETACH,
+// VOLUME_DELETE). *db.Repo satisfies this interface. Tests inject fakeVolumeStore.
+// Source: P2_VOLUME_MODEL.md §7 VOL-I-5 (locked_by), §4 (attach/detach), §5 (delete).
+// VM-P2B Slice 1.
+
+type VolumeStore interface {
+	GetVolumeByID(ctx context.Context, id string) (*db.VolumeRow, error)
+	LockVolume(ctx context.Context, id, jobID, expectedStatus string, version int) error
+	UnlockVolume(ctx context.Context, id, newStatus string) error
+	UpdateVolumeStatus(ctx context.Context, id, expectedStatus, newStatus string, version int) error
+	SoftDeleteVolume(ctx context.Context, id string, version int) error
+	GetActiveAttachmentByVolume(ctx context.Context, volumeID string) (*db.VolumeAttachmentRow, error)
+	CloseVolumeAttachment(ctx context.Context, attachmentID string) error
+}
+
+// VolumeDeps holds dependencies for volume job handlers.
+// Separate from Deps to keep the instance handler dependency set stable.
+type VolumeDeps struct {
+	Store VolumeStore
+}
+
+// ── SnapshotStore ─────────────────────────────────────────────────────────────
+// Subset of *db.Repo used by snapshot job handlers (SNAPSHOT_CREATE,
+// SNAPSHOT_DELETE, VOLUME_RESTORE). *db.Repo satisfies this interface.
+// Tests inject fakeSnapshotStore.
+// Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.9 (invariants),
+//         vm-15-02__skill__snapshot-clone-restore-retention-model.md.
+// VM-P2B-S2.
+
+type SnapshotStore interface {
+	// Snapshot operations
+	GetSnapshotByID(ctx context.Context, id string) (*db.SnapshotRow, error)
+	LockSnapshot(ctx context.Context, id, jobID, expectedStatus string, version int) error
+	UnlockSnapshot(ctx context.Context, id, newStatus string) error
+	UpdateSnapshotStatus(ctx context.Context, id, expectedStatus, newStatus string, version int) error
+	MarkSnapshotAvailable(ctx context.Context, id, storagePath string, version int) error
+	SoftDeleteSnapshot(ctx context.Context, id string, version int) error
+
+	// Volume operations needed by VOLUME_RESTORE.
+	GetVolumeByID(ctx context.Context, id string) (*db.VolumeRow, error)
+	UnlockVolume(ctx context.Context, id, newStatus string) error
+}
+
+// SnapshotDeps holds dependencies for snapshot job handlers.
+// Separate from Deps and VolumeDeps to keep dependency sets stable.
+type SnapshotDeps struct {
+	Store SnapshotStore
 }
 
 // ── NetworkControllerClient ───────────────────────────────────────────────────

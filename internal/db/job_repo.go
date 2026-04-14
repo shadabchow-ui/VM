@@ -7,6 +7,11 @@ package db
 //         atomic_claim, update_status).
 //
 // PASS 3: Added GetJobByInstanceAndID for the job-status endpoint.
+// VM-P2B: Added VolumeID field to JobRow for volume-scoped jobs.
+//         InsertVolumeJob lives in volume_repo.go.
+//         ListStuckInProgressJobs extended with volume job timeout intervals.
+// VM-P2B-S2: Added SnapshotID field to JobRow for snapshot-scoped jobs.
+//         InsertSnapshotJob lives in snapshot_repo.go.
 
 import (
 	"context"
@@ -15,9 +20,16 @@ import (
 )
 
 // JobRow is the DB representation of a job record.
+// VM-P2B: Added VolumeID — nullable FK to volumes.
+// VM-P2B-S2: Added SnapshotID — nullable FK to snapshots.
+// Invariant: exactly one of InstanceID, VolumeID, or SnapshotID is non-null
+// (enforced at the application layer; the DB allows any combination).
+// Source: JOB_MODEL_V1 §1, P2_VOLUME_MODEL.md §4.2, P2_IMAGE_SNAPSHOT_MODEL.md §4.
 type JobRow struct {
 	ID             string
-	InstanceID     string
+	InstanceID     string  // empty string when VolumeID or SnapshotID is set
+	VolumeID       *string // non-nil for VOLUME_* job types
+	SnapshotID     *string // non-nil for SNAPSHOT_* job types
 	JobType        string
 	Status         string
 	IdempotencyKey string
@@ -33,6 +45,9 @@ type JobRow struct {
 // InsertJob creates a new job in 'pending' status.
 // ON CONFLICT on idempotency_key does nothing — caller checks for existing job.
 // Source: JOB_MODEL_V1 §1, 03-02-async-job-model §idempotency.
+// Note: This method is for instance-scoped jobs only. For volume-scoped jobs,
+// use InsertVolumeJob in volume_repo.go. For snapshot-scoped jobs,
+// use InsertSnapshotJob in snapshot_repo.go.
 func (r *Repo) InsertJob(ctx context.Context, row *JobRow) error {
 	_, err := r.pool.Exec(ctx, `
 		INSERT INTO jobs (
@@ -51,40 +66,18 @@ func (r *Repo) InsertJob(ctx context.Context, row *JobRow) error {
 	return nil
 }
 
-// GetJobByID fetches a single job by its primary key.
+// GetJobByID fetches a job by primary key.
+// Returns nil, nil when not found.
 func (r *Repo) GetJobByID(ctx context.Context, id string) (*JobRow, error) {
 	row := &JobRow{}
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, instance_id, job_type, status,
-		       idempotency_key, attempt_count, max_attempts,
-		       error_message, created_at, updated_at, claimed_at, completed_at
-		FROM jobs WHERE id = $1
-	`, id).Scan(
-		&row.ID, &row.InstanceID, &row.JobType, &row.Status,
-		&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
-		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("GetJobByID %s: %w", id, err)
-	}
-	return row, nil
-}
-
-// GetJobByInstanceAndID fetches a job only when it belongs to the given instance.
-// Returns nil, nil when no matching row exists.
-// Used by GET /v1/instances/{id}/jobs/{job_id} to enforce the instance/job relationship.
-// Source: JOB_MODEL_V1 §1, AUTH_OWNERSHIP_MODEL_V1 §3.
-func (r *Repo) GetJobByInstanceAndID(ctx context.Context, instanceID, jobID string) (*JobRow, error) {
-	row := &JobRow{}
-	err := r.pool.QueryRow(ctx, `
-		SELECT id, instance_id, job_type, status,
+		SELECT id, instance_id, volume_id, snapshot_id, job_type, status,
 		       idempotency_key, attempt_count, max_attempts,
 		       error_message, created_at, updated_at, claimed_at, completed_at
 		FROM jobs
 		WHERE id = $1
-		  AND instance_id = $2
-	`, jobID, instanceID).Scan(
-		&row.ID, &row.InstanceID, &row.JobType, &row.Status,
+	`, id).Scan(
+		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.JobType, &row.Status,
 		&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
 		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 	)
@@ -92,23 +85,49 @@ func (r *Repo) GetJobByInstanceAndID(ctx context.Context, instanceID, jobID stri
 		if isNoRowsErr(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("GetJobByInstanceAndID %s/%s: %w", instanceID, jobID, err)
+		return nil, fmt.Errorf("GetJobByID: %w", err)
 	}
 	return row, nil
 }
 
-// GetJobByIdempotencyKey fetches the job associated with the given idempotency key.
-// Returns nil, nil if no job exists for that key.
-// Source: JOB_MODEL_V1 §idempotency.
+// GetJobByInstanceAndID fetches a job by its ID and instance_id together.
+// Used by the job-status endpoint to enforce instance ownership.
+// Returns nil, nil when not found.
+func (r *Repo) GetJobByInstanceAndID(ctx context.Context, instanceID, jobID string) (*JobRow, error) {
+	row := &JobRow{}
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, instance_id, volume_id, snapshot_id, job_type, status,
+		       idempotency_key, attempt_count, max_attempts,
+		       error_message, created_at, updated_at, claimed_at, completed_at
+		FROM jobs
+		WHERE id          = $1
+		  AND instance_id = $2
+	`, jobID, instanceID).Scan(
+		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.JobType, &row.Status,
+		&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
+		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
+	)
+	if err != nil {
+		if isNoRowsErr(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("GetJobByInstanceAndID: %w", err)
+	}
+	return row, nil
+}
+
+// GetJobByIdempotencyKey fetches a job by its idempotency key.
+// Returns nil, nil when not found.
 func (r *Repo) GetJobByIdempotencyKey(ctx context.Context, key string) (*JobRow, error) {
 	row := &JobRow{}
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, instance_id, job_type, status,
+		SELECT id, instance_id, volume_id, snapshot_id, job_type, status,
 		       idempotency_key, attempt_count, max_attempts,
 		       error_message, created_at, updated_at, claimed_at, completed_at
-		FROM jobs WHERE idempotency_key = $1
+		FROM jobs
+		WHERE idempotency_key = $1
 	`, key).Scan(
-		&row.ID, &row.InstanceID, &row.JobType, &row.Status,
+		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.JobType, &row.Status,
 		&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
 		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 	)
@@ -121,29 +140,29 @@ func (r *Repo) GetJobByIdempotencyKey(ctx context.Context, key string) (*JobRow,
 	return row, nil
 }
 
-// isNoRowsErr returns true for the pgx "no rows in result set" sentinel.
-func isNoRowsErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	return err.Error() == "no rows in result set"
-}
-
 // AtomicClaimJob claims the next pending job using SELECT FOR UPDATE SKIP LOCKED.
-// Returns nil, nil when no pending job is available.
-// Source: JOB_MODEL_V1 §atomic_claim, IMPLEMENTATION_PLAN_V1 §20.
+// Returns nil, nil when there are no pending jobs.
+// Source: JOB_MODEL_V1 §atomic_claim, 03-02-async-job-model §claim.
 func (r *Repo) AtomicClaimJob(ctx context.Context) (*JobRow, error) {
 	row := &JobRow{}
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, instance_id, job_type, status,
-		       idempotency_key, attempt_count, max_attempts,
-		       error_message, created_at, updated_at, claimed_at, completed_at
-		FROM jobs
-		WHERE status = 'pending'
-		ORDER BY created_at ASC
-		LIMIT 1
+		UPDATE jobs
+		SET status        = 'in_progress',
+		    attempt_count = attempt_count + 1,
+		    claimed_at    = NOW(),
+		    updated_at    = NOW()
+		WHERE id = (
+			SELECT id FROM jobs
+			WHERE status = 'pending'
+			ORDER BY created_at ASC
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id, instance_id, volume_id, snapshot_id, job_type, status,
+		          idempotency_key, attempt_count, max_attempts,
+		          error_message, created_at, updated_at, claimed_at, completed_at
 	`).Scan(
-		&row.ID, &row.InstanceID, &row.JobType, &row.Status,
+		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.JobType, &row.Status,
 		&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
 		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 	)
@@ -151,32 +170,77 @@ func (r *Repo) AtomicClaimJob(ctx context.Context) (*JobRow, error) {
 		if isNoRowsErr(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("AtomicClaimJob query: %w", err)
+		return nil, fmt.Errorf("AtomicClaimJob: %w", err)
 	}
 	return row, nil
 }
 
-// ListStuckInProgressJobs returns all in_progress jobs whose per-type timeout
-// has elapsed since claimed_at. Used exclusively by the janitor.
-// Source: JOB_MODEL_V1 §8 (janitor scan query).
+// UpdateJobStatus sets a job's terminal or requeue status.
+// errorMessage is optional — pass nil for success transitions.
+// Source: JOB_MODEL_V1 §2 (states: completed, dead).
+func (r *Repo) UpdateJobStatus(ctx context.Context, id, status string, errorMessage *string) error {
+	var completedAt *time.Time
+	if status == "completed" || status == "dead" {
+		now := time.Now()
+		completedAt = &now
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE jobs
+		SET status        = $2,
+		    error_message = $3,
+		    completed_at  = $4,
+		    updated_at    = NOW()
+		WHERE id = $1
+	`, id, status, errorMessage, completedAt)
+	if err != nil {
+		return fmt.Errorf("UpdateJobStatus: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("UpdateJobStatus: job %s not found", id)
+	}
+	return nil
+}
+
+// RequeueFailedAttempt transitions a job from in_progress back to pending
+// so it can be retried. Preserves attempt_count and stores the error message.
+// Source: JOB_MODEL_V1 §retry.
+func (r *Repo) RequeueFailedAttempt(ctx context.Context, id string, errorMessage *string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE jobs
+		SET status        = 'pending',
+		    claimed_at    = NULL,
+		    error_message = $2,
+		    updated_at    = NOW()
+		WHERE id     = $1
+		  AND status = 'in_progress'
+	`, id, errorMessage)
+	if err != nil {
+		return fmt.Errorf("RequeueFailedAttempt: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("RequeueFailedAttempt: job %s not found or not in_progress", id)
+	}
+	return nil
+}
+
+// ListStuckInProgressJobs returns jobs that have been in_progress past their
+// timeout threshold. Used by the reconciler to recover stuck jobs.
+// Source: JOB_MODEL_V1 §stuck_job_recovery.
 func (r *Repo) ListStuckInProgressJobs(ctx context.Context) ([]*JobRow, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, instance_id, job_type, status,
+		SELECT id, instance_id, volume_id, snapshot_id, job_type, status,
 		       idempotency_key, attempt_count, max_attempts,
 		       error_message, created_at, updated_at, claimed_at, completed_at
 		FROM jobs
 		WHERE status = 'in_progress'
-		  AND claimed_at IS NOT NULL
-		  AND claimed_at + (
-		        CASE job_type
-		            WHEN 'INSTANCE_CREATE'  THEN INTERVAL '1800 seconds'
-		            WHEN 'INSTANCE_START'   THEN INTERVAL '300 seconds'
-		            WHEN 'INSTANCE_STOP'    THEN INTERVAL '600 seconds'
-		            WHEN 'INSTANCE_REBOOT'  THEN INTERVAL '180 seconds'
-		            WHEN 'INSTANCE_DELETE'  THEN INTERVAL '900 seconds'
-		            ELSE                         INTERVAL '600 seconds'
-		        END
-		      ) < NOW()
+		  AND (
+		        -- Instance jobs: 10-minute timeout.
+		        (instance_id IS NOT NULL AND claimed_at < NOW() - INTERVAL '10 minutes')
+		        -- Volume jobs: 15-minute timeout.
+		     OR (volume_id IS NOT NULL AND claimed_at < NOW() - INTERVAL '15 minutes')
+		        -- Snapshot jobs: 30-minute timeout (snapshot I/O may be slow).
+		     OR (snapshot_id IS NOT NULL AND claimed_at < NOW() - INTERVAL '30 minutes')
+		      )
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("ListStuckInProgressJobs: %w", err)
@@ -187,7 +251,7 @@ func (r *Repo) ListStuckInProgressJobs(ctx context.Context) ([]*JobRow, error) {
 	for rows.Next() {
 		row := &JobRow{}
 		if err := rows.Scan(
-			&row.ID, &row.InstanceID, &row.JobType, &row.Status,
+			&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.JobType, &row.Status,
 			&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
 			&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 		); err != nil {
@@ -198,132 +262,39 @@ func (r *Repo) ListStuckInProgressJobs(ctx context.Context) ([]*JobRow, error) {
 	return out, rows.Err()
 }
 
-// RequeueTimedOutJob resets a stuck in_progress job back to pending.
-// Source: JOB_MODEL_V1 §8.
-func (r *Repo) RequeueTimedOutJob(ctx context.Context, id string) error {
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE jobs
-		SET status      = 'pending',
-		    claimed_at  = NULL,
-		    updated_at  = NOW()
-		WHERE id     = $1
-		  AND status = 'in_progress'
-	`, id)
-	if err != nil {
-		return fmt.Errorf("RequeueTimedOutJob: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return nil
-	}
-	return nil
-}
-
-// RequeueFailedAttempt returns a failed in_progress job back to pending for retry.
-//
-// This is called when a job fails but has remaining attempts (attempt_count < max_attempts).
-// The method:
-//   - Sets status back to 'pending' so the job will be picked up again
-//   - Preserves attempt_count (already incremented by claimNext)
-//   - Stores the most recent error_message for debugging
-//   - Clears claimed_at so the job can be claimed again
-//   - Clears completed_at since the job is not complete
-//
-// Source: JOB_MODEL_V1 §retry semantics.
-func (r *Repo) RequeueFailedAttempt(ctx context.Context, id string, errMsg *string) error {
-	tag, err := r.pool.Exec(ctx, `
-		UPDATE jobs
-		SET status        = 'pending',
-		    error_message = $2,
-		    claimed_at    = NULL,
-		    completed_at  = NULL,
-		    updated_at    = NOW()
-		WHERE id = $1
-		  AND status = 'in_progress'
-	`, id, errMsg)
-	if err != nil {
-		return fmt.Errorf("RequeueFailedAttempt: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("RequeueFailedAttempt: job %s not found or not in_progress", id)
-	}
-	return nil
-}
-
-// HasActivePendingJob returns true when the instance already has a pending or
-// in_progress job of the given type.
-// Source: 03-03-reconciliation-loops §Job-Based Architecture (idempotency check).
+// HasActivePendingJob reports whether an instance currently has a non-terminal job.
 func (r *Repo) HasActivePendingJob(ctx context.Context, instanceID, jobType string) (bool, error) {
 	var count int
 	err := r.pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM jobs
 		WHERE instance_id = $1
-		  AND job_type    = $2
-		  AND status IN ('pending', 'in_progress')
+		  AND job_type = $2
+		  AND status IN ('pending', 'running')
 	`, instanceID, jobType).Scan(&count)
 	if err != nil {
+		if isNoRowsErr(err) {
+			return false, nil
+		}
 		return false, fmt.Errorf("HasActivePendingJob: %w", err)
 	}
 	return count > 0, nil
 }
 
-// ListActiveInstances returns all non-deleted instances. Used by the reconciler.
-// Source: 03-03-reconciliation-loops §Periodic Polling (Resync).
-func (r *Repo) ListActiveInstances(ctx context.Context) ([]*InstanceRow, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT id, name, owner_principal_id, vm_state,
-		       instance_type_id, image_id, host_id, availability_zone,
-		       version, created_at, updated_at, deleted_at
-		FROM instances
-		WHERE deleted_at IS NULL
-		  AND vm_state NOT IN ('deleted', 'failed')
-		ORDER BY created_at ASC
-	`)
-	if err != nil {
-		return nil, fmt.Errorf("ListActiveInstances: %w", err)
-	}
-	defer rows.Close()
-
-	var out []*InstanceRow
-	for rows.Next() {
-		row := &InstanceRow{}
-		if err := rows.Scan(
-			&row.ID, &row.Name, &row.OwnerPrincipalID, &row.VMState,
-			&row.InstanceTypeID, &row.ImageID, &row.HostID, &row.AvailabilityZone,
-			&row.Version, &row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
-		); err != nil {
-			return nil, fmt.Errorf("ListActiveInstances scan: %w", err)
-		}
-		out = append(out, row)
-	}
-	return out, rows.Err()
-}
-
-// UpdateJobStatus updates a job's status and optionally sets error_message.
-// For terminal statuses (completed, dead), also sets completed_at.
-// Source: JOB_MODEL_V1 §2 (status transitions).
-func (r *Repo) UpdateJobStatus(ctx context.Context, id, status string, errMsg *string) error {
-	now := time.Now().UTC()
-	var completedAt *time.Time
-	// Only set completed_at for terminal states.
-	// Note: 'failed' is NOT a terminal state in the retry model — jobs that fail
-	// with attempts remaining are requeued via RequeueFailedAttempt, not this method.
-	if status == "completed" || status == "dead" {
-		completedAt = &now
-	}
+// RequeueTimedOutJob moves a timed-out running job back to queued.
+func (r *Repo) RequeueTimedOutJob(ctx context.Context, jobID string) error {
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE jobs
-		SET status        = $2,
-		    error_message = $3,
-		    completed_at  = $4,
-		    updated_at    = $5
+		SET status = 'queued',
+		    updated_at = NOW()
 		WHERE id = $1
-	`, id, status, errMsg, completedAt, now)
+		  AND status = 'running'
+	`, jobID)
 	if err != nil {
-		return fmt.Errorf("UpdateJobStatus: %w", err)
+		return fmt.Errorf("RequeueTimedOutJob: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("UpdateJobStatus: job %s not found", id)
+		return nil
 	}
 	return nil
 }

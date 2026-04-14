@@ -9,13 +9,9 @@ package main
 //   NETWORK_CONTROLLER_URL    e.g. http://network-controller.internal:8083 (required)
 //   LOG_LEVEL                 debug|info|warn|error (default: info)
 //
-// Local-dev overrides (never set in production):
-//   WORKER_IMAGE_MAP          comma-separated imageID=url pairs that override the
-//                             built-in object:// image table with local file paths.
-//                             Example: "00000000-...-0010=/opt/images/ubuntu.qcow2"
-//   WORKER_NFS_ROOT           override the /mnt/nfs/vols default used to derive
-//                             RootfsPath in CreateInstance requests. Set to a local
-//                             writable directory (e.g. /tmp/dev-vols) in dev.
+// VM-P2B Slice 1: VOLUME_ATTACH, VOLUME_DETACH, VOLUME_DELETE added to dispatch.
+// VM-P2B-S2: SNAPSHOT_CREATE, SNAPSHOT_DELETE, VOLUME_RESTORE added to dispatch.
+// Source: P2_VOLUME_MODEL.md §4, P2_IMAGE_SNAPSHOT_MODEL.md §4.
 
 import (
 	"context"
@@ -55,7 +51,7 @@ func main() {
 
 	network := handlers.NewNetworkControllerClient(ncURL)
 	deps := &handlers.Deps{
-		Store:         repo,
+		Store:        repo,
 		Network:      network,
 		DefaultVPCID: "00000000-0000-0000-0000-000000000001",
 		Runtime: func(hostID, address string) *runtimeclient.Client {
@@ -63,17 +59,43 @@ func main() {
 		},
 	}
 
+	// VM-P2B Slice 1: volume job handlers.
+	// Source: P2_VOLUME_MODEL.md §4.2 (VOLUME_ATTACH), §4.4 (VOLUME_DETACH), §5.2 (VOLUME_DELETE).
+	volumeDeps := &handlers.VolumeDeps{
+		Store: repo,
+	}
+
+	// VM-P2B-S2: snapshot job handlers.
+	// Source: P2_IMAGE_SNAPSHOT_MODEL.md §4.
+	snapshotDeps := &handlers.SnapshotDeps{
+		Store: repo,
+	}
+
 	dispatch := map[string]handlers.Handler{
 		"INSTANCE_CREATE": handlers.NewCreateHandler(deps, log),
 		"INSTANCE_DELETE": handlers.NewDeleteHandler(deps, log),
 		// INSTANCE_START, INSTANCE_STOP, INSTANCE_REBOOT: M3 — not yet registered.
+
+		// VM-P2B Slice 1: volume job handlers.
+		"VOLUME_ATTACH": handlers.NewVolumeAttachHandler(volumeDeps, log),
+		"VOLUME_DETACH": handlers.NewVolumeDetachHandler(volumeDeps, log),
+		"VOLUME_DELETE": handlers.NewVolumeDeleteHandler(volumeDeps, log),
+
+		// VM-P2B-S2: snapshot and restore handlers.
+		"SNAPSHOT_CREATE": handlers.NewSnapshotCreateHandler(snapshotDeps, log),
+		"SNAPSHOT_DELETE": handlers.NewSnapshotDeleteHandler(snapshotDeps, log),
+		"VOLUME_RESTORE":  handlers.NewVolumeRestoreHandler(snapshotDeps, log),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	log.Info("worker starting",
-		"handlers", []string{"INSTANCE_CREATE", "INSTANCE_DELETE"},
+		"handlers", []string{
+			"INSTANCE_CREATE", "INSTANCE_DELETE",
+			"VOLUME_ATTACH", "VOLUME_DETACH", "VOLUME_DELETE",
+			"SNAPSHOT_CREATE", "SNAPSHOT_DELETE", "VOLUME_RESTORE",
+		},
 		"network_controller", ncURL,
 	)
 

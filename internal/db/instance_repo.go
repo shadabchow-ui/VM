@@ -173,3 +173,34 @@ func (r *Repo) SoftDeleteInstance(ctx context.Context, id string, version int) e
 	}
 	return nil
 }
+
+// ListActiveInstances returns non-deleted instances that are still active in the control plane.
+func (r *Repo) ListActiveInstances(ctx context.Context) ([]*InstanceRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, name, owner_principal_id, vm_state,
+		       instance_type_id, image_id, host_id, availability_zone,
+		       version, created_at, updated_at, deleted_at
+		FROM instances
+		WHERE deleted_at IS NULL
+		  AND vm_state NOT IN ('deleted', 'failed')
+		ORDER BY created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListActiveInstances: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*InstanceRow
+	for rows.Next() {
+		row := &InstanceRow{}
+		if err := rows.Scan(
+			&row.ID, &row.Name, &row.OwnerPrincipalID, &row.VMState,
+			&row.InstanceTypeID, &row.ImageID, &row.HostID, &row.AvailabilityZone,
+			&row.Version, &row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
+		); err != nil {
+			return nil, fmt.Errorf("ListActiveInstances scan: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}

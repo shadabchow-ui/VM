@@ -86,9 +86,13 @@ func (w *WorkerLoop) claimNext(ctx context.Context) (*db.JobRow, error) {
 	defer func() { _ = tx.Rollback() }()
 
 	// SELECT FOR UPDATE SKIP LOCKED — skip jobs locked by another worker.
+	// volume_id is included so VOLUME_* handlers receive job.VolumeID != nil.
+	// snapshot_id is included so SNAPSHOT_* and VOLUME_RESTORE handlers receive
+	// job.SnapshotID != nil.
+	// Source: P2_VOLUME_MODEL.md §4.2, P2_IMAGE_SNAPSHOT_MODEL.md §4, VM-P2B-S2.
 	var job db.JobRow
 	err = tx.QueryRowContext(ctx, `
-		SELECT id, instance_id, job_type, status,
+		SELECT id, instance_id, volume_id, snapshot_id, job_type, status,
 		       idempotency_key, attempt_count, max_attempts,
 		       error_message, created_at, updated_at, claimed_at, completed_at
 		FROM jobs
@@ -97,7 +101,7 @@ func (w *WorkerLoop) claimNext(ctx context.Context) (*db.JobRow, error) {
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
 	`).Scan(
-		&job.ID, &job.InstanceID, &job.JobType, &job.Status,
+		&job.ID, &job.InstanceID, &job.VolumeID, &job.SnapshotID, &job.JobType, &job.Status,
 		&job.IdempotencyKey, &job.AttemptCount, &job.MaxAttempts,
 		&job.ErrorMessage, &job.CreatedAt, &job.UpdatedAt, &job.ClaimedAt, &job.CompletedAt,
 	)
@@ -131,7 +135,15 @@ func (w *WorkerLoop) claimNext(ctx context.Context) (*db.JobRow, error) {
 
 // execute runs a job, then updates its final status.
 func (w *WorkerLoop) execute(ctx context.Context, job *db.JobRow) {
-	log := w.log.With("job_id", job.ID, "job_type", job.JobType, "instance_id", job.InstanceID, "attempt", job.AttemptCount)
+	volumeID := ""
+	if job.VolumeID != nil {
+		volumeID = *job.VolumeID
+	}
+	snapshotID := ""
+	if job.SnapshotID != nil {
+		snapshotID = *job.SnapshotID
+	}
+	log := w.log.With("job_id", job.ID, "job_type", job.JobType, "instance_id", job.InstanceID, "volume_id", volumeID, "snapshot_id", snapshotID, "attempt", job.AttemptCount)
 	log.Info("executing job")
 
 	handler, ok := w.dispatch[job.JobType]

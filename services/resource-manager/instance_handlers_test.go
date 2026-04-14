@@ -59,12 +59,16 @@ import (
 // PASS 3: extended QueryRow dispatch to support:
 //   - GetJobByIdempotencyKey  (FROM jobs WHERE idempotency_key = $1)
 //   - GetJobByInstanceAndID   (FROM jobs WHERE id = $1 AND instance_id = $2)
+//
 // M9 Slice 4: extended for networking queries:
 //   - VPCs, Subnets, SecurityGroups, NetworkInterfaces
+//
 // M10 Slice 1: extended for project queries:
 //   - Projects, Principals
+//
 // M10 Slice 2: extended for root disk queries:
 //   - RootDisks
+//
 // VM-P2B: extended for volume queries:
 //   - Volumes, VolumeAttachments
 type memPool struct {
@@ -75,14 +79,15 @@ type memPool struct {
 	subnets             map[string]*db.SubnetRow
 	securityGroups      map[string]*db.SecurityGroupRow
 	networkInterfaces   map[string]*db.NetworkInterfaceRow
-	nicSecurityGroups   map[string][]string // nic_id → []sg_id
-	subnetIPAllocations map[string]string   // "subnet:ip" → instance_id (for allocated IPs)
-	nextSubnetIP        map[string]int      // subnet_id → next available IP offset
-	projects            map[string]*db.ProjectRow // M10 Slice 1
-	principals          map[string]string          // id → principal_type (M10 Slice 1)
-	rootDisks           map[string]*db.RootDiskRow // M10 Slice 2
+	nicSecurityGroups   map[string][]string                // nic_id → []sg_id
+	subnetIPAllocations map[string]string                  // "subnet:ip" → instance_id (for allocated IPs)
+	nextSubnetIP        map[string]int                     // subnet_id → next available IP offset
+	projects            map[string]*db.ProjectRow          // M10 Slice 1
+	principals          map[string]string                  // id → principal_type (M10 Slice 1)
+	rootDisks           map[string]*db.RootDiskRow         // M10 Slice 2
 	volumes             map[string]*db.VolumeRow           // VM-P2B
 	volumeAttachments   map[string]*db.VolumeAttachmentRow // VM-P2B; keyed by attachment ID
+	snapshots           map[string]*db.SnapshotRow         // VM-P2B-S2
 }
 
 func newMemPool() *memPool {
@@ -102,6 +107,7 @@ func newMemPool() *memPool {
 		rootDisks:           make(map[string]*db.RootDiskRow),
 		volumes:             make(map[string]*db.VolumeRow),
 		volumeAttachments:   make(map[string]*db.VolumeAttachmentRow),
+		snapshots:           make(map[string]*db.SnapshotRow), // VM-P2B-S2
 	}
 }
 
@@ -228,8 +234,27 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 		return &fakeTag{1}, nil
 
 	case strings.Contains(sql, "INSERT INTO jobs"):
-		// Dispatch: volume jobs use different column order from instance jobs.
-		// InsertVolumeJob SQL contains "volume_id" in the column list.
+		// Dispatch: volume jobs and snapshot jobs use different column orders.
+		// InsertVolumeJob SQL contains "volume_id" (without "snapshot_id").
+		// InsertSnapshotJob SQL contains "snapshot_id".
+		if strings.Contains(sql, "snapshot_id") {
+			// InsertSnapshotJob: $1=id, $2=snapshot_id, $3=volume_id, $4=job_type, $5=idempotency_key, $6=max_attempts
+			id := asStr(args[0])
+			snapID := asStrPtr(args[1])
+			volID := asStrPtr(args[2])
+			now := time.Now()
+			row := &db.JobRow{
+				ID:         id,
+				SnapshotID: snapID,
+				VolumeID:   volID,
+				JobType:    asStr(args[3]),
+				Status:     "pending",
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			}
+			p.jobs[id] = row
+			return &fakeTag{1}, nil
+		}
 		if strings.Contains(sql, "volume_id") {
 			// InsertVolumeJob: $1=id, $2=volume_id, $3=job_type, $4=idempotency_key, $5=max_attempts
 			id := asStr(args[0])
@@ -483,6 +508,33 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 			AttachedAt:          time.Now(),
 		}
 		return &fakeTag{1}, nil
+
+	// VM-P2B-S2: CreateSnapshot
+	// $1=id, $2=owner, $3=name, $4=region, $5=source_volume_id, $6=source_instance_id,
+	// $7=size_gb, $8=encrypted, $9=storage_pool_id
+	case strings.Contains(sql, "INSERT INTO snapshots"):
+		id := asStr(args[0])
+		now := time.Now()
+		enc := false
+		if v, ok := args[7].(bool); ok {
+			enc = v
+		}
+		p.snapshots[id] = &db.SnapshotRow{
+			ID:               id,
+			OwnerPrincipalID: asStr(args[1]),
+			DisplayName:      asStr(args[2]),
+			Region:           asStr(args[3]),
+			SourceVolumeID:   asStrPtr(args[4]),
+			SourceInstanceID: asStrPtr(args[5]),
+			SizeGB:           args[6].(int),
+			Status:           db.SnapshotStatusPending,
+			ProgressPercent:  0,
+			Encrypted:        enc,
+			Version:          0,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		return &fakeTag{1}, nil
 	}
 	return &fakeTag{0}, nil
 }
@@ -546,6 +598,17 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 			}
 		}
 		return &volumeRows{rows: out}, nil
+
+	// VM-P2B-S2: ListSnapshotsByOwner
+	case strings.Contains(sql, "FROM snapshots") && strings.Contains(sql, "owner_principal_id"):
+		ownerID := asStr(args[0])
+		var out []*db.SnapshotRow
+		for _, r := range p.snapshots {
+			if r.OwnerPrincipalID == ownerID && r.DeletedAt == nil {
+				out = append(out, r)
+			}
+		}
+		return &snapshotRows{rows: out}, nil
 
 	// VM-P2B: ListActiveAttachmentsByInstance
 	// Be tolerant of joined/aliased SQL forms such as:
@@ -753,6 +816,47 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 			}
 		}
 		return &intRow{value: count}
+
+	// VM-P2B-S1 / VM-P2B-S2 — HasActiveVolumeJob:
+	// SELECT COUNT(*) FROM jobs WHERE volume_id = $1 AND job_type = $2 AND status IN (...)
+	// Source: P2_VOLUME_MODEL.md §7 VOL-I-5.
+	case strings.Contains(sql, "SELECT COUNT(*)") && strings.Contains(sql, "FROM jobs") && strings.Contains(sql, "volume_id"):
+		volID := asStr(args[0])
+		jobType := asStr(args[1])
+		count := 0
+		for _, j := range p.jobs {
+			if j.VolumeID != nil && *j.VolumeID == volID &&
+				j.JobType == jobType &&
+				(j.Status == "pending" || j.Status == "in_progress") {
+				count++
+			}
+		}
+		return &intRow{value: count}
+
+	// VM-P2B-S2 — HasActiveSnapshotJob:
+	// SELECT COUNT(*) FROM jobs WHERE snapshot_id = $1 AND job_type = $2 AND status IN (...)
+	// Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.9.
+	case strings.Contains(sql, "SELECT COUNT(*)") && strings.Contains(sql, "FROM jobs") && strings.Contains(sql, "snapshot_id"):
+		snapID := asStr(args[0])
+		jobType := asStr(args[1])
+		count := 0
+		for _, j := range p.jobs {
+			if j.SnapshotID != nil && *j.SnapshotID == snapID &&
+				j.JobType == jobType &&
+				(j.Status == "pending" || j.Status == "in_progress") {
+				count++
+			}
+		}
+		return &intRow{value: count}
+
+	// VM-P2B-S2: GetSnapshotByID — WHERE id = $1 AND deleted_at IS NULL
+	case strings.Contains(sql, "FROM snapshots") && strings.Contains(sql, "id = $1"):
+		id := asStr(args[0])
+		snap, ok := p.snapshots[id]
+		if !ok || snap.DeletedAt != nil {
+			return &errRow{fmt.Errorf("GetSnapshotByID %s: no rows in result set", id)}
+		}
+		return &snapshotRow{r: snap}
 	}
 
 	return &errRow{fmt.Errorf("no rows in result set")}
@@ -795,29 +899,31 @@ func (row *instRow) Scan(dest ...any) error {
 
 // jobRow scans a single JobRow.
 // VM-P2B: updated to 13 columns — volume_id inserted at position 2.
-// Column order must match job_repo.go SELECT: id, instance_id, volume_id, job_type,
-// status, idempotency_key, attempt_count, max_attempts, error_message,
+// VM-P2B-S2: updated to 14 columns — snapshot_id inserted at position 3.
+// Column order must match job_repo.go SELECT: id, instance_id, volume_id, snapshot_id,
+// job_type, status, idempotency_key, attempt_count, max_attempts, error_message,
 // created_at, updated_at, claimed_at, completed_at.
 type jobRow struct{ r *db.JobRow }
 
 func (row *jobRow) Scan(dest ...any) error {
 	r := row.r
-	if len(dest) < 13 {
-		return fmt.Errorf("jobRow.Scan: need 13 dest, got %d", len(dest))
+	if len(dest) < 14 {
+		return fmt.Errorf("jobRow.Scan: need 14 dest, got %d", len(dest))
 	}
 	*dest[0].(*string) = r.ID
 	*dest[1].(*string) = r.InstanceID
 	*dest[2].(**string) = r.VolumeID
-	*dest[3].(*string) = r.JobType
-	*dest[4].(*string) = r.Status
-	*dest[5].(*string) = r.IdempotencyKey
-	*dest[6].(*int) = r.AttemptCount
-	*dest[7].(*int) = r.MaxAttempts
-	*dest[8].(**string) = r.ErrorMessage
-	*dest[9].(*time.Time) = r.CreatedAt
-	*dest[10].(*time.Time) = r.UpdatedAt
-	*dest[11].(**time.Time) = r.ClaimedAt
-	*dest[12].(**time.Time) = r.CompletedAt
+	*dest[3].(**string) = r.SnapshotID
+	*dest[4].(*string) = r.JobType
+	*dest[5].(*string) = r.Status
+	*dest[6].(*string) = r.IdempotencyKey
+	*dest[7].(*int) = r.AttemptCount
+	*dest[8].(*int) = r.MaxAttempts
+	*dest[9].(**string) = r.ErrorMessage
+	*dest[10].(*time.Time) = r.CreatedAt
+	*dest[11].(*time.Time) = r.UpdatedAt
+	*dest[12].(**time.Time) = r.ClaimedAt
+	*dest[13].(**time.Time) = r.CompletedAt
 	return nil
 }
 
@@ -959,7 +1065,7 @@ func (r *instRows) Scan(dest ...any) error {
 	return nil
 }
 
-func (r *instRows) Close() {}
+func (r *instRows) Close()     {}
 func (r *instRows) Err() error { return nil }
 
 // stringRows iterates a slice of strings (for security group IDs).
@@ -984,7 +1090,7 @@ func (r *stringRows) Scan(dest ...any) error {
 	return nil
 }
 
-func (r *stringRows) Close() {}
+func (r *stringRows) Close()     {}
 func (r *stringRows) Err() error { return nil }
 
 // M10 Slice 1: projRow scans a single ProjectRow.
@@ -1040,7 +1146,7 @@ func (r *projRows) Scan(dest ...any) error {
 	return nil
 }
 
-func (r *projRows) Close() {}
+func (r *projRows) Close()     {}
 func (r *projRows) Err() error { return nil }
 
 // M10 Slice 1: boolRow returns a single bool value.
@@ -1105,7 +1211,7 @@ func (r *rootDiskRows) Scan(dest ...any) error {
 	return nil
 }
 
-func (r *rootDiskRows) Close() {}
+func (r *rootDiskRows) Close()     {}
 func (r *rootDiskRows) Err() error { return nil }
 
 // ── Test server ───────────────────────────────────────────────────────────────

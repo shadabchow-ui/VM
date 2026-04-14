@@ -242,6 +242,14 @@ func (s *server) routes() http.Handler {
 	// M7: SSH key management.
 	s.registerSSHKeyRoutes(mux)
 
+	// VM-P2B: Volume management API.
+	// Source: P2_VOLUME_MODEL.md §8.
+	s.registerVolumeRoutes(mux)
+
+	// VM-P2B-S2: Snapshot management API.
+	// Source: P2_IMAGE_SNAPSHOT_MODEL.md §4.
+	s.registerSnapshotRoutes(mux)
+
 	// M7: CORS middleware so the browser console SPA can call the API.
 	// In production this is handled by the API gateway / reverse proxy.
 	return corsMiddleware(mux)
