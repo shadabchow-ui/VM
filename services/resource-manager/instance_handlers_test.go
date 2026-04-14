@@ -27,6 +27,12 @@ package main
 //   - Security group validation
 //   - Networking info enrichment in GET/LIST responses
 //
+// VM-P2B: extended memPool with volume and volume_attachment support.
+//   - volumes, volumeAttachments fields on memPool
+//   - volume Exec/Query/QueryRow dispatch cases
+//   - jobRow.Scan updated to 13 columns (volume_id added at position 3)
+//   - newVolTestSrv, newDiscardLogger, startTestServer shared helpers
+//
 // Test strategy: in-process httptest.Server backed by memPool (fake db.Pool).
 // No DB, no Linux/KVM, no network required.
 // Source: 11-02-phase-1-test-strategy.md §unit test approach.
@@ -59,37 +65,43 @@ import (
 //   - Projects, Principals
 // M10 Slice 2: extended for root disk queries:
 //   - RootDisks
+// VM-P2B: extended for volume queries:
+//   - Volumes, VolumeAttachments
 type memPool struct {
-	instances          map[string]*db.InstanceRow
-	jobs               map[string]*db.JobRow
-	jobsByIdemKey      map[string]*db.JobRow // idempotency_key → job
-	vpcs               map[string]*db.VPCRow
-	subnets            map[string]*db.SubnetRow
-	securityGroups     map[string]*db.SecurityGroupRow
-	networkInterfaces  map[string]*db.NetworkInterfaceRow
-	nicSecurityGroups  map[string][]string // nic_id → []sg_id
-	subnetIPAllocations map[string]string  // "subnet:ip" → instance_id (for allocated IPs)
-	nextSubnetIP       map[string]int      // subnet_id → next available IP offset
-	projects           map[string]*db.ProjectRow // M10 Slice 1
-	principals         map[string]string          // id → principal_type (M10 Slice 1)
-	rootDisks          map[string]*db.RootDiskRow // M10 Slice 2
+	instances           map[string]*db.InstanceRow
+	jobs                map[string]*db.JobRow
+	jobsByIdemKey       map[string]*db.JobRow // idempotency_key → job
+	vpcs                map[string]*db.VPCRow
+	subnets             map[string]*db.SubnetRow
+	securityGroups      map[string]*db.SecurityGroupRow
+	networkInterfaces   map[string]*db.NetworkInterfaceRow
+	nicSecurityGroups   map[string][]string // nic_id → []sg_id
+	subnetIPAllocations map[string]string   // "subnet:ip" → instance_id (for allocated IPs)
+	nextSubnetIP        map[string]int      // subnet_id → next available IP offset
+	projects            map[string]*db.ProjectRow // M10 Slice 1
+	principals          map[string]string          // id → principal_type (M10 Slice 1)
+	rootDisks           map[string]*db.RootDiskRow // M10 Slice 2
+	volumes             map[string]*db.VolumeRow           // VM-P2B
+	volumeAttachments   map[string]*db.VolumeAttachmentRow // VM-P2B; keyed by attachment ID
 }
 
 func newMemPool() *memPool {
 	return &memPool{
-		instances:          make(map[string]*db.InstanceRow),
-		jobs:               make(map[string]*db.JobRow),
-		jobsByIdemKey:      make(map[string]*db.JobRow),
-		vpcs:               make(map[string]*db.VPCRow),
-		subnets:            make(map[string]*db.SubnetRow),
-		securityGroups:     make(map[string]*db.SecurityGroupRow),
-		networkInterfaces:  make(map[string]*db.NetworkInterfaceRow),
-		nicSecurityGroups:  make(map[string][]string),
+		instances:           make(map[string]*db.InstanceRow),
+		jobs:                make(map[string]*db.JobRow),
+		jobsByIdemKey:       make(map[string]*db.JobRow),
+		vpcs:                make(map[string]*db.VPCRow),
+		subnets:             make(map[string]*db.SubnetRow),
+		securityGroups:      make(map[string]*db.SecurityGroupRow),
+		networkInterfaces:   make(map[string]*db.NetworkInterfaceRow),
+		nicSecurityGroups:   make(map[string][]string),
 		subnetIPAllocations: make(map[string]string),
-		nextSubnetIP:       make(map[string]int),
-		projects:           make(map[string]*db.ProjectRow),
-		principals:         make(map[string]string),
-		rootDisks:          make(map[string]*db.RootDiskRow),
+		nextSubnetIP:        make(map[string]int),
+		projects:            make(map[string]*db.ProjectRow),
+		principals:          make(map[string]string),
+		rootDisks:           make(map[string]*db.RootDiskRow),
+		volumes:             make(map[string]*db.VolumeRow),
+		volumeAttachments:   make(map[string]*db.VolumeAttachmentRow),
 	}
 }
 
@@ -216,7 +228,25 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 		return &fakeTag{1}, nil
 
 	case strings.Contains(sql, "INSERT INTO jobs"):
-		// $1=id, $2=instance_id, $3=job_type, $4=idempotency_key, $5=max_attempts
+		// Dispatch: volume jobs use different column order from instance jobs.
+		// InsertVolumeJob SQL contains "volume_id" in the column list.
+		if strings.Contains(sql, "volume_id") {
+			// InsertVolumeJob: $1=id, $2=volume_id, $3=job_type, $4=idempotency_key, $5=max_attempts
+			id := asStr(args[0])
+			volID := asStr(args[1])
+			now := time.Now()
+			row := &db.JobRow{
+				ID:        id,
+				VolumeID:  &volID,
+				JobType:   asStr(args[2]),
+				Status:    "pending",
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+			p.jobs[id] = row
+			return &fakeTag{1}, nil
+		}
+		// Instance job: $1=id, $2=instance_id, $3=job_type, $4=idempotency_key, $5=max_attempts
 		id := asStr(args[0])
 		ikey := asStr(args[3])
 		// ON CONFLICT (idempotency_key) DO NOTHING simulation.
@@ -338,14 +368,14 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 			proj.Name = asStr(args[1])
 			proj.DisplayName = asStr(args[2])
 			if args[3] == nil {
-                proj.Description = nil
-            } else {
-                if v, ok := args[3].(*string); ok {
-                    proj.Description = v
-                } else if v, ok := args[3].(string); ok {
-                    proj.Description = &v
-                }
-            }
+				proj.Description = nil
+			} else {
+				if v, ok := args[3].(*string); ok {
+					proj.Description = v
+				} else if v, ok := args[3].(string); ok {
+					proj.Description = &v
+				}
+			}
 			proj.UpdatedAt = time.Now()
 			return &fakeTag{1}, nil
 		}
@@ -405,6 +435,54 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 			return &fakeTag{1}, nil
 		}
 		return &fakeTag{0}, nil
+
+	// VM-P2B: Volume operations
+	case strings.Contains(sql, "INSERT INTO volumes"):
+		// CreateVolume: $1=id, $2=owner, $3=name, $4=region, $5=az,
+		// $6=size_gb, $7=origin, $8=source_disk_id, $9=source_snapshot_id, $10=storage_pool_id
+		id := asStr(args[0])
+		now := time.Now()
+		p.volumes[id] = &db.VolumeRow{
+			ID:               id,
+			OwnerPrincipalID: asStr(args[1]),
+			DisplayName:      asStr(args[2]),
+			Region:           asStr(args[3]),
+			AvailabilityZone: asStr(args[4]),
+			SizeGB:           args[5].(int),
+			Origin:           asStr(args[6]),
+			SourceDiskID:     asStrPtr(args[7]),
+			SourceSnapshotID: asStrPtr(args[8]),
+			Status:           "creating",
+			StoragePoolID:    asStrPtr(args[9]),
+			Version:          0,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		return &fakeTag{1}, nil
+
+	case strings.Contains(sql, "INSERT INTO volume_attachments"):
+		// CreateVolumeAttachment: $1=id, $2=vol_id, $3=inst_id, $4=device_path, $5=delete_on_term
+		id := asStr(args[0])
+		volID := asStr(args[1])
+		// VOL-I-1: reject if active attachment already exists for this volume.
+		for _, att := range p.volumeAttachments {
+			if att.VolumeID == volID && att.DetachedAt == nil {
+				return &fakeTag{0}, fmt.Errorf("unique constraint idx_volume_attachments_active")
+			}
+		}
+		dot := false
+		if v, ok := args[4].(bool); ok {
+			dot = v
+		}
+		p.volumeAttachments[id] = &db.VolumeAttachmentRow{
+			ID:                  id,
+			VolumeID:            volID,
+			InstanceID:          asStr(args[2]),
+			DevicePath:          asStr(args[3]),
+			DeleteOnTermination: dot,
+			AttachedAt:          time.Now(),
+		}
+		return &fakeTag{1}, nil
 	}
 	return &fakeTag{0}, nil
 }
@@ -457,6 +535,45 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 			}
 		}
 		return &rootDiskRows{rows: out}, nil
+
+	// VM-P2B: ListVolumesByOwner
+	case strings.Contains(sql, "FROM volumes") && strings.Contains(sql, "owner_principal_id"):
+		ownerID := asStr(args[0])
+		var out []*db.VolumeRow
+		for _, r := range p.volumes {
+			if r.OwnerPrincipalID == ownerID && r.DeletedAt == nil {
+				out = append(out, r)
+			}
+		}
+		return &volumeRows{rows: out}, nil
+
+	// VM-P2B: ListActiveAttachmentsByInstance
+	// Be tolerant of joined/aliased SQL forms such as:
+	//   FROM volume_attachments ...
+	//   JOIN volume_attachments va ...
+	//   WHERE va.instance_id = $1
+	// The happy-path list-instance-volumes test returns 0 rows if this matcher is
+	// too strict and falls through to the default empty rows implementation.
+	case strings.Contains(sql, "volume_attachments") && strings.Contains(sql, "instance_id") && !strings.Contains(sql, "SELECT device_path"):
+		instanceID := asStr(args[0])
+		var out []*db.VolumeAttachmentRow
+		for _, att := range p.volumeAttachments {
+			if att.InstanceID == instanceID && att.DetachedAt == nil {
+				out = append(out, att)
+			}
+		}
+		return &attachmentRows{rows: out}, nil
+
+	// VM-P2B: NextDevicePath — SELECT device_path FROM volume_attachments WHERE instance_id = $1 ...
+	case strings.Contains(sql, "SELECT device_path") && strings.Contains(sql, "volume_attachments"):
+		instanceID := asStr(args[0])
+		var paths []string
+		for _, att := range p.volumeAttachments {
+			if att.InstanceID == instanceID && att.DetachedAt == nil {
+				paths = append(paths, att.DevicePath)
+			}
+		}
+		return &devicePathRows{paths: paths}, nil
 	}
 	return &instRows{}, nil
 }
@@ -469,6 +586,7 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 //   - GetPrimaryNetworkInterfaceByInstance
 //   - AllocateIPFromSubnet (RETURNING)
 //   - GetDefaultSecurityGroupForVPC
+//   - VM-P2B: GetVolumeByID, GetActiveAttachmentByVolume, CountActiveAttachmentsByInstance
 func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 	switch {
 	// GetInstanceByID
@@ -605,6 +723,36 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 			}
 		}
 		return &errRow{fmt.Errorf("no rows in result set")}
+
+	// VM-P2B: GetVolumeByID
+	case strings.Contains(sql, "FROM volumes") && strings.Contains(sql, "id = $1"):
+		id := asStr(args[0])
+		vol, ok := p.volumes[id]
+		if !ok || vol.DeletedAt != nil {
+			return &errRow{fmt.Errorf("no rows in result set")}
+		}
+		return &volumeRow{r: vol}
+
+	// VM-P2B: GetActiveAttachmentByVolume — WHERE volume_id = $1 AND detached_at IS NULL
+	case strings.Contains(sql, "FROM volume_attachments") && strings.Contains(sql, "volume_id"):
+		volID := asStr(args[0])
+		for _, att := range p.volumeAttachments {
+			if att.VolumeID == volID && att.DetachedAt == nil {
+				return &volumeAttachmentRow{r: att}
+			}
+		}
+		return &errRow{fmt.Errorf("no rows in result set")}
+
+	// VM-P2B: CountActiveAttachmentsByInstance — SELECT COUNT(*) FROM volume_attachments WHERE instance_id = $1 ...
+	case strings.Contains(sql, "SELECT COUNT(*)") && strings.Contains(sql, "volume_attachments"):
+		instanceID := asStr(args[0])
+		count := 0
+		for _, att := range p.volumeAttachments {
+			if att.InstanceID == instanceID && att.DetachedAt == nil {
+				count++
+			}
+		}
+		return &intRow{value: count}
 	}
 
 	return &errRow{fmt.Errorf("no rows in result set")}
@@ -646,25 +794,30 @@ func (row *instRow) Scan(dest ...any) error {
 }
 
 // jobRow scans a single JobRow.
+// VM-P2B: updated to 13 columns — volume_id inserted at position 2.
+// Column order must match job_repo.go SELECT: id, instance_id, volume_id, job_type,
+// status, idempotency_key, attempt_count, max_attempts, error_message,
+// created_at, updated_at, claimed_at, completed_at.
 type jobRow struct{ r *db.JobRow }
 
 func (row *jobRow) Scan(dest ...any) error {
 	r := row.r
-	if len(dest) < 12 {
-		return fmt.Errorf("jobRow.Scan: need 12 dest, got %d", len(dest))
+	if len(dest) < 13 {
+		return fmt.Errorf("jobRow.Scan: need 13 dest, got %d", len(dest))
 	}
 	*dest[0].(*string) = r.ID
 	*dest[1].(*string) = r.InstanceID
-	*dest[2].(*string) = r.JobType
-	*dest[3].(*string) = r.Status
-	*dest[4].(*string) = r.IdempotencyKey
-	*dest[5].(*int) = r.AttemptCount
-	*dest[6].(*int) = r.MaxAttempts
-	*dest[7].(**string) = r.ErrorMessage
-	*dest[8].(*time.Time) = r.CreatedAt
-	*dest[9].(*time.Time) = r.UpdatedAt
-	*dest[10].(**time.Time) = r.ClaimedAt
-	*dest[11].(**time.Time) = r.CompletedAt
+	*dest[2].(**string) = r.VolumeID
+	*dest[3].(*string) = r.JobType
+	*dest[4].(*string) = r.Status
+	*dest[5].(*string) = r.IdempotencyKey
+	*dest[6].(*int) = r.AttemptCount
+	*dest[7].(*int) = r.MaxAttempts
+	*dest[8].(**string) = r.ErrorMessage
+	*dest[9].(*time.Time) = r.CreatedAt
+	*dest[10].(*time.Time) = r.UpdatedAt
+	*dest[11].(**time.Time) = r.ClaimedAt
+	*dest[12].(**time.Time) = r.CompletedAt
 	return nil
 }
 
@@ -757,6 +910,18 @@ func (row *stringValueRow) Scan(dest ...any) error {
 		return fmt.Errorf("stringValueRow.Scan: need 1 dest")
 	}
 	*dest[0].(*string) = row.value
+	return nil
+}
+
+// intRow returns a single int value (used for COUNT(*) queries).
+// VM-P2B: CountActiveAttachmentsByInstance.
+type intRow struct{ value int }
+
+func (row *intRow) Scan(dest ...any) error {
+	if len(dest) < 1 {
+		return fmt.Errorf("intRow.Scan: need 1 dest")
+	}
+	*dest[0].(*int) = row.value
 	return nil
 }
 
@@ -962,9 +1127,25 @@ func newTestSrv(t *testing.T) *testSrv {
 	mux := http.NewServeMux()
 	srv.registerInstanceRoutes(mux)
 	srv.registerProjectRoutes(mux) // M10 Slice 1
+	srv.registerVolumeRoutes(mux)  // VM-P2B
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
 	return &testSrv{ts: ts, mem: mem}
+}
+
+// newDiscardLogger returns a slog.Logger that discards all output.
+// VM-P2B: shared helper used by volume_handlers_test.go.
+func newDiscardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// startTestServer starts an httptest.Server and registers cleanup.
+// VM-P2B: shared helper used by volume_handlers_test.go.
+func startTestServer(t *testing.T, mux *http.ServeMux) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────

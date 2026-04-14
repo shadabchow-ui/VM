@@ -139,6 +139,13 @@ func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// VM-P2B: volume sub-routes can use non-POST methods, so they must be
+	// dispatched before the POST-only lifecycle gate.
+	if subpath == "volumes" {
+		s.handleInstanceVolumeSubroute(w, r, id, parts)
+		return
+	}
+
 	// POST lifecycle subpaths.
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
