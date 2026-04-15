@@ -37,8 +37,8 @@ import (
 
 // ── pointer helpers ───────────────────────────────────────────────────────────
 
-func strPtr(s string) *string { return &s }
-func intPtr(i int) *int       { return &i }
+func familyStrPtr(s string) *string { return &s }
+func familyIntPtr(i int) *int       { return &i }
 
 // ── seed helpers ──────────────────────────────────────────────────────────────
 
@@ -76,7 +76,7 @@ func seedFamilyImage(
 		MinDiskGB:        10,
 		Status:           status,
 		ValidationStatus: "passed",
-		FamilyName:       strPtr(familyName),
+		FamilyName:       familyStrPtr(familyName),
 		FamilyVersion:    familyVersion,
 		CreatedAt:        now,
 		UpdatedAt:        now,
@@ -112,7 +112,7 @@ func seedFamilyImageAt(
 		MinDiskGB:        10,
 		Status:           status,
 		ValidationStatus: "passed",
-		FamilyName:       strPtr(familyName),
+		FamilyName:       familyStrPtr(familyName),
 		FamilyVersion:    familyVersion,
 		CreatedAt:        createdAt,
 		UpdatedAt:        createdAt,
@@ -159,8 +159,8 @@ func TestFamilyLaunch_ExplicitImageIDUnchanged(t *testing.T) {
 // the image with the highest family_version.
 func TestFamilyLaunch_ResolvesHighestVersion(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-v1", "ubuntu-lts", intPtr(1), db.ImageStatusActive, "system")
-	seedFamilyImage(s.mem, "img-v2", "ubuntu-lts", intPtr(2), db.ImageStatusActive, "system")
+	seedFamilyImage(s.mem, "img-v1", "ubuntu-lts", familyIntPtr(1), db.ImageStatusActive, "system")
+	seedFamilyImage(s.mem, "img-v2", "ubuntu-lts", familyIntPtr(2), db.ImageStatusActive, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
 		familyLaunchBody("ubuntu-lts", nil), authHdr(alice))
@@ -181,8 +181,8 @@ func TestFamilyLaunch_TieBreakByCreatedAt(t *testing.T) {
 	s := newTestSrv(t)
 	older := time.Now().Add(-2 * time.Hour)
 	newer := time.Now().Add(-1 * time.Hour)
-	seedFamilyImageAt(s.mem, "img-old", "tie-family", intPtr(3), db.ImageStatusActive, "system", older)
-	seedFamilyImageAt(s.mem, "img-new", "tie-family", intPtr(3), db.ImageStatusActive, "system", newer)
+	seedFamilyImageAt(s.mem, "img-old", "tie-family", familyIntPtr(3), db.ImageStatusActive, "system", older)
+	seedFamilyImageAt(s.mem, "img-new", "tie-family", familyIntPtr(3), db.ImageStatusActive, "system", newer)
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
 		familyLaunchBody("tie-family", nil), authHdr(alice))
@@ -202,7 +202,7 @@ func TestFamilyLaunch_TieBreakByCreatedAt(t *testing.T) {
 func TestFamilyLaunch_VersionedRanksAboveUnversioned(t *testing.T) {
 	s := newTestSrv(t)
 	seedFamilyImage(s.mem, "img-unver", "rank-family", nil, db.ImageStatusActive, "system")
-	seedFamilyImage(s.mem, "img-ver1", "rank-family", intPtr(1), db.ImageStatusActive, "system")
+	seedFamilyImage(s.mem, "img-ver1", "rank-family", familyIntPtr(1), db.ImageStatusActive, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
 		familyLaunchBody("rank-family", nil), authHdr(alice))
@@ -223,7 +223,7 @@ func TestFamilyLaunch_VersionedRanksAboveUnversioned(t *testing.T) {
 // returned by family resolution (DEPRECATED is launchable per contract).
 func TestFamilyLaunch_DeprecatedIsEligible(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-dep", "legacy-family", intPtr(1),
+	seedFamilyImage(s.mem, "img-dep", "legacy-family", familyIntPtr(1),
 		db.ImageStatusDeprecated, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
@@ -243,7 +243,7 @@ func TestFamilyLaunch_DeprecatedIsEligible(t *testing.T) {
 // TestFamilyLaunch_ObsoleteExcluded confirms OBSOLETE images are never resolved.
 func TestFamilyLaunch_ObsoleteExcluded(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-obs", "obs-family", intPtr(1),
+	seedFamilyImage(s.mem, "img-obs", "obs-family", familyIntPtr(1),
 		db.ImageStatusObsolete, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
@@ -299,9 +299,9 @@ func TestFamilyLaunch_PendingValidationExcluded(t *testing.T) {
 // both ACTIVE and OBSOLETE members resolves only the ACTIVE one.
 func TestFamilyLaunch_MixedFamily_OnlyActiveResolves(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-mixed-obs", "mixed-family", intPtr(1),
+	seedFamilyImage(s.mem, "img-mixed-obs", "mixed-family", familyIntPtr(1),
 		db.ImageStatusObsolete, "system")
-	seedFamilyImage(s.mem, "img-mixed-act", "mixed-family", intPtr(2),
+	seedFamilyImage(s.mem, "img-mixed-act", "mixed-family", familyIntPtr(2),
 		db.ImageStatusActive, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
@@ -322,13 +322,13 @@ func TestFamilyLaunch_MixedFamily_OnlyActiveResolves(t *testing.T) {
 // to the specified version even when a newer version exists.
 func TestFamilyLaunch_ExactVersion(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-v1", "ver-family", intPtr(1),
+	seedFamilyImage(s.mem, "img-v1", "ver-family", familyIntPtr(1),
 		db.ImageStatusActive, "system")
-	seedFamilyImage(s.mem, "img-v2", "ver-family", intPtr(2),
+	seedFamilyImage(s.mem, "img-v2", "ver-family", familyIntPtr(2),
 		db.ImageStatusActive, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		familyLaunchBody("ver-family", intPtr(1)), authHdr(alice))
+		familyLaunchBody("ver-family", familyIntPtr(1)), authHdr(alice))
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("exact version: want 202, got %d", resp.StatusCode)
 	}
@@ -343,11 +343,11 @@ func TestFamilyLaunch_ExactVersion(t *testing.T) {
 // version returns 422 image_family_version_not_found.
 func TestFamilyLaunch_ExactVersionNotFound(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-only-v1", "ver-family2", intPtr(1),
+	seedFamilyImage(s.mem, "img-only-v1", "ver-family2", familyIntPtr(1),
 		db.ImageStatusActive, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		familyLaunchBody("ver-family2", intPtr(99)), authHdr(alice))
+		familyLaunchBody("ver-family2", familyIntPtr(99)), authHdr(alice))
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("missing version: want 422, got %d", resp.StatusCode)
 	}
@@ -363,11 +363,11 @@ func TestFamilyLaunch_ExactVersionNotFound(t *testing.T) {
 // launchable — not resolved by the repo query).
 func TestFamilyLaunch_ExactVersionObsoleteBlocked(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-obs-v2", "obs-ver-family", intPtr(2),
+	seedFamilyImage(s.mem, "img-obs-v2", "obs-ver-family", familyIntPtr(2),
 		db.ImageStatusObsolete, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		familyLaunchBody("obs-ver-family", intPtr(2)), authHdr(alice))
+		familyLaunchBody("obs-ver-family", familyIntPtr(2)), authHdr(alice))
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("obsolete exact version: want 422, got %d", resp.StatusCode)
 	}
@@ -386,7 +386,7 @@ func TestFamilyLaunch_ExactVersionObsoleteBlocked(t *testing.T) {
 func TestFamilyLaunch_PrivateNotVisibleToNonOwner(t *testing.T) {
 	s := newTestSrv(t)
 	// alice owns this image; bob must not see it.
-	seedFamilyImage(s.mem, "img-priv", "alice-private-family", intPtr(1),
+	seedFamilyImage(s.mem, "img-priv", "alice-private-family", familyIntPtr(1),
 		db.ImageStatusActive, alice)
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
@@ -406,7 +406,7 @@ func TestFamilyLaunch_PrivateNotVisibleToNonOwner(t *testing.T) {
 // resolves correctly for its owning principal.
 func TestFamilyLaunch_PrivateVisibleToOwner(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-priv-alice", "alice-only-family", intPtr(1),
+	seedFamilyImage(s.mem, "img-priv-alice", "alice-only-family", familyIntPtr(1),
 		db.ImageStatusActive, alice)
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
@@ -426,7 +426,7 @@ func TestFamilyLaunch_PrivateVisibleToOwner(t *testing.T) {
 // are resolvable by any authenticated principal.
 func TestFamilyLaunch_PublicVisibleToAnyPrincipal(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-pub", "public-family", intPtr(1),
+	seedFamilyImage(s.mem, "img-pub", "public-family", familyIntPtr(1),
 		db.ImageStatusActive, "system")
 
 	// bob is not the "owner" (system) but PUBLIC means accessible to all.
@@ -447,11 +447,11 @@ func TestFamilyLaunch_PublicVisibleToAnyPrincipal(t *testing.T) {
 // lookup also enforces PRIVATE visibility.
 func TestFamilyLaunch_PrivateVersionNotVisibleToNonOwner(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-priv-v3", "alice-ver-family", intPtr(3),
+	seedFamilyImage(s.mem, "img-priv-v3", "alice-ver-family", familyIntPtr(3),
 		db.ImageStatusActive, alice)
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		familyLaunchBody("alice-ver-family", intPtr(3)), authHdr(bob))
+		familyLaunchBody("alice-ver-family", familyIntPtr(3)), authHdr(bob))
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("private exact version non-owner: want 422, got %d",
 			resp.StatusCode)
@@ -561,9 +561,9 @@ func TestFamilyLaunch_FamilyDoesNotExist(t *testing.T) {
 // a non-launchable state returns 422 image_family_not_found.
 func TestFamilyLaunch_AllMembersBlocked(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-all-obs-1", "all-blocked", intPtr(1),
+	seedFamilyImage(s.mem, "img-all-obs-1", "all-blocked", familyIntPtr(1),
 		db.ImageStatusObsolete, "system")
-	seedFamilyImage(s.mem, "img-all-obs-2", "all-blocked", intPtr(2),
+	seedFamilyImage(s.mem, "img-all-obs-2", "all-blocked", familyIntPtr(2),
 		db.ImageStatusFailed, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
@@ -592,7 +592,7 @@ func TestFamilyLaunch_AllMembersBlocked(t *testing.T) {
 // layer.
 func TestFamilyLaunch_AdmissionGateNotBypassed(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-race", "race-family", intPtr(1),
+	seedFamilyImage(s.mem, "img-race", "race-family", familyIntPtr(1),
 		db.ImageStatusActive, "system")
 
 	// Flip status to OBSOLETE after seeding — simulates post-resolution state change.
