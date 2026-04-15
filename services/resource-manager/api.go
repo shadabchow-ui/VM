@@ -250,6 +250,10 @@ func (s *server) routes() http.Handler {
 	// Source: P2_IMAGE_SNAPSHOT_MODEL.md §4.
 	s.registerSnapshotRoutes(mux)
 
+	// VM-P2D: Project management API.
+	// Source: P2_PROJECT_RBAC_MODEL.md §9.
+	s.registerProjectRoutes(mux)
+
 	// M7: CORS middleware so the browser console SPA can call the API.
 	// In production this is handled by the API gateway / reverse proxy.
 	return corsMiddleware(mux)
