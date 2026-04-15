@@ -4,7 +4,7 @@ package main
 //
 // PASS 1 scope: validateCreateRequest only.
 //
-// P2-M1/WS-H1 fix: aligned image_id and instance_type catalogs with schema seed values.
+// P2-M1/WS-H1 fix: aligned instance_type catalog with schema seed values.
 //
 // M10 Slice 4: added block_devices validation.
 //   - Phase 1: exactly one block device entry is permitted.
@@ -14,11 +14,19 @@ package main
 //   - image_id in block_devices[0] must match the top-level image_id (Phase 1 invariant).
 //   - size_gb in block_devices[0] must be > 0 and <= shape max.
 //
+// VM-P2C-P1: image_id static catalog (validImageIDs) removed.
+//   Image existence, visibility, and lifecycle state are now checked via DB in
+//   handleCreateInstance using repo.GetImageForAdmission + db.ImageIsLaunchable,
+//   after validateCreateRequest passes. validateCreateRequest retains only the
+//   presence check (empty string → missing_field). This matches the pattern used
+//   for all resource references whose validity requires a DB lookup.
+//   Source: vm-13-01__blueprint__ §core_contracts "Image Lifecycle State Enforcement",
+//           P2_IMAGE_SNAPSHOT_MODEL.md §3.8, API_ERROR_CONTRACT_V1 §6.
+//
 // Source: 08-02-validation-rules-and-error-contracts.md,
-//         INSTANCE_MODEL_V1 §2 (field constraints), §6 (shape catalog), §7 (image catalog),
+//         INSTANCE_MODEL_V1 §2 (field constraints), §6 (shape catalog),
 //         API_ERROR_CONTRACT_V1 §4 (invalid_block_device_mapping, delete_on_termination_required),
-//         execution_blueprint §7.7, P2_VOLUME_MODEL §1, P2_MIGRATION_COMPATIBILITY_RULES §7.2,
-//         db/migrations/001_initial.up.sql (authoritative seed values).
+//         execution_blueprint §7.7, P2_VOLUME_MODEL §1, P2_MIGRATION_COMPATIBILITY_RULES §7.2.
 
 import (
 	"regexp"
@@ -46,17 +54,6 @@ var shapeDiskSizeGB = map[string]int{
 	"c1.xlarge": 500,
 }
 
-// ── Image catalog ─────────────────────────────────────────────────────────────
-// Values must be UUID strings matching images.id seeded in 001_initial.up.sql.
-// The instances.image_id column is UUID NOT NULL REFERENCES images(id) — passing
-// any other string produces a PostgreSQL FK violation at INSERT time.
-// Source: INSTANCE_MODEL_V1 §7 (Phase 1 curated platform images).
-
-var validImageIDs = map[string]bool{
-	"00000000-0000-0000-0000-000000000010": true, // ubuntu-22.04-lts
-	"00000000-0000-0000-0000-000000000011": true, // debian-12
-}
-
 // ── AZ catalog ────────────────────────────────────────────────────────────────
 // Phase 1: single region, two AZs. Source: 07-01 §Phase 1 network architecture.
 
@@ -74,6 +71,13 @@ var nameRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,61}[a-z0-9]$`)
 
 // validateCreateRequest returns one fieldErr per failing field.
 // Returns nil if the request is valid.
+//
+// Image admission (existence, visibility, lifecycle state) is NOT checked here.
+// It is checked in handleCreateInstance via repo.GetImageForAdmission after this
+// function returns no errors. This keeps validateCreateRequest free of DB calls
+// and matches how subnet_id, security_group_ids, and other resource references
+// are validated: field format first, then DB lookup in the handler.
+//
 // Source: API_ERROR_CONTRACT_V1 §6 (validation execution order: schema → resource existence).
 func validateCreateRequest(req *CreateInstanceRequest) []fieldErr {
 	var errs []fieldErr
@@ -94,12 +98,12 @@ func validateCreateRequest(req *CreateInstanceRequest) []fieldErr {
 			"'" + req.InstanceType + "' is not a valid instance type.", "instance_type"})
 	}
 
-	// image_id
+	// image_id — presence check only.
+	// Existence, visibility, and lifecycle state are checked via DB in handleCreateInstance
+	// using repo.GetImageForAdmission + db.ImageIsLaunchable after field validation passes.
+	// Source: vm-13-01__blueprint__ §core_contracts, P2_IMAGE_SNAPSHOT_MODEL.md §3.8.
 	if strings.TrimSpace(req.ImageID) == "" {
 		errs = append(errs, fieldErr{errMissingField, "The field 'image_id' is required.", "image_id"})
-	} else if !validImageIDs[req.ImageID] {
-		errs = append(errs, fieldErr{errInvalidImageID,
-			"Image '" + req.ImageID + "' does not exist or is not accessible.", "image_id"})
 	}
 
 	// availability_zone

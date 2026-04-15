@@ -18,6 +18,13 @@ package main
 //         - Synthesizes default block_devices when omitted (backward compat).
 //         - Passes delete_on_termination through to root disk creation in worker.
 //         - Includes block_devices in InstanceResponse.
+// VM-P2C-P1: Image admission check in handleCreateInstance.
+//         After validateCreateRequest passes, repo.GetImageForAdmission is called
+//         to verify: image exists, is visible to the principal, and
+//         db.ImageIsLaunchable(status) is true (ACTIVE or DEPRECATED).
+//         OBSOLETE, FAILED, and PENDING_VALIDATION images return 422.
+//         Source: vm-13-01__blueprint__ §core_contracts "Image Lifecycle State Enforcement",
+//                 P2_IMAGE_SNAPSHOT_MODEL.md §3.8.
 //
 // Control-plane rule: lifecycle handlers enqueue a job via InsertJob.
 // They never call runtime directly. Workers drive all state transitions.
@@ -240,6 +247,37 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 
 	if errs := validateCreateRequest(&req); len(errs) > 0 {
 		writeAPIErrors(w, errs)
+		return
+	}
+
+	// VM-P2C-P1: Image admission — existence, visibility, and lifecycle state check.
+	//
+	// Must run after field validation (so image_id is non-empty) and before
+	// InsertInstance (so we never write a DB row for an unusable image).
+	//
+	// GetImageForAdmission returns nil when:
+	//   - The image does not exist.
+	//   - The image is PRIVATE and the caller does not own it (→ 404-for-cross-account).
+	// ImageIsLaunchable returns false for OBSOLETE, FAILED, PENDING_VALIDATION.
+	// DEPRECATED images remain launchable (warning-level state, not blocked).
+	//
+	// Source: vm-13-01__blueprint__ §core_contracts "Image Lifecycle State Enforcement",
+	//         P2_IMAGE_SNAPSHOT_MODEL.md §3.8,
+	//         AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account on non-visible images).
+	img, err := s.repo.GetImageForAdmission(r.Context(), req.ImageID, principal)
+	if err != nil {
+		s.log.Error("GetImageForAdmission failed", "image_id", req.ImageID, "error", err)
+		writeDBError(w, err)
+		return
+	}
+	if img == nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, errInvalidImageID,
+			"Image '"+req.ImageID+"' does not exist or is not accessible.", "image_id")
+		return
+	}
+	if !db.ImageIsLaunchable(img.Status) {
+		writeAPIError(w, http.StatusUnprocessableEntity, errImageNotLaunchable,
+			"Image '"+req.ImageID+"' is not available for launch (status: "+img.Status+").", "image_id")
 		return
 	}
 

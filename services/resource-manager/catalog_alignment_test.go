@@ -6,8 +6,31 @@ package main
 // POST /v1/instances. These tests make the contract between instance_validation.go
 // and db/migrations/001_initial.up.sql explicit and machine-checkable.
 //
-// If these tests fail after a schema migration change, it means instance_validation.go
-// was not updated in sync — the exact failure that caused this bug.
+// VM-P2C-P1: Image admission moved from static validImageIDs map to DB lookup.
+//
+// CHANGED from original:
+//   - TestValidation_CatalogImageUUIDs: reworked. validateCreateRequest no longer
+//     checks image existence; it only checks presence (empty string). The alignment
+//     between DB seed values and admission is now enforced by the handler's
+//     GetImageForAdmission + ImageIsLaunchable call. The catalog UUIDs are still
+//     documented here for reference, but the test now confirms that validateCreateRequest
+//     accepts any non-empty image_id (presence-only check) and that the E2E path
+//     succeeds when the image is seeded in the memPool.
+//   - TestValidation_OldImageIDsRejected: removed. Old invented IDs (img_ubuntu2204,
+//     img_debian12) are no longer rejected at the validation layer with 400. They are
+//     rejected at the handler's DB admission layer with 422 invalid_image_id (image
+//     not found in DB). The test for this behavior lives in image_handlers_test.go
+//     (TestCreateInstance_NonExistentImage_Blocked).
+//   - TestCreate_ImageUUID_E2E: preserved and still passes because newTestSrv seeds
+//     the standard catalog UUIDs in the memPool.
+//
+// UNCHANGED:
+//   - TestValidation_CatalogInstanceTypes: instance_type catalog is still a static
+//     in-memory check in validateCreateRequest; no DB lookup needed for Phase 1.
+//   - TestValidation_OldInstanceTypesRejected: still valid; gp1.* is not in validInstanceTypes.
+//
+// Source: instance_validation.go, image_repo.go GetImageForAdmission,
+//         vm-13-01__blueprint__ §core_contracts, API_ERROR_CONTRACT_V1 §6.
 
 import (
 	"net/http"
@@ -15,8 +38,9 @@ import (
 )
 
 // catalogImageUUIDs are the exact UUIDs seeded in db/migrations/001_initial.up.sql §images.
-// This list is the single source of truth for what the test suite treats as valid.
-// If the migration adds or removes images, update this list and validImageIDs together.
+// These are documented here for cross-reference. Admission is now enforced by the
+// handler's DB lookup, not by a static map in validateCreateRequest.
+// Source: INSTANCE_MODEL_V1 §7 (Phase 1 curated platform images).
 var catalogImageUUIDs = []string{
 	"00000000-0000-0000-0000-000000000010", // ubuntu-22.04-lts
 	"00000000-0000-0000-0000-000000000011", // debian-12
@@ -30,9 +54,13 @@ var catalogInstanceTypeIDs = []string{
 	"c1.xlarge",
 }
 
-// TestValidation_CatalogImageUUIDs verifies that every UUID in catalogImageUUIDs
-// is accepted by validateCreateRequest (i.e. is in validImageIDs).
-// Fails if instance_validation.go diverges from the migration seed again.
+// TestValidation_CatalogImageUUIDs verifies that validateCreateRequest accepts
+// any non-empty image_id (presence-only check post VM-P2C-P1).
+//
+// Image admission (existence + lifecycle state) is now a handler-layer DB check.
+// This test confirms the field validator does not erroneously reject catalog UUIDs.
+//
+// Source: instance_validation.go (image_id: presence-only after VM-P2C-P1).
 func TestValidation_CatalogImageUUIDs(t *testing.T) {
 	base := validCreateBody()
 	for _, imageID := range catalogImageUUIDs {
@@ -42,17 +70,36 @@ func TestValidation_CatalogImageUUIDs(t *testing.T) {
 			errs := validateCreateRequest(&req)
 			for _, e := range errs {
 				if e.target == "image_id" {
-					t.Errorf("image_id %q rejected by validateCreateRequest: %s — "+
-						"validImageIDs in instance_validation.go is out of sync with "+
-						"db/migrations/001_initial.up.sql", imageID, e.message)
+					t.Errorf("image_id %q unexpectedly rejected by validateCreateRequest: %s — "+
+						"image_id is presence-only in validateCreateRequest post VM-P2C-P1; "+
+						"DB admission happens in the handler", imageID, e.message)
 				}
 			}
 		})
 	}
 }
 
+// TestValidation_EmptyImageIDRejected verifies that an empty image_id is rejected
+// by validateCreateRequest with missing_field.
+// Source: instance_validation.go (presence-only check preserved).
+func TestValidation_EmptyImageIDRejected(t *testing.T) {
+	req := validCreateBody()
+	req.ImageID = ""
+	errs := validateCreateRequest(&req)
+	found := false
+	for _, e := range errs {
+		if e.target == "image_id" && e.code == errMissingField {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("empty image_id: want missing_field error on image_id, got none")
+	}
+}
+
 // TestValidation_CatalogInstanceTypes verifies every instance type ID seeded in
 // the migration is accepted by validateCreateRequest.
+// instance_type is still a static in-memory check; no DB lookup required.
 func TestValidation_CatalogInstanceTypes(t *testing.T) {
 	base := validCreateBody()
 	for _, itID := range catalogInstanceTypeIDs {
@@ -67,31 +114,6 @@ func TestValidation_CatalogInstanceTypes(t *testing.T) {
 						"db/migrations/001_initial.up.sql", itID, e.message)
 				}
 			}
-		})
-	}
-}
-
-// TestValidation_OldImageIDsRejected verifies the old invented image IDs that
-// previously caused FK violations at INSERT time now fail validation with 400.
-func TestValidation_OldImageIDsRejected(t *testing.T) {
-	oldIDs := []string{
-		"img_ubuntu2204", // old invented value — not a UUID, not in images table
-		"img_debian12",   // old invented value — not a UUID, not in images table
-	}
-	s := newTestSrv(t)
-	for _, imageID := range oldIDs {
-		t.Run(imageID, func(t *testing.T) {
-			body := validCreateBody()
-			body.ImageID = imageID
-			resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
-			if resp.StatusCode != http.StatusBadRequest {
-				t.Errorf("old image_id %q: want 400 (rejected at validation), got %d — "+
-					"this value would cause a FK violation at DB INSERT if it reaches InsertInstance",
-					imageID, resp.StatusCode)
-			}
-			var env apiError
-			decodeBody(t, resp, &env)
-			assertDetailCode(t, env, "image_id", errInvalidImageID)
 		})
 	}
 }
@@ -124,8 +146,11 @@ func TestValidation_OldInstanceTypesRejected(t *testing.T) {
 }
 
 // TestCreate_ImageUUID_E2E verifies the full handler path: a request with a
-// valid catalog UUID reaches InsertInstance without a validation error.
-// (The fake memPool accepts any value; this test confirms no pre-insert rejection.)
+// valid catalog UUID reaches InsertInstance without a validation or admission error.
+// newTestSrv seeds the standard catalog UUIDs in the memPool so DB admission passes.
+// Source: image_handlers_test.go (broader admission coverage),
+//
+//	instance_handlers_test.go (newTestSrv seeding).
 func TestCreate_ImageUUID_E2E(t *testing.T) {
 	s := newTestSrv(t)
 	body := validCreateBody()

@@ -71,6 +71,9 @@ import (
 //
 // VM-P2B: extended for volume queries:
 //   - Volumes, VolumeAttachments
+//
+// VM-P2C-P1: extended for image queries:
+//   - Images (used by GetImageForAdmission + ListImagesByPrincipal)
 type memPool struct {
 	instances           map[string]*db.InstanceRow
 	jobs                map[string]*db.JobRow
@@ -88,6 +91,7 @@ type memPool struct {
 	volumes             map[string]*db.VolumeRow           // VM-P2B
 	volumeAttachments   map[string]*db.VolumeAttachmentRow // VM-P2B; keyed by attachment ID
 	snapshots           map[string]*db.SnapshotRow         // VM-P2B-S2
+	images              map[string]*db.ImageRow            // VM-P2C-P1
 }
 
 func newMemPool() *memPool {
@@ -108,6 +112,7 @@ func newMemPool() *memPool {
 		volumes:             make(map[string]*db.VolumeRow),
 		volumeAttachments:   make(map[string]*db.VolumeAttachmentRow),
 		snapshots:           make(map[string]*db.SnapshotRow), // VM-P2B-S2
+		images:              make(map[string]*db.ImageRow),    // VM-P2C-P1
 	}
 }
 
@@ -637,6 +642,19 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 			}
 		}
 		return &devicePathRows{paths: paths}, nil
+
+	// VM-P2C-P1: ListImagesByPrincipal
+	// Matches WHERE visibility = 'PUBLIC' OR (visibility = 'PRIVATE' AND owner_id = $1)
+	// Source: image_repo.go ListImagesByPrincipal.
+	case strings.Contains(sql, "FROM images"):
+		principalID := asStr(args[0])
+		var out []*db.ImageRow
+		for _, img := range p.images {
+			if img.Visibility == "PUBLIC" || (img.Visibility == "PRIVATE" && img.OwnerID == principalID) {
+				out = append(out, img)
+			}
+		}
+		return &imageRows{rows: out}, nil
 	}
 	return &instRows{}, nil
 }
@@ -875,6 +893,18 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 			return &errRow{fmt.Errorf("GetSnapshotByID %s: no rows in result set", id)}
 		}
 		return &snapshotRow{r: snap}
+
+	// VM-P2C-P1: GetImageByID — WHERE id = $1
+	// Used by GetImageForAdmission (called from handleCreateInstance admission check
+	// and handleGetImage). Visibility filtering is done in Go, not SQL.
+	// Source: image_repo.go GetImageByID.
+	case strings.Contains(sql, "FROM images") && strings.Contains(sql, "id = $1"):
+		id := asStr(args[0])
+		img, ok := p.images[id]
+		if !ok {
+			return &errRow{fmt.Errorf("GetImageByID %s: no rows in result set", id)}
+		}
+		return &imageRow{r: img}
 	}
 
 	return &errRow{fmt.Errorf("no rows in result set")}
@@ -1252,8 +1282,48 @@ func newTestSrv(t *testing.T) *testSrv {
 	srv.registerInstanceRoutes(mux)
 	srv.registerProjectRoutes(mux) // M10 Slice 1
 	srv.registerVolumeRoutes(mux)  // VM-P2B
+	srv.registerImageRoutes(mux)   // VM-P2C-P1
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
+
+	// VM-P2C-P1: seed Phase 1 platform images so handleCreateInstance admission
+	// passes for the standard test image IDs used in validCreateBody() and seedInstance().
+	// Without these, all create/lifecycle tests fail image admission with 422.
+	// Source: image_repo.go GetImageForAdmission, db.ImageIsLaunchable.
+	now := time.Now()
+	mem.images["00000000-0000-0000-0000-000000000010"] = &db.ImageRow{
+		ID:               "00000000-0000-0000-0000-000000000010",
+		Name:             "ubuntu-22.04-lts",
+		OSFamily:         "ubuntu",
+		OSVersion:        "22.04",
+		Architecture:     "x86_64",
+		OwnerID:          "system",
+		Visibility:       "PUBLIC",
+		SourceType:       "PLATFORM",
+		StorageURL:       "nfs://images/ubuntu-22.04.qcow2",
+		MinDiskGB:        10,
+		Status:           "ACTIVE",
+		ValidationStatus: "passed",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	mem.images["00000000-0000-0000-0000-000000000011"] = &db.ImageRow{
+		ID:               "00000000-0000-0000-0000-000000000011",
+		Name:             "debian-12",
+		OSFamily:         "debian",
+		OSVersion:        "12",
+		Architecture:     "x86_64",
+		OwnerID:          "system",
+		Visibility:       "PUBLIC",
+		SourceType:       "PLATFORM",
+		StorageURL:       "nfs://images/debian-12.qcow2",
+		MinDiskGB:        10,
+		Status:           "ACTIVE",
+		ValidationStatus: "passed",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+
 	return &testSrv{ts: ts, mem: mem}
 }
 
