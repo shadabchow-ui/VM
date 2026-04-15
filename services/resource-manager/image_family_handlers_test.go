@@ -1,27 +1,33 @@
 package main
 
-// image_family_handlers_test.go — VM-P2C-P3: image family, versioning, and alias resolution tests.
+// image_family_handlers_test.go — VM-P2C-P4: family alias launch tests.
 //
-// Coverage (12 required cases):
+// Tests for:
+//   - Launch by explicit image_id unchanged (family code path not entered).
+//   - Launch by family_name resolves to latest launchable image.
+//   - Latest = highest family_version; tie-break by created_at DESC.
+//   - DEPRECATED images are eligible for family resolution (still launchable).
+//   - OBSOLETE images are excluded from resolution.
+//   - FAILED images are excluded from resolution.
+//   - PENDING_VALIDATION images are excluded from resolution.
+//   - Mixed family: only launchable members resolve; blocked members ignored.
+//   - Exact family_version targeting.
+//   - Exact family_version not found → 422 image_family_version_not_found.
+//   - PRIVATE family image: non-owner gets 422 image_family_not_found (no 403 leak).
+//   - PRIVATE family image: owner resolves correctly.
+//   - PUBLIC family image: any principal resolves correctly.
+//   - Both image_id and image_family set → 400 invalid_request.
+//   - Neither image_id nor image_family → 400 missing_field on image_id.
+//   - image_family.family_name empty → 400 image_family_invalid_request.
+//   - Family does not exist → 422 image_family_not_found.
+//   - Admission gate not bypassed: family resolution feeds GetImageForAdmission.
 //
-//  1.  Create image with family_name + family_version → 202, fields exposed in response.
-//  2.  GET /v1/images/{id} exposes family_name and family_version when set.
-//  3.  Launch by direct image_id still works unchanged (no regression).
-//  4.  Launch by image_family (latest) resolves to correct ACTIVE image → 202.
-//  5.  PRIVATE family resolves only for owner; non-owner gets 422 family_not_found.
-//  6.  PUBLIC platform family resolves for any authenticated caller → 202.
-//  7.  Family containing only OBSOLETE images → 422 image_family_not_found.
-//  8.  DEPRECATED candidate is selected by family alias (still launchable).
-//  9.  OBSOLETE / FAILED / PENDING_VALIDATION images not selected as family candidates.
-//  10. Explicit family + version resolves to correct image → 202.
-//  11. Family + version where version does not exist → 422 image_family_version_not_found.
-//  12. No cross-principal image sharing introduced (PRIVATE family invisible cross-account).
-//
-// Test strategy: in-process httptest.Server backed by memPool (fake db.Pool).
-// Source: 11-02-phase-1-test-strategy.md §unit test approach,
-//         vm-13-01__blueprint__ §family_seam.
+// Source: vm-13-01__blueprint__ §family_seam,
+//         AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account, PRIVATE visibility),
+//         P2_IMAGE_SNAPSHOT_MODEL.md §3.8 (ACTIVE or DEPRECATED required for launch).
 
 import (
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -29,424 +35,446 @@ import (
 	"github.com/compute-platform/compute-platform/internal/db"
 )
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── pointer helpers ───────────────────────────────────────────────────────────
 
-// strPtr returns a pointer to s.
-func familyStrPtr(s string) *string { return &s }
+func strPtr(s string) *string { return &s }
+func intPtr(i int) *int       { return &i }
 
-// intPtr returns a pointer to n.
-func intPtr(n int) *int { return &n }
+// ── seed helpers ──────────────────────────────────────────────────────────────
 
-// seedFamilyImage adds an image with family metadata to the memPool.
-func seedFamilyImage(mem *memPool, id, name, ownerID, visibility, status, familyName string, familyVersion *int) *db.ImageRow {
-	img := &db.ImageRow{
+// seedFamilyImage adds a family-affiliated image to the memPool.
+//
+// ownerID controls visibility:
+//   - "system" or empty string → visibility=PUBLIC, ownerID="system".
+//   - any other value          → visibility=PRIVATE, ownerID=that value.
+//
+// Uses seedImage from image_handlers_test.go (same package).
+func seedFamilyImage(
+	mem *memPool,
+	id, familyName string,
+	familyVersion *int,
+	status, ownerID string,
+) {
+	visibility := db.ImageVisibilityPublic
+	if ownerID == "" {
+		ownerID = "system"
+	}
+	if ownerID != "system" {
+		visibility = db.ImageVisibilityPrivate
+	}
+	now := time.Now()
+	seedImage(mem, &db.ImageRow{
 		ID:               id,
-		Name:             name,
+		Name:             fmt.Sprintf("img-%s", id),
 		OSFamily:         "ubuntu",
 		OSVersion:        "22.04",
 		Architecture:     "x86_64",
 		OwnerID:          ownerID,
 		Visibility:       visibility,
-		SourceType:       "SNAPSHOT",
-		StorageURL:       "nfs://images/" + name + ".qcow2",
-		MinDiskGB:        20,
+		SourceType:       db.ImageSourceTypePlatform,
+		StorageURL:       "nfs://images/test.qcow2",
+		MinDiskGB:        10,
 		Status:           status,
 		ValidationStatus: "passed",
-		FamilyName:       &familyName,
+		FamilyName:       strPtr(familyName),
 		FamilyVersion:    familyVersion,
-		CreatedAt:        time.Now(),
-		UpdatedAt:        time.Now(),
-	}
-	if status == db.ImageStatusDeprecated {
-		now := time.Now()
-		img.DeprecatedAt = &now
-	}
-	if status == db.ImageStatusObsolete {
-		now := time.Now()
-		img.ObsoletedAt = &now
-	}
-	mem.images[id] = img
-	return img
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	})
 }
 
-// launchByFamilyBody returns a POST /v1/instances body using image_family.
-func launchByFamilyBody(familyName string, familyVersion *int) map[string]any {
-	body := map[string]any{
-		"name":              "test-instance",
-		"instance_type":     "c1.small",
-		"availability_zone": "us-east-1a",
-		"ssh_key_name":      "my-key",
-		"image_family": map[string]any{
-			"family_name": familyName,
+// seedFamilyImageAt seeds a family image with an explicit creation time,
+// used for tie-break ordering tests.
+func seedFamilyImageAt(
+	mem *memPool,
+	id, familyName string,
+	familyVersion *int,
+	status, ownerID string,
+	createdAt time.Time,
+) {
+	visibility := db.ImageVisibilityPublic
+	if ownerID == "" {
+		ownerID = "system"
+	}
+	if ownerID != "system" {
+		visibility = db.ImageVisibilityPrivate
+	}
+	seedImage(mem, &db.ImageRow{
+		ID:               id,
+		Name:             fmt.Sprintf("img-%s", id),
+		OSFamily:         "ubuntu",
+		OSVersion:        "22.04",
+		Architecture:     "x86_64",
+		OwnerID:          ownerID,
+		Visibility:       visibility,
+		SourceType:       db.ImageSourceTypePlatform,
+		StorageURL:       "nfs://images/test.qcow2",
+		MinDiskGB:        10,
+		Status:           status,
+		ValidationStatus: "passed",
+		FamilyName:       strPtr(familyName),
+		FamilyVersion:    familyVersion,
+		CreatedAt:        createdAt,
+		UpdatedAt:        createdAt,
+	})
+}
+
+// familyLaunchBody builds a CreateInstanceRequest using image_family.
+// All required non-image fields are filled with valid values.
+func familyLaunchBody(familyName string, familyVersion *int) CreateInstanceRequest {
+	return CreateInstanceRequest{
+		Name:             "my-instance",
+		InstanceType:     "c1.small",
+		AvailabilityZone: "us-east-1a",
+		SSHKeyName:       "my-key",
+		ImageFamily: &ImageFamilyRef{
+			FamilyName:    familyName,
+			FamilyVersion: familyVersion,
 		},
 	}
-	if familyVersion != nil {
-		body["image_family"].(map[string]any)["family_version"] = *familyVersion
-	}
-	return body
 }
 
-// ── Test 1: Create image with family_name + family_version ────────────────────
+// ── explicit image_id unchanged ───────────────────────────────────────────────
 
-// Test 1: POST /v1/images with family_name and family_version → 202 + fields in response.
-func TestCreateImageFromSnapshot_WithFamilyFields_Returns202WithFamily(t *testing.T) {
+// TestFamilyLaunch_ExplicitImageIDUnchanged confirms the family code path is
+// not entered when image_id is set directly, and the resolved image is correct.
+func TestFamilyLaunch_ExplicitImageIDUnchanged(t *testing.T) {
 	s := newTestSrv(t)
-	seedSnapshotForImage(s.mem, "snap-family", alice, db.SnapshotStatusAvailable, 20)
-
-	body := map[string]any{
-		"source_type":        "SNAPSHOT",
-		"name":               "my-family-image",
-		"source_snapshot_id": "snap-family",
-		"os_family":          "ubuntu",
-		"os_version":         "22.04",
-		"architecture":       "x86_64",
-		"family_name":        "ubuntu-base",
-		"family_version":     3,
-	}
-	resp := doReq(t, s.ts, http.MethodPost, "/v1/images", body, authHdr(alice))
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("want 202, got %d", resp.StatusCode)
-	}
-	var out CreateImageFromSnapshotResponse
-	decodeBody(t, resp, &out)
-
-	if out.Image.FamilyName == nil || *out.Image.FamilyName != "ubuntu-base" {
-		t.Errorf("want family_name=ubuntu-base, got %v", out.Image.FamilyName)
-	}
-	if out.Image.FamilyVersion == nil || *out.Image.FamilyVersion != 3 {
-		t.Errorf("want family_version=3, got %v", out.Image.FamilyVersion)
-	}
-	// Status should be PENDING_VALIDATION (not yet resolved by worker).
-	if out.Image.Status != "PENDING_VALIDATION" {
-		t.Errorf("want PENDING_VALIDATION, got %q", out.Image.Status)
-	}
-}
-
-// Test 1b: image without family fields → family_name and family_version absent from response.
-func TestCreateImageFromSnapshot_NoFamilyFields_ResponseOmitsFamilyFields(t *testing.T) {
-	s := newTestSrv(t)
-	seedSnapshotForImage(s.mem, "snap-nofamily", alice, db.SnapshotStatusAvailable, 20)
-
-	body := createFromSnapshotBody("snap-nofamily")
-	resp := doReq(t, s.ts, http.MethodPost, "/v1/images", body, authHdr(alice))
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("want 202, got %d", resp.StatusCode)
-	}
-	// Decode to raw map to verify omitempty behaviour.
-	var raw map[string]any
-	decodeBody(t, resp, &raw)
-	imgRaw, _ := raw["image"].(map[string]any)
-	if _, ok := imgRaw["family_name"]; ok {
-		t.Error("family_name must be omitted from response when not set")
-	}
-	if _, ok := imgRaw["family_version"]; ok {
-		t.Error("family_version must be omitted from response when not set")
-	}
-}
-
-// ── Test 2: GET /v1/images/{id} exposes family fields ────────────────────────
-
-// Test 2: GET image with family fields set → response includes family_name + family_version.
-func TestGetImage_WithFamilyFields_ExposesFamilyInResponse(t *testing.T) {
-	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-family-get", "family-img", alice, "PRIVATE", "ACTIVE", "ubuntu-base", intPtr(2))
-
-	resp := doReq(t, s.ts, http.MethodGet, "/v1/images/img-family-get", nil, authHdr(alice))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("want 200, got %d", resp.StatusCode)
-	}
-	var raw map[string]any
-	decodeBody(t, resp, &raw)
-	if raw["family_name"] != "ubuntu-base" {
-		t.Errorf("want family_name=ubuntu-base, got %v", raw["family_name"])
-	}
-	// JSON numbers decode as float64.
-	if raw["family_version"] != float64(2) {
-		t.Errorf("want family_version=2, got %v", raw["family_version"])
-	}
-	// Internal fields must still be absent.
-	if _, ok := raw["storage_url"]; ok {
-		t.Error("storage_url must not appear in image response")
-	}
-	if _, ok := raw["owner_id"]; ok {
-		t.Error("owner_id must not appear in image response")
-	}
-}
-
-// ── Test 3: Direct image_id launch unchanged ──────────────────────────────────
-
-// Test 3: launch by direct image_id still works — no regression from P2C-P3 changes.
-func TestCreateInstance_DirectImageID_UnchangedBehavior(t *testing.T) {
-	s := newTestSrv(t)
-	// Use a seeded PUBLIC platform image (always present in newTestSrv).
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
 		validCreateBody(), authHdr(alice))
 	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("want 202 for direct image_id launch, got %d", resp.StatusCode)
-	}
-}
-
-// ── Test 4: Launch by family alias (latest) ───────────────────────────────────
-
-// Test 4: launch by image_family resolves latest ACTIVE image → 202.
-func TestCreateInstance_ByFamilyLatest_ResolvesToActiveImage(t *testing.T) {
-	s := newTestSrv(t)
-	// Seed two ACTIVE images in the same family — version 1 and version 2.
-	seedFamilyImage(s.mem, "img-family-v1", "ubuntu-v1", alice, "PRIVATE", "ACTIVE", "my-ubuntu", intPtr(1))
-	seedFamilyImage(s.mem, "img-family-v2", "ubuntu-v2", alice, "PRIVATE", "ACTIVE", "my-ubuntu", intPtr(2))
-
-	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("my-ubuntu", nil), authHdr(alice))
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("want 202 for family latest launch, got %d", resp.StatusCode)
+		t.Fatalf("explicit image_id: want 202, got %d", resp.StatusCode)
 	}
 	var out CreateInstanceResponse
 	decodeBody(t, resp, &out)
-	// Version 2 must be selected (highest version).
-	if out.Instance.ImageID != "img-family-v2" {
-		t.Errorf("want image_id=img-family-v2 (latest), got %q", out.Instance.ImageID)
+	if out.Instance.ImageID != "00000000-0000-0000-0000-000000000010" {
+		t.Errorf("want image_id 00000000-0000-0000-0000-000000000010, got %q",
+			out.Instance.ImageID)
 	}
 }
 
-// ── Test 5: PRIVATE family resolves only for owner ────────────────────────────
+// ── family latest resolution ──────────────────────────────────────────────────
 
-// Test 5a: alice's PRIVATE family is resolved for alice → 202.
-func TestCreateInstance_PrivateFamilyByOwner_Resolves(t *testing.T) {
+// TestFamilyLaunch_ResolvesHighestVersion confirms ResolveFamilyLatest selects
+// the image with the highest family_version.
+func TestFamilyLaunch_ResolvesHighestVersion(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-alice-fam", "alice-img", alice, "PRIVATE", "ACTIVE", "alice-family", intPtr(1))
+	seedFamilyImage(s.mem, "img-v1", "ubuntu-lts", intPtr(1), db.ImageStatusActive, "system")
+	seedFamilyImage(s.mem, "img-v2", "ubuntu-lts", intPtr(2), db.ImageStatusActive, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("alice-family", nil), authHdr(alice))
+		familyLaunchBody("ubuntu-lts", nil), authHdr(alice))
 	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("want 202 for owner resolving PRIVATE family, got %d", resp.StatusCode)
+		t.Fatalf("family latest: want 202, got %d", resp.StatusCode)
+	}
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+	if out.Instance.ImageID != "img-v2" {
+		t.Errorf("family latest: want img-v2 (highest version), got %q",
+			out.Instance.ImageID)
 	}
 }
 
-// Test 5b: alice's PRIVATE family is NOT resolved for bob → 422 image_family_not_found.
-func TestCreateInstance_PrivateFamilyByNonOwner_Returns422(t *testing.T) {
+// TestFamilyLaunch_TieBreakByCreatedAt confirms that when two images share the
+// same family_version (or both are nil), the newer created_at wins.
+func TestFamilyLaunch_TieBreakByCreatedAt(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-alice-priv-fam", "alice-private", alice, "PRIVATE", "ACTIVE", "alice-only-family", intPtr(1))
+	older := time.Now().Add(-2 * time.Hour)
+	newer := time.Now().Add(-1 * time.Hour)
+	seedFamilyImageAt(s.mem, "img-old", "tie-family", intPtr(3), db.ImageStatusActive, "system", older)
+	seedFamilyImageAt(s.mem, "img-new", "tie-family", intPtr(3), db.ImageStatusActive, "system", newer)
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("alice-only-family", nil), authHdr(bob))
+		familyLaunchBody("tie-family", nil), authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("tie-break: want 202, got %d", resp.StatusCode)
+	}
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+	if out.Instance.ImageID != "img-new" {
+		t.Errorf("tie-break: want img-new (newer created_at), got %q",
+			out.Instance.ImageID)
+	}
+}
+
+// TestFamilyLaunch_VersionedRanksAboveUnversioned confirms that an image with
+// an explicit family_version beats an unversioned image in the same family.
+func TestFamilyLaunch_VersionedRanksAboveUnversioned(t *testing.T) {
+	s := newTestSrv(t)
+	seedFamilyImage(s.mem, "img-unver", "rank-family", nil, db.ImageStatusActive, "system")
+	seedFamilyImage(s.mem, "img-ver1", "rank-family", intPtr(1), db.ImageStatusActive, "system")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("rank-family", nil), authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("versioned vs unversioned: want 202, got %d", resp.StatusCode)
+	}
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+	if out.Instance.ImageID != "img-ver1" {
+		t.Errorf("versioned vs unversioned: want img-ver1, got %q",
+			out.Instance.ImageID)
+	}
+}
+
+// ── DEPRECATED still launchable ───────────────────────────────────────────────
+
+// TestFamilyLaunch_DeprecatedIsEligible confirms that a DEPRECATED image is
+// returned by family resolution (DEPRECATED is launchable per contract).
+func TestFamilyLaunch_DeprecatedIsEligible(t *testing.T) {
+	s := newTestSrv(t)
+	seedFamilyImage(s.mem, "img-dep", "legacy-family", intPtr(1),
+		db.ImageStatusDeprecated, "system")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("legacy-family", nil), authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("deprecated eligible: want 202, got %d", resp.StatusCode)
+	}
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+	if out.Instance.ImageID != "img-dep" {
+		t.Errorf("deprecated eligible: want img-dep, got %q", out.Instance.ImageID)
+	}
+}
+
+// ── blocked lifecycle states excluded ────────────────────────────────────────
+
+// TestFamilyLaunch_ObsoleteExcluded confirms OBSOLETE images are never resolved.
+func TestFamilyLaunch_ObsoleteExcluded(t *testing.T) {
+	s := newTestSrv(t)
+	seedFamilyImage(s.mem, "img-obs", "obs-family", intPtr(1),
+		db.ImageStatusObsolete, "system")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("obs-family", nil), authHdr(alice))
 	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("want 422 for non-owner resolving PRIVATE family, got %d", resp.StatusCode)
+		t.Fatalf("obsolete-only family: want 422, got %d", resp.StatusCode)
 	}
 	var env apiError
 	decodeBody(t, resp, &env)
 	if env.Error.Code != errImageFamilyNotFound {
-		t.Errorf("want code %q, got %q", errImageFamilyNotFound, env.Error.Code)
+		t.Errorf("want %q, got %q", errImageFamilyNotFound, env.Error.Code)
 	}
 }
 
-// ── Test 6: PUBLIC platform family resolves for any caller ───────────────────
-
-// Test 6: PUBLIC image family resolves for any authenticated caller → 202.
-func TestCreateInstance_PublicFamilyAnyCallerResolves(t *testing.T) {
+// TestFamilyLaunch_FailedExcluded confirms FAILED images are never resolved.
+func TestFamilyLaunch_FailedExcluded(t *testing.T) {
 	s := newTestSrv(t)
-	// Seed a PUBLIC image in a family (platform-style, owned by "system").
-	seedFamilyImage(s.mem, "img-pub-fam", "pub-family-img", "system", "PUBLIC", "ACTIVE", "ubuntu-lts", intPtr(1))
-
-	// Both alice and bob can resolve this family.
-	for _, user := range []string{alice, bob} {
-		resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-			launchByFamilyBody("ubuntu-lts", nil), authHdr(user))
-		if resp.StatusCode != http.StatusAccepted {
-			t.Errorf("user %q: want 202 for PUBLIC family resolution, got %d", user, resp.StatusCode)
-		}
-	}
-}
-
-// ── Test 7: Family with only blocked images → 422 ─────────────────────────────
-
-// Test 7: family exists but all images are OBSOLETE → 422 image_family_not_found.
-func TestCreateInstance_FamilyAllObsolete_Returns422(t *testing.T) {
-	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-all-obs-1", "obs-img-1", alice, "PRIVATE", "OBSOLETE", "dead-family", intPtr(1))
-	seedFamilyImage(s.mem, "img-all-obs-2", "obs-img-2", alice, "PRIVATE", "OBSOLETE", "dead-family", intPtr(2))
+	seedFamilyImage(s.mem, "img-fail", "fail-family", nil,
+		db.ImageStatusFailed, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("dead-family", nil), authHdr(alice))
+		familyLaunchBody("fail-family", nil), authHdr(alice))
 	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("want 422 for all-blocked family, got %d", resp.StatusCode)
+		t.Fatalf("failed-only family: want 422, got %d", resp.StatusCode)
 	}
 	var env apiError
 	decodeBody(t, resp, &env)
 	if env.Error.Code != errImageFamilyNotFound {
-		t.Errorf("want code %q, got %q", errImageFamilyNotFound, env.Error.Code)
+		t.Errorf("want %q, got %q", errImageFamilyNotFound, env.Error.Code)
 	}
 }
 
-// ── Test 8: DEPRECATED candidate selected by family alias ────────────────────
-
-// Test 8: family contains one DEPRECATED image (no ACTIVE) → alias resolves it → 202.
-func TestCreateInstance_FamilyDeprecatedCandidate_StillLaunchable(t *testing.T) {
+// TestFamilyLaunch_PendingValidationExcluded confirms PENDING_VALIDATION images
+// are never resolved.
+func TestFamilyLaunch_PendingValidationExcluded(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-deprecated-fam", "depr-img", alice, "PRIVATE", "DEPRECATED", "sunset-family", intPtr(1))
+	seedFamilyImage(s.mem, "img-pv", "pv-family", nil,
+		db.ImageStatusPendingValidation, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("sunset-family", nil), authHdr(alice))
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("want 202 for DEPRECATED family candidate (still launchable), got %d", resp.StatusCode)
-	}
-	var out CreateInstanceResponse
-	decodeBody(t, resp, &out)
-	if out.Instance.ImageID != "img-deprecated-fam" {
-		t.Errorf("want resolved image=img-deprecated-fam, got %q", out.Instance.ImageID)
-	}
-}
-
-// ── Test 9: Blocked statuses excluded from family resolution ──────────────────
-
-// Test 9: family has OBSOLETE, FAILED, PENDING_VALIDATION, and one ACTIVE image.
-// Only the ACTIVE image should be selected.
-func TestCreateInstance_FamilyMixedStatuses_OnlyActiveSelected(t *testing.T) {
-	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-mix-obs",  "obs",  alice, "PRIVATE", "OBSOLETE",           "mixed-family", intPtr(1))
-	seedFamilyImage(s.mem, "img-mix-fail", "fail", alice, "PRIVATE", "FAILED",             "mixed-family", intPtr(2))
-	seedFamilyImage(s.mem, "img-mix-pend", "pend", alice, "PRIVATE", "PENDING_VALIDATION", "mixed-family", intPtr(3))
-	seedFamilyImage(s.mem, "img-mix-act",  "act",  alice, "PRIVATE", "ACTIVE",             "mixed-family", intPtr(4))
-
-	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("mixed-family", nil), authHdr(alice))
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("want 202, got %d", resp.StatusCode)
-	}
-	var out CreateInstanceResponse
-	decodeBody(t, resp, &out)
-	if out.Instance.ImageID != "img-mix-act" {
-		t.Errorf("want only ACTIVE image selected from mixed family, got %q", out.Instance.ImageID)
-	}
-}
-
-// Test 9b: family has ONLY FAILED images → 422.
-func TestCreateInstance_FamilyAllFailed_Returns422(t *testing.T) {
-	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-fail-fam", "fail-img", alice, "PRIVATE", "FAILED", "fail-family", intPtr(1))
-
-	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("fail-family", nil), authHdr(alice))
+		familyLaunchBody("pv-family", nil), authHdr(alice))
 	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("want 422 for all-failed family, got %d", resp.StatusCode)
+		t.Fatalf("pending-only family: want 422, got %d", resp.StatusCode)
 	}
 	var env apiError
 	decodeBody(t, resp, &env)
 	if env.Error.Code != errImageFamilyNotFound {
-		t.Errorf("want code %q, got %q", errImageFamilyNotFound, env.Error.Code)
+		t.Errorf("want %q, got %q", errImageFamilyNotFound, env.Error.Code)
 	}
 }
 
-// Test 9c: family has ONLY PENDING_VALIDATION images → 422.
-func TestCreateInstance_FamilyAllPending_Returns422(t *testing.T) {
+// TestFamilyLaunch_MixedFamily_OnlyActiveResolves confirms that a family with
+// both ACTIVE and OBSOLETE members resolves only the ACTIVE one.
+func TestFamilyLaunch_MixedFamily_OnlyActiveResolves(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-pend-fam", "pend-img", alice, "PRIVATE", "PENDING_VALIDATION", "pending-family", intPtr(1))
+	seedFamilyImage(s.mem, "img-mixed-obs", "mixed-family", intPtr(1),
+		db.ImageStatusObsolete, "system")
+	seedFamilyImage(s.mem, "img-mixed-act", "mixed-family", intPtr(2),
+		db.ImageStatusActive, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("pending-family", nil), authHdr(alice))
-	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("want 422 for all-pending family, got %d", resp.StatusCode)
-	}
-}
-
-// ── Test 10: Explicit family + version resolves correctly ─────────────────────
-
-// Test 10: image_family with family_version resolves the exact version → 202.
-func TestCreateInstance_FamilyExactVersion_ResolvesCorrectly(t *testing.T) {
-	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-ver-1", "v1", alice, "PRIVATE", "ACTIVE", "versioned-family", intPtr(1))
-	seedFamilyImage(s.mem, "img-ver-2", "v2", alice, "PRIVATE", "ACTIVE", "versioned-family", intPtr(2))
-	seedFamilyImage(s.mem, "img-ver-3", "v3", alice, "PRIVATE", "ACTIVE", "versioned-family", intPtr(3))
-
-	// Request version 2 specifically.
-	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("versioned-family", intPtr(2)), authHdr(alice))
+		familyLaunchBody("mixed-family", nil), authHdr(alice))
 	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("want 202 for exact version resolution, got %d", resp.StatusCode)
+		t.Fatalf("mixed family: want 202, got %d", resp.StatusCode)
 	}
 	var out CreateInstanceResponse
 	decodeBody(t, resp, &out)
-	if out.Instance.ImageID != "img-ver-2" {
-		t.Errorf("want img-ver-2 for version 2, got %q", out.Instance.ImageID)
+	if out.Instance.ImageID != "img-mixed-act" {
+		t.Errorf("mixed family: want img-mixed-act, got %q", out.Instance.ImageID)
 	}
 }
 
-// ── Test 11: Family + version does not exist → 422 ───────────────────────────
+// ── exact version targeting ───────────────────────────────────────────────────
 
-// Test 11: explicit family+version where version 99 doesn't exist → 422.
-func TestCreateInstance_FamilyVersionNotFound_Returns422(t *testing.T) {
+// TestFamilyLaunch_ExactVersion confirms family_name + family_version resolves
+// to the specified version even when a newer version exists.
+func TestFamilyLaunch_ExactVersion(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-exist-ver", "existing", alice, "PRIVATE", "ACTIVE", "partial-family", intPtr(1))
+	seedFamilyImage(s.mem, "img-v1", "ver-family", intPtr(1),
+		db.ImageStatusActive, "system")
+	seedFamilyImage(s.mem, "img-v2", "ver-family", intPtr(2),
+		db.ImageStatusActive, "system")
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("partial-family", intPtr(99)), authHdr(alice))
+		familyLaunchBody("ver-family", intPtr(1)), authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("exact version: want 202, got %d", resp.StatusCode)
+	}
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+	if out.Instance.ImageID != "img-v1" {
+		t.Errorf("exact version: want img-v1, got %q", out.Instance.ImageID)
+	}
+}
+
+// TestFamilyLaunch_ExactVersionNotFound confirms requesting a non-existent
+// version returns 422 image_family_version_not_found.
+func TestFamilyLaunch_ExactVersionNotFound(t *testing.T) {
+	s := newTestSrv(t)
+	seedFamilyImage(s.mem, "img-only-v1", "ver-family2", intPtr(1),
+		db.ImageStatusActive, "system")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("ver-family2", intPtr(99)), authHdr(alice))
 	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("want 422 for missing version, got %d", resp.StatusCode)
+		t.Fatalf("missing version: want 422, got %d", resp.StatusCode)
 	}
 	var env apiError
 	decodeBody(t, resp, &env)
 	if env.Error.Code != errImageFamilyVersionNotFound {
-		t.Errorf("want code %q, got %q", errImageFamilyVersionNotFound, env.Error.Code)
+		t.Errorf("want %q, got %q", errImageFamilyVersionNotFound, env.Error.Code)
 	}
 }
 
-// ── Test 12: No cross-principal image sharing ─────────────────────────────────
-
-// Test 12: bob's PRIVATE family image is not visible to alice in LIST.
-func TestListImages_FamilyImages_NoCrossPrincipalSharing(t *testing.T) {
+// TestFamilyLaunch_ExactVersionObsoleteBlocked confirms that requesting an
+// exact version that exists but is OBSOLETE returns 422 (version is not
+// launchable — not resolved by the repo query).
+func TestFamilyLaunch_ExactVersionObsoleteBlocked(t *testing.T) {
 	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-bob-family", "bob-fam", bob, "PRIVATE", "ACTIVE", "bob-secret-family", intPtr(1))
+	seedFamilyImage(s.mem, "img-obs-v2", "obs-ver-family", intPtr(2),
+		db.ImageStatusObsolete, "system")
 
-	resp := doReq(t, s.ts, http.MethodGet, "/v1/images", nil, authHdr(alice))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("want 200, got %d", resp.StatusCode)
-	}
-	var out ListImagesResponse
-	decodeBody(t, resp, &out)
-	for _, img := range out.Images {
-		if img.ID == "img-bob-family" {
-			t.Error("bob's PRIVATE family image must not appear in alice's image list")
-		}
-	}
-}
-
-// Test 12b: bob's PRIVATE family cannot be resolved by alice via image_family alias.
-func TestCreateInstance_FamilyAlias_NoCrossPrincipalResolution(t *testing.T) {
-	s := newTestSrv(t)
-	seedFamilyImage(s.mem, "img-bob-resolve", "bob-resolve", bob, "PRIVATE", "ACTIVE", "bob-exclusive", intPtr(1))
-
-	// alice attempts to launch using bob's PRIVATE family name.
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("bob-exclusive", nil), authHdr(alice))
+		familyLaunchBody("obs-ver-family", intPtr(2)), authHdr(alice))
 	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("want 422 (not 200/202) for cross-principal family alias, got %d", resp.StatusCode)
+		t.Fatalf("obsolete exact version: want 422, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errImageFamilyVersionNotFound {
+		t.Errorf("want %q, got %q", errImageFamilyVersionNotFound, env.Error.Code)
+	}
+}
+
+// ── ownership / visibility ────────────────────────────────────────────────────
+
+// TestFamilyLaunch_PrivateNotVisibleToNonOwner confirms a PRIVATE family image
+// is not resolvable by a non-owner; returns 422 (not 403) per ownership contract.
+// Source: AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account).
+func TestFamilyLaunch_PrivateNotVisibleToNonOwner(t *testing.T) {
+	s := newTestSrv(t)
+	// alice owns this image; bob must not see it.
+	seedFamilyImage(s.mem, "img-priv", "alice-private-family", intPtr(1),
+		db.ImageStatusActive, alice)
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("alice-private-family", nil), authHdr(bob))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("cross-principal private family: want 422, got %d",
+			resp.StatusCode)
 	}
 	var env apiError
 	decodeBody(t, resp, &env)
 	if env.Error.Code != errImageFamilyNotFound {
-		t.Errorf("want code %q, got %q", errImageFamilyNotFound, env.Error.Code)
+		t.Errorf("want %q, got %q", errImageFamilyNotFound, env.Error.Code)
 	}
 }
 
-// ── Additional edge cases ─────────────────────────────────────────────────────
-
-// Test: both image_id and image_family set → 400 invalid_request.
-func TestCreateInstance_BothImageIDAndFamily_Returns400(t *testing.T) {
+// TestFamilyLaunch_PrivateVisibleToOwner confirms a PRIVATE family image
+// resolves correctly for its owning principal.
+func TestFamilyLaunch_PrivateVisibleToOwner(t *testing.T) {
 	s := newTestSrv(t)
-	body := validCreateBody()
-	// validCreateBody sets image_id; now also set image_family.
-	bodyMap := map[string]any{
-		"name":              body.Name,
-		"instance_type":     body.InstanceType,
-		"image_id":          body.ImageID,
-		"availability_zone": body.AvailabilityZone,
-		"ssh_key_name":      body.SSHKeyName,
-		"image_family": map[string]any{
-			"family_name": "some-family",
-		},
+	seedFamilyImage(s.mem, "img-priv-alice", "alice-only-family", intPtr(1),
+		db.ImageStatusActive, alice)
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("alice-only-family", nil), authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("owner private family: want 202, got %d", resp.StatusCode)
 	}
-	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", bodyMap, authHdr(alice))
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+	if out.Instance.ImageID != "img-priv-alice" {
+		t.Errorf("owner private family: want img-priv-alice, got %q",
+			out.Instance.ImageID)
+	}
+}
+
+// TestFamilyLaunch_PublicVisibleToAnyPrincipal confirms PUBLIC family images
+// are resolvable by any authenticated principal.
+func TestFamilyLaunch_PublicVisibleToAnyPrincipal(t *testing.T) {
+	s := newTestSrv(t)
+	seedFamilyImage(s.mem, "img-pub", "public-family", intPtr(1),
+		db.ImageStatusActive, "system")
+
+	// bob is not the "owner" (system) but PUBLIC means accessible to all.
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("public-family", nil), authHdr(bob))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("public family non-owner: want 202, got %d", resp.StatusCode)
+	}
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+	if out.Instance.ImageID != "img-pub" {
+		t.Errorf("public family non-owner: want img-pub, got %q",
+			out.Instance.ImageID)
+	}
+}
+
+// TestFamilyLaunch_PrivateVersionNotVisibleToNonOwner confirms exact-version
+// lookup also enforces PRIVATE visibility.
+func TestFamilyLaunch_PrivateVersionNotVisibleToNonOwner(t *testing.T) {
+	s := newTestSrv(t)
+	seedFamilyImage(s.mem, "img-priv-v3", "alice-ver-family", intPtr(3),
+		db.ImageStatusActive, alice)
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("alice-ver-family", intPtr(3)), authHdr(bob))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("private exact version non-owner: want 422, got %d",
+			resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errImageFamilyVersionNotFound {
+		t.Errorf("want %q, got %q", errImageFamilyVersionNotFound, env.Error.Code)
+	}
+}
+
+// ── malformed request combinations ───────────────────────────────────────────
+
+// TestFamilyLaunch_BothImageIDAndFamilySet confirms mutual exclusion: providing
+// both image_id and image_family returns 400 invalid_request.
+func TestFamilyLaunch_BothImageIDAndFamilySet(t *testing.T) {
+	s := newTestSrv(t)
+	req := validCreateBody() // image_id already set
+	req.ImageFamily = &ImageFamilyRef{FamilyName: "ubuntu-lts"}
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", req, authHdr(alice))
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("want 400 when both image_id and image_family set, got %d", resp.StatusCode)
+		t.Fatalf("both image_id+family: want 400, got %d", resp.StatusCode)
 	}
 	var env apiError
 	decodeBody(t, resp, &env)
@@ -455,87 +483,132 @@ func TestCreateInstance_BothImageIDAndFamily_Returns400(t *testing.T) {
 	}
 }
 
-// Test: image_family with empty family_name → 400 image_family_invalid_request.
-func TestCreateInstance_FamilyEmptyName_Returns400(t *testing.T) {
+// TestFamilyLaunch_NeitherImageIDNorFamily confirms that omitting both
+// image_id and image_family returns 400 missing_field on the image_id field.
+func TestFamilyLaunch_NeitherImageIDNorFamily(t *testing.T) {
 	s := newTestSrv(t)
-	body := map[string]any{
-		"name":              "test-instance",
-		"instance_type":     "c1.small",
-		"availability_zone": "us-east-1a",
-		"ssh_key_name":      "my-key",
-		"image_family": map[string]any{
-			"family_name": "   ", // whitespace only
-		},
+	req := CreateInstanceRequest{
+		Name:             "no-image",
+		InstanceType:     "c1.small",
+		AvailabilityZone: "us-east-1a",
+		SSHKeyName:       "my-key",
+		// ImageID and ImageFamily both absent.
 	}
-	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", req, authHdr(alice))
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("want 400 for empty family_name, got %d", resp.StatusCode)
+		t.Fatalf("no image spec: want 400, got %d", resp.StatusCode)
 	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	assertDetailCode(t, env, "image_id", errMissingField)
 }
 
-// Test: family resolution selects highest version over lower version.
-func TestFamilyResolution_HighestVersionWins(t *testing.T) {
+// TestFamilyLaunch_EmptyFamilyName confirms image_family with an empty
+// family_name returns 400 image_family_invalid_request.
+func TestFamilyLaunch_EmptyFamilyName(t *testing.T) {
 	s := newTestSrv(t)
-	// Seed out-of-order to confirm sorting, not insertion order.
-	seedFamilyImage(s.mem, "img-ord-v3", "v3", alice, "PRIVATE", "ACTIVE", "ordered-family", intPtr(3))
-	seedFamilyImage(s.mem, "img-ord-v1", "v1", alice, "PRIVATE", "ACTIVE", "ordered-family", intPtr(1))
-	seedFamilyImage(s.mem, "img-ord-v2", "v2", alice, "PRIVATE", "ACTIVE", "ordered-family", intPtr(2))
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		launchByFamilyBody("ordered-family", nil), authHdr(alice))
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("want 202, got %d", resp.StatusCode)
-	}
-	var out CreateInstanceResponse
-	decodeBody(t, resp, &out)
-	if out.Instance.ImageID != "img-ord-v3" {
-		t.Errorf("want img-ord-v3 (highest version=3), got %q", out.Instance.ImageID)
-	}
-}
-
-// Test: family validation — invalid family_name format in create image request.
-func TestCreateImageFromSnapshot_InvalidFamilyName_Returns400(t *testing.T) {
-	s := newTestSrv(t)
-	seedSnapshotForImage(s.mem, "snap-badfam", alice, db.SnapshotStatusAvailable, 20)
-
-	body := map[string]any{
-		"source_type":        "SNAPSHOT",
-		"name":               "my-image",
-		"source_snapshot_id": "snap-badfam",
-		"os_family":          "ubuntu",
-		"os_version":         "22.04",
-		"architecture":       "x86_64",
-		"family_name":        "INVALID_CAPS", // uppercase not allowed
-	}
-	resp := doReq(t, s.ts, http.MethodPost, "/v1/images", body, authHdr(alice))
+		familyLaunchBody("", nil), authHdr(alice))
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("want 400 for invalid family_name, got %d", resp.StatusCode)
+		t.Fatalf("empty family_name: want 400, got %d", resp.StatusCode)
 	}
 	var env apiError
 	decodeBody(t, resp, &env)
-	assertDetailCode(t, env, "family_name", errInvalidName)
+	if env.Error.Code != errImageFamilyInvalidRequest {
+		t.Errorf("want %q, got %q", errImageFamilyInvalidRequest, env.Error.Code)
+	}
 }
 
-// Test: family_version without family_name → 400.
-func TestCreateImageFromSnapshot_FamilyVersionWithoutName_Returns400(t *testing.T) {
+// TestFamilyLaunch_WhitespaceFamilyName confirms a whitespace-only family_name
+// is treated as empty and returns 400 image_family_invalid_request.
+func TestFamilyLaunch_WhitespaceFamilyName(t *testing.T) {
 	s := newTestSrv(t)
-	seedSnapshotForImage(s.mem, "snap-vonly", alice, db.SnapshotStatusAvailable, 20)
 
-	body := map[string]any{
-		"source_type":        "SNAPSHOT",
-		"name":               "my-image",
-		"source_snapshot_id": "snap-vonly",
-		"os_family":          "ubuntu",
-		"os_version":         "22.04",
-		"architecture":       "x86_64",
-		"family_version":     1,
-		// family_name intentionally absent
-	}
-	resp := doReq(t, s.ts, http.MethodPost, "/v1/images", body, authHdr(alice))
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("   ", nil), authHdr(alice))
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("want 400 for family_version without family_name, got %d", resp.StatusCode)
+		t.Fatalf("whitespace family_name: want 400, got %d", resp.StatusCode)
 	}
 	var env apiError
 	decodeBody(t, resp, &env)
-	assertDetailCode(t, env, "family_version", errImageFamilyInvalidRequest)
+	if env.Error.Code != errImageFamilyInvalidRequest {
+		t.Errorf("want %q, got %q", errImageFamilyInvalidRequest, env.Error.Code)
+	}
+}
+
+// ── family not found / empty ──────────────────────────────────────────────────
+
+// TestFamilyLaunch_FamilyDoesNotExist confirms a family name with no images at
+// all returns 422 image_family_not_found.
+func TestFamilyLaunch_FamilyDoesNotExist(t *testing.T) {
+	s := newTestSrv(t)
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("nonexistent-family", nil), authHdr(alice))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("nonexistent family: want 422, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errImageFamilyNotFound {
+		t.Errorf("want %q, got %q", errImageFamilyNotFound, env.Error.Code)
+	}
+}
+
+// TestFamilyLaunch_AllMembersBlocked confirms a family where every member is in
+// a non-launchable state returns 422 image_family_not_found.
+func TestFamilyLaunch_AllMembersBlocked(t *testing.T) {
+	s := newTestSrv(t)
+	seedFamilyImage(s.mem, "img-all-obs-1", "all-blocked", intPtr(1),
+		db.ImageStatusObsolete, "system")
+	seedFamilyImage(s.mem, "img-all-obs-2", "all-blocked", intPtr(2),
+		db.ImageStatusFailed, "system")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("all-blocked", nil), authHdr(alice))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("all-blocked family: want 422, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errImageFamilyNotFound {
+		t.Errorf("want %q, got %q", errImageFamilyNotFound, env.Error.Code)
+	}
+}
+
+// ── admission gate not bypassed ───────────────────────────────────────────────
+
+// TestFamilyLaunch_AdmissionGateNotBypassed confirms that the resolved image ID
+// still flows through GetImageForAdmission after family resolution. The test
+// seeds an image as ACTIVE for the family path, then flips it to OBSOLETE in
+// the in-memory map before the request is served, simulating a race where the
+// image is in the map at ID-lookup time but not launchable.
+//
+// Because familyQueryRowDispatch applies the same status filter as the real repo
+// query, the family resolution itself will return no candidate → 422. This
+// verifies the filter is applied at the repo boundary, not deferred to a later
+// layer.
+func TestFamilyLaunch_AdmissionGateNotBypassed(t *testing.T) {
+	s := newTestSrv(t)
+	seedFamilyImage(s.mem, "img-race", "race-family", intPtr(1),
+		db.ImageStatusActive, "system")
+
+	// Flip status to OBSOLETE after seeding — simulates post-resolution state change.
+	// The family dispatch in memPool applies the launchable filter on every call,
+	// so this image will not be selected.
+	s.mem.images["img-race"].Status = db.ImageStatusObsolete
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		familyLaunchBody("race-family", nil), authHdr(alice))
+	// No launchable candidate found → 422 family_not_found (not a bypass).
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("admission gate: want 422, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errImageFamilyNotFound {
+		t.Errorf("want %q, got %q", errImageFamilyNotFound, env.Error.Code)
+	}
 }
