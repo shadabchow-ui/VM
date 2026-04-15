@@ -238,6 +238,33 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 		}
 		return &fakeTag{1}, nil
 
+	case strings.Contains(sql, "UPDATE images"):
+		id := args[0].(string)
+		img, ok := p.images[id]
+		if !ok {
+			return &fakeTag{0}, nil
+		}
+		img.Status = args[1].(string)
+		if len(args) > 2 {
+			if args[2] == nil {
+				img.DeprecatedAt = nil
+			} else {
+				v := args[2].(*time.Time)
+				img.DeprecatedAt = v
+			}
+		}
+		if len(args) > 3 {
+			if args[3] == nil {
+				img.ObsoletedAt = nil
+			} else {
+				v := args[3].(*time.Time)
+				img.ObsoletedAt = v
+			}
+		}
+		now := time.Now()
+		img.UpdatedAt = now
+		return &fakeTag{1}, nil
+
 	case strings.Contains(sql, "INSERT INTO jobs"):
 		// Dispatch: volume jobs and snapshot jobs use different column orders.
 		// InsertVolumeJob SQL contains "volume_id" (without "snapshot_id").
@@ -898,6 +925,9 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 	// Used by GetImageForAdmission (called from handleCreateInstance admission check
 	// and handleGetImage). Visibility filtering is done in Go, not SQL.
 	// Source: image_repo.go GetImageByID.
+	case strings.Contains(sql, "FROM images") && strings.Contains(sql, "family_name = $1"):
+		return p.familyQueryRowDispatch(sql, args)
+
 	case strings.Contains(sql, "FROM images") && strings.Contains(sql, "id = $1"):
 		id := asStr(args[0])
 		img, ok := p.images[id]
@@ -948,30 +978,32 @@ func (row *instRow) Scan(dest ...any) error {
 // jobRow scans a single JobRow.
 // VM-P2B: updated to 13 columns — volume_id inserted at position 2.
 // VM-P2B-S2: updated to 14 columns — snapshot_id inserted at position 3.
+// VM-P2C-P2: updated to 15 columns — image_id inserted at position 4.
 // Column order must match job_repo.go SELECT: id, instance_id, volume_id, snapshot_id,
-// job_type, status, idempotency_key, attempt_count, max_attempts, error_message,
-// created_at, updated_at, claimed_at, completed_at.
+// image_id, job_type, status, idempotency_key, attempt_count, max_attempts,
+// error_message, created_at, updated_at, claimed_at, completed_at.
 type jobRow struct{ r *db.JobRow }
 
 func (row *jobRow) Scan(dest ...any) error {
 	r := row.r
-	if len(dest) < 14 {
-		return fmt.Errorf("jobRow.Scan: need 14 dest, got %d", len(dest))
+	if len(dest) < 15 {
+		return fmt.Errorf("jobRow.Scan: need 15 dest, got %d", len(dest))
 	}
 	*dest[0].(*string) = r.ID
 	*dest[1].(*string) = r.InstanceID
 	*dest[2].(**string) = r.VolumeID
 	*dest[3].(**string) = r.SnapshotID
-	*dest[4].(*string) = r.JobType
-	*dest[5].(*string) = r.Status
-	*dest[6].(*string) = r.IdempotencyKey
-	*dest[7].(*int) = r.AttemptCount
-	*dest[8].(*int) = r.MaxAttempts
-	*dest[9].(**string) = r.ErrorMessage
-	*dest[10].(*time.Time) = r.CreatedAt
-	*dest[11].(*time.Time) = r.UpdatedAt
-	*dest[12].(**time.Time) = r.ClaimedAt
-	*dest[13].(**time.Time) = r.CompletedAt
+	*dest[4].(**string) = r.ImageID
+	*dest[5].(*string) = r.JobType
+	*dest[6].(*string) = r.Status
+	*dest[7].(*string) = r.IdempotencyKey
+	*dest[8].(*int) = r.AttemptCount
+	*dest[9].(*int) = r.MaxAttempts
+	*dest[10].(**string) = r.ErrorMessage
+	*dest[11].(*time.Time) = r.CreatedAt
+	*dest[12].(*time.Time) = r.UpdatedAt
+	*dest[13].(**time.Time) = r.ClaimedAt
+	*dest[14].(**time.Time) = r.CompletedAt
 	return nil
 }
 

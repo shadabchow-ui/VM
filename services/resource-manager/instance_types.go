@@ -30,6 +30,8 @@ type InstanceResponse struct {
 	Status           string                       `json:"status"`
 	InstanceType     string                       `json:"instance_type"`
 	ImageID          string                       `json:"image_id"`
+	ImageFamily  string  `json:"image_family,omitempty"`
+	ImageVersion *string `json:"image_version,omitempty"`
 	AvailabilityZone string                       `json:"availability_zone"`
 	Region           string                       `json:"region"`
 	Labels           map[string]string             `json:"labels"`
@@ -62,13 +64,14 @@ type BlockDeviceMapping struct {
 // Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, 08-02 §validation,
 //         execution_blueprint §7.7.
 type CreateInstanceRequest struct {
-	Name             string              `json:"name"`
-	InstanceType     string              `json:"instance_type"`
-	ImageID          string              `json:"image_id"`
-	AvailabilityZone string              `json:"availability_zone"`
-	SSHKeyName       string              `json:"ssh_key_name"`
-	Labels           map[string]string   `json:"labels"`
-	Networking       *NetworkingConfig   `json:"networking,omitempty"`
+	Name             string               `json:"name"`
+	InstanceType     string               `json:"instance_type"`
+	ImageID          string               `json:"image_id,omitempty"`
+	ImageFamily      *ImageFamilyRef      `json:"image_family,omitempty"`
+	AvailabilityZone string               `json:"availability_zone"`
+	SSHKeyName       string               `json:"ssh_key_name"`
+	Labels           map[string]string    `json:"labels"`
+	Networking       *NetworkingConfig    `json:"networking,omitempty"`
 	BlockDevices     []BlockDeviceMapping `json:"block_devices,omitempty"`
 }
 

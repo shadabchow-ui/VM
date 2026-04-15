@@ -25,6 +25,12 @@ package main
 //         OBSOLETE, FAILED, and PENDING_VALIDATION images return 422.
 //         Source: vm-13-01__blueprint__ §core_contracts "Image Lifecycle State Enforcement",
 //                 P2_IMAGE_SNAPSHOT_MODEL.md §3.8.
+// VM-P2C-P3: Family alias resolution in handleCreateInstance.
+//         When req.ImageFamily is set (and req.ImageID is empty), the handler
+//         resolves the family alias to a concrete image ID before running the
+//         existing admission checks. Resolution is ownership-safe and
+//         lifecycle-safe. Direct image_id launch is unchanged.
+//         Source: vm-13-01__blueprint__ §family_seam.
 //
 // Control-plane rule: lifecycle handlers enqueue a job via InsertJob.
 // They never call runtime directly. Workers drive all state transitions.
@@ -186,6 +192,14 @@ func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
 //   - block_devices[0].delete_on_termination is available for downstream use
 //     by the worker (stored via the root_disks table).
 //
+// VM-P2C-P3: Family alias resolution.
+//   - When req.ImageFamily is non-nil, resolve the family alias to a concrete
+//     image ID before field validation. req.ImageID is set to the resolved ID.
+//   - Direct image_id launch is unchanged (ImageFamily == nil path).
+//   - Resolution is ownership-safe (PRIVATE families resolve only for owner).
+//   - Resolution is lifecycle-safe (OBSOLETE/FAILED/PENDING_VALIDATION excluded).
+//   - Source: vm-13-01__blueprint__ §family_seam.
+//
 // Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, JOB_MODEL_V1 §6,
 //
 //	execution_blueprint §7.7, P2_VOLUME_MODEL §1.
@@ -225,6 +239,80 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// VM-P2C-P3: Family alias resolution.
+	//
+	// When image_family is set, resolve to a concrete image ID before validation
+	// and admission. This must run before block_devices synthesis (which uses
+	// req.ImageID) and before validateCreateRequest (which checks image_id presence).
+	//
+	// Mutual exclusion: exactly one of image_id / image_family must be set.
+	// This is enforced here so the remainder of the handler can treat req.ImageID
+	// as canonical regardless of which path was used.
+	//
+	// Source: vm-13-01__blueprint__ §family_seam,
+	//         AUTH_OWNERSHIP_MODEL_V1.md §3 (ownership-safe resolution).
+	if req.ImageFamily != nil {
+		// image_id and image_family are mutually exclusive.
+		if strings.TrimSpace(req.ImageID) != "" {
+			writeAPIError(w, http.StatusBadRequest, errInvalidRequest,
+				"Specify either 'image_id' or 'image_family', not both.", "image_family")
+			return
+		}
+
+		familyName := strings.TrimSpace(req.ImageFamily.FamilyName)
+		if familyName == "" {
+			writeAPIError(w, http.StatusBadRequest, errImageFamilyInvalidRequest,
+				"image_family.family_name must not be empty.", "image_family.family_name")
+			return
+		}
+
+		var resolved *db.ImageRow
+		var resolveErr error
+
+		if req.ImageFamily.FamilyVersion != nil {
+			// Exact version requested.
+			resolved, resolveErr = s.repo.ResolveFamilyByVersion(
+				r.Context(), familyName, *req.ImageFamily.FamilyVersion, principal)
+			if resolveErr != nil {
+				s.log.Error("ResolveFamilyByVersion failed",
+					"family_name", familyName,
+					"family_version", *req.ImageFamily.FamilyVersion,
+					"error", resolveErr)
+				writeDBError(w, resolveErr)
+				return
+			}
+			if resolved == nil {
+				// No visible, launchable image at that exact version.
+				writeAPIError(w, http.StatusUnprocessableEntity, errImageFamilyVersionNotFound,
+					"Family '"+familyName+"' version "+fmt.Sprintf("%d", *req.ImageFamily.FamilyVersion)+" does not exist or has no launchable image accessible to this account.", "image_family.family_version")
+				return
+			}
+		} else {
+			// Latest launchable image in family.
+			resolved, resolveErr = s.repo.ResolveFamilyLatest(r.Context(), familyName, principal)
+			if resolveErr != nil {
+				s.log.Error("ResolveFamilyLatest failed",
+					"family_name", familyName, "error", resolveErr)
+				writeDBError(w, resolveErr)
+				return
+			}
+			if resolved == nil {
+				// Family not found OR family exists but all images are blocked.
+				// We cannot distinguish the two without an extra query, and the
+				// contract (ownership-hiding) says we must not reveal whether a
+				// PRIVATE family exists to non-owners. Return the same 422 for both.
+				writeAPIError(w, http.StatusUnprocessableEntity, errImageFamilyNotFound,
+					"Family '"+familyName+"' does not exist or has no launchable image accessible to this account.", "image_family.family_name")
+				return
+			}
+		}
+
+		// Stamp the resolved image ID into req so the rest of the handler
+		// (block_devices synthesis, validateCreateRequest, GetImageForAdmission)
+		// can treat req.ImageID as canonical.
+		req.ImageID = resolved.ID
+	}
+
 	// M10 Slice 4: synthesize default block_devices when omitted.
 	// This preserves backward compatibility: existing clients that do not send
 	// block_devices get the same behavior as before.
@@ -254,6 +342,10 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	//
 	// Must run after field validation (so image_id is non-empty) and before
 	// InsertInstance (so we never write a DB row for an unusable image).
+	//
+	// When the family alias path was taken above, req.ImageID is already the
+	// resolved concrete ID — GetImageForAdmission runs the same ownership and
+	// lifecycle checks as for a directly specified image_id. No bypass.
 	//
 	// GetImageForAdmission returns nil when:
 	//   - The image does not exist.

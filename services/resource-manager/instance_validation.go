@@ -23,6 +23,15 @@ package main
 //   Source: vm-13-01__blueprint__ §core_contracts "Image Lifecycle State Enforcement",
 //           P2_IMAGE_SNAPSHOT_MODEL.md §3.8, API_ERROR_CONTRACT_V1 §6.
 //
+// VM-P2C-P3: image_id / image_family mutual exclusion.
+//   When image_family is set and image_id is empty, the image_id missing_field
+//   error is suppressed — the handler will resolve image_id from the family alias
+//   before validateCreateRequest is called (it sets req.ImageID from the resolved
+//   image). After resolution req.ImageID is non-empty, so validation passes normally.
+//   No separate image_family format validation is done here; that is done in the
+//   handler before resolution (family_name empty check + repo call).
+//   Source: vm-13-01__blueprint__ §family_seam.
+//
 // Source: 08-02-validation-rules-and-error-contracts.md,
 //         INSTANCE_MODEL_V1 §2 (field constraints), §6 (shape catalog),
 //         API_ERROR_CONTRACT_V1 §4 (invalid_block_device_mapping, delete_on_termination_required),
@@ -78,6 +87,11 @@ var nameRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,61}[a-z0-9]$`)
 // and matches how subnet_id, security_group_ids, and other resource references
 // are validated: field format first, then DB lookup in the handler.
 //
+// VM-P2C-P3: When the handler resolves a family alias it sets req.ImageID to the
+// resolved image ID before calling this function. So by the time this runs,
+// req.ImageID is always set regardless of whether image_id or image_family was
+// used in the original request. No special-casing needed here.
+//
 // Source: API_ERROR_CONTRACT_V1 §6 (validation execution order: schema → resource existence).
 func validateCreateRequest(req *CreateInstanceRequest) []fieldErr {
 	var errs []fieldErr
@@ -99,11 +113,16 @@ func validateCreateRequest(req *CreateInstanceRequest) []fieldErr {
 	}
 
 	// image_id — presence check only.
+	// By the time this function runs, the handler has already resolved any
+	// image_family alias into req.ImageID. So this check catches the case where
+	// neither image_id nor image_family was provided in the request.
 	// Existence, visibility, and lifecycle state are checked via DB in handleCreateInstance
 	// using repo.GetImageForAdmission + db.ImageIsLaunchable after field validation passes.
-	// Source: vm-13-01__blueprint__ §core_contracts, P2_IMAGE_SNAPSHOT_MODEL.md §3.8.
+	// Source: vm-13-01__blueprint__ §core_contracts, P2_IMAGE_SNAPSHOT_MODEL.md §3.8,
+	//         vm-13-01__blueprint__ §family_seam (VM-P2C-P3).
 	if strings.TrimSpace(req.ImageID) == "" {
-		errs = append(errs, fieldErr{errMissingField, "The field 'image_id' is required.", "image_id"})
+		errs = append(errs, fieldErr{errMissingField,
+			"The field 'image_id' is required (or provide 'image_family' for alias resolution).", "image_id"})
 	}
 
 	// availability_zone
