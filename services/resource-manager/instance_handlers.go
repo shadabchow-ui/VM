@@ -39,6 +39,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -370,6 +371,44 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	if !db.ImageIsLaunchable(img.Status) {
 		writeAPIError(w, http.StatusUnprocessableEntity, errImageNotLaunchable,
 			"Image '"+req.ImageID+"' is not available for launch (status: "+img.Status+").", "image_id")
+		return
+	}
+
+	// VM-P2D Slice 3: Project-aware quota/admission check.
+	//
+	// Runs after image admission (image validity confirmed) and before InsertInstance
+	// (quota is not charged for requests that fail field or image validation).
+	//
+	// Scope resolution:
+	//   - Classic/no-project mode (Phase 1): principal == ownerPrincipalID.
+	//     CheckAndDecrementQuota counts instances owned by this principal_id.
+	//   - Project-aware mode (Phase 2+): principal is the project's principal_id.
+	//     Same call — owner_principal_id is the single scope anchor in Phase 1.
+	//   No parallel scope model is introduced. The existing ownership model drives both.
+	//
+	// Error separation (vm-13-02__blueprint__ §core_contracts "Error Code Separation"):
+	//   - db.ErrQuotaExceeded   → 422 quota_exceeded  (client-correctable)
+	//   - scheduler.ErrNoCapacity → 503 insufficient_capacity (stays in scheduler path)
+	//   These are distinct and must never be collapsed.
+	//
+	// Transactional correctness: if InsertInstance or networking steps subsequently
+	// fail, the instance row is either never written or removed (soft-delete), so the
+	// active-instance count reverts automatically. No explicit Refund call is needed
+	// for the Phase 1 count-based model.
+	//
+	// Source: vm-13-02__blueprint__ §mvp, §core_contracts "Transactional Quota Integrity",
+	//         vm-13-02__blueprint__ §core_contracts "Error Code Separation",
+	//         vm-16-01__blueprint__ §quota_enforcement_point.
+	if err := s.repo.CheckAndDecrementQuota(r.Context(), principal); err != nil {
+		if errors.Is(err, db.ErrQuotaExceeded) {
+			writeAPIError(w, http.StatusUnprocessableEntity, errQuotaExceeded,
+				"Instance quota exceeded for this account or project. "+
+					"Delete existing instances or request a quota increase.",
+				"instance_type")
+			return
+		}
+		s.log.Error("CheckAndDecrementQuota failed", "principal", principal, "error", err)
+		writeDBError(w, err)
 		return
 	}
 

@@ -92,6 +92,9 @@ type memPool struct {
 	volumeAttachments   map[string]*db.VolumeAttachmentRow // VM-P2B; keyed by attachment ID
 	snapshots           map[string]*db.SnapshotRow         // VM-P2B-S2
 	images              map[string]*db.ImageRow            // VM-P2C-P1
+	// VM-P2D Slice 3: quota maps.
+	// quotas: scopeID → max_instances override. nil entry = use db.DefaultMaxInstances.
+	quotas map[string]int // VM-P2D-S3
 }
 
 func newMemPool() *memPool {
@@ -113,6 +116,7 @@ func newMemPool() *memPool {
 		volumeAttachments:   make(map[string]*db.VolumeAttachmentRow),
 		snapshots:           make(map[string]*db.SnapshotRow), // VM-P2B-S2
 		images:              make(map[string]*db.ImageRow),    // VM-P2C-P1
+		quotas:              make(map[string]int),             // VM-P2D-S3
 	}
 }
 
@@ -217,6 +221,13 @@ func (p *memPool) seedNetworkInterface(row *db.NetworkInterfaceRow) {
 		row.Status = "attached"
 	}
 	p.networkInterfaces[row.ID] = row
+}
+
+// seedQuota sets a max_instances override for scopeID.
+// When not seeded the memPool returns db.DefaultMaxInstances (10).
+// VM-P2D Slice 3.
+func (p *memPool) seedQuota(scopeID string, maxInstances int) {
+	p.quotas[scopeID] = maxInstances
 }
 
 // Exec handles INSERT INTO instances, INSERT INTO jobs, and networking tables.
@@ -697,8 +708,8 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 //   - VM-P2B: GetVolumeByID, GetActiveAttachmentByVolume, CountActiveAttachmentsByInstance
 func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 	switch {
-	// GetInstanceByID
-	case strings.Contains(sql, "FROM instances") && strings.Contains(sql, "id = $1"):
+	// GetInstanceByID — guard against SELECT COUNT(*) queries which also contain "id = $1"
+	case strings.Contains(sql, "FROM instances") && strings.Contains(sql, "id = $1") && !strings.Contains(sql, "SELECT COUNT(*)"):
 		id := asStr(args[0])
 		r, ok := p.instances[id]
 		if !ok || r.DeletedAt != nil {
@@ -925,6 +936,28 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 	// Used by GetImageForAdmission (called from handleCreateInstance admission check
 	// and handleGetImage). Visibility filtering is done in Go, not SQL.
 	// Source: image_repo.go GetImageByID.
+	// VM-P2D Slice 3: GetQuota — FROM project_quotas WHERE scope_id = $1
+	case strings.Contains(sql, "FROM project_quotas") && strings.Contains(sql, "scope_id = $1"):
+		scopeID := asStr(args[0])
+		if max, ok := p.quotas[scopeID]; ok {
+			return &quotaRow{scopeID: scopeID, maxInstances: max}
+		}
+		// No row → signal ErrNoRows so GetQuota returns the default.
+		return &errRow{fmt.Errorf("no rows in result set")}
+
+	// VM-P2D Slice 3: CountActiveInstancesByScope
+	// SELECT COUNT(*) FROM instances WHERE owner_principal_id = $1 ...
+	case strings.Contains(sql, "SELECT COUNT(*)") && strings.Contains(sql, "FROM instances") && strings.Contains(sql, "owner_principal_id = $1"):
+		scopeID := asStr(args[0])
+		count := 0
+		for _, inst := range p.instances {
+			if inst.OwnerPrincipalID == scopeID && inst.DeletedAt == nil &&
+				inst.VMState != "deleted" && inst.VMState != "failed" {
+				count++
+			}
+		}
+		return &intRow{value: count}
+
 	case strings.Contains(sql, "FROM images") && strings.Contains(sql, "family_name = $1"):
 		return p.familyQueryRowDispatch(sql, args)
 
@@ -1293,6 +1326,21 @@ func (r *rootDiskRows) Scan(dest ...any) error {
 
 func (r *rootDiskRows) Close()     {}
 func (r *rootDiskRows) Err() error { return nil }
+
+// VM-P2D Slice 3: quotaRow returns a single quota row for project_quotas queries.
+type quotaRow struct {
+	scopeID      string
+	maxInstances int
+}
+
+func (row *quotaRow) Scan(dest ...any) error {
+	if len(dest) < 2 {
+		return fmt.Errorf("quotaRow.Scan: need 2 dest, got %d", len(dest))
+	}
+	*dest[0].(*string) = row.scopeID
+	*dest[1].(*int) = row.maxInstances
+	return nil
+}
 
 // ── Test server ───────────────────────────────────────────────────────────────
 
@@ -2170,4 +2218,124 @@ func detailCodes(env apiError) []string {
 		out = append(out, fmt.Sprintf("%s:%s", d.Target, d.Code))
 	}
 	return out
+}
+
+// ── VM-P2D Slice 3: Quota admission tests ────────────────────────────────────
+
+// TestCreate_QuotaExceeded verifies that a create request is rejected with
+// 422 quota_exceeded when the scope has reached its instance limit.
+// Source: vm-13-02__blueprint__ §core_contracts "Error Code Separation".
+func TestCreate_QuotaExceeded(t *testing.T) {
+	s := newTestSrv(t)
+
+	// Seed max instances (default limit = 10) for alice.
+	for i := 0; i < 10; i++ {
+		seedInstance(s.mem, fmt.Sprintf("inst_quota_%d", i), fmt.Sprintf("quota-%d", i), alice, "running")
+	}
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), authHdr(alice))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422 quota_exceeded, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errQuotaExceeded {
+		t.Errorf("want code %q, got %q", errQuotaExceeded, env.Error.Code)
+	}
+}
+
+// TestCreate_QuotaWithinLimit verifies that a create succeeds when the scope
+// is at limit-1 (one slot remaining).
+func TestCreate_QuotaWithinLimit(t *testing.T) {
+	s := newTestSrv(t)
+
+	// Seed 9 instances — one slot remains under the default limit of 10.
+	for i := 0; i < 9; i++ {
+		seedInstance(s.mem, fmt.Sprintf("inst_q9_%d", i), fmt.Sprintf("q9-%d", i), alice, "running")
+	}
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202 when within quota, got %d", resp.StatusCode)
+	}
+}
+
+// TestCreate_QuotaExceeded_DistinctFromCapacityFailure verifies that the
+// quota_exceeded error code is distinct from any capacity/scheduler failure code.
+// This guards against the specific contract violation described in:
+// vm-13-02__blueprint__ §core_contracts "Error Code Separation".
+func TestCreate_QuotaExceeded_DistinctFromCapacityFailure(t *testing.T) {
+	s := newTestSrv(t)
+
+	// Exhaust alice's quota.
+	for i := 0; i < 10; i++ {
+		seedInstance(s.mem, fmt.Sprintf("inst_cap_%d", i), fmt.Sprintf("cap-%d", i), alice, "running")
+	}
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), authHdr(alice))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+
+	// quota_exceeded must not be confused with scheduler capacity codes.
+	if env.Error.Code == "insufficient_capacity" || env.Error.Code == "service_unavailable" {
+		t.Errorf("quota failure must not be coded as capacity failure, got %q", env.Error.Code)
+	}
+	if env.Error.Code != errQuotaExceeded {
+		t.Errorf("want %q, got %q", errQuotaExceeded, env.Error.Code)
+	}
+}
+
+// TestCreate_QuotaIsolation_CrossAccount verifies that quota exhaustion for one
+// principal does not affect a different principal. The 404-for-cross-account
+// behavior established in Slice 2 must still hold.
+func TestCreate_QuotaIsolation_CrossAccount(t *testing.T) {
+	s := newTestSrv(t)
+
+	// Exhaust bob's quota.
+	for i := 0; i < 10; i++ {
+		seedInstance(s.mem, fmt.Sprintf("inst_bob_q_%d", i), fmt.Sprintf("bob-q%d", i), bob, "running")
+	}
+
+	// Alice's quota is independent — her create must succeed.
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("alice's create must succeed when only bob's quota is exhausted, got %d", resp.StatusCode)
+	}
+
+	// Cross-account instance visibility: alice cannot see bob's instances.
+	for i := 0; i < 10; i++ {
+		instID := fmt.Sprintf("inst_bob_q_%d", i)
+		getResp := doReq(t, s.ts, http.MethodGet, "/v1/instances/"+instID, nil, authHdr(alice))
+		if getResp.StatusCode != http.StatusNotFound {
+			t.Errorf("want 404 for cross-account instance %s, got %d", instID, getResp.StatusCode)
+		}
+		getResp.Body.Close()
+	}
+}
+
+// TestCreate_CustomQuotaLimit verifies that a per-scope quota override is
+// respected when the operator seeds a lower limit.
+func TestCreate_CustomQuotaLimit(t *testing.T) {
+	s := newTestSrv(t)
+
+	// Operator sets alice's limit to 2.
+	s.mem.seedQuota(alice, 2)
+
+	// Seed 2 instances — at the limit.
+	seedInstance(s.mem, "inst_cq_0", "cq-0", alice, "running")
+	seedInstance(s.mem, "inst_cq_1", "cq-1", alice, "running")
+
+	// Third create must be rejected.
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), authHdr(alice))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422 at custom limit=2, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errQuotaExceeded {
+		t.Errorf("want %q, got %q", errQuotaExceeded, env.Error.Code)
+	}
 }

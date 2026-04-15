@@ -47,8 +47,15 @@ const (
 	errServiceUnavailable = "service_unavailable"
 	// M10 Slice 4: block device mapping error codes.
 	// Source: API_ERROR_CONTRACT_V1 §4 (invalid_block_device_mapping, delete_on_termination_required).
-	errInvalidBlockDeviceMapping    = "invalid_block_device_mapping"
-	errDeleteOnTerminationRequired  = "delete_on_termination_required"
+	errInvalidBlockDeviceMapping   = "invalid_block_device_mapping"
+	errDeleteOnTerminationRequired = "delete_on_termination_required"
+
+	// VM-P2D Slice 3: quota admission failure.
+	// Returned when the create request exceeds the project's or account's instance
+	// entitlement. Maps to HTTP 422 (client-correctable, not a platform capacity failure).
+	// Must NOT be confused with errServiceUnavailable (503) or scheduler capacity failure.
+	// Source: vm-13-02__blueprint__ §core_contracts "Error Code Separation".
+	errQuotaExceeded = "quota_exceeded"
 )
 
 // apiError is the structured error envelope sent in every error response.
@@ -167,7 +174,8 @@ func writeServiceUnavailable(w http.ResponseWriter) {
 //   - If err is nil, returns false.
 //
 // Source: P2_M1_WS_H1_DB_HA_RUNBOOK §6 Step 11 (gate item DB-6),
-//         P2_M1_INFRASTRUCTURE_HARDENING_PLAN §3.1.
+//
+//	P2_M1_INFRASTRUCTURE_HARDENING_PLAN §3.1.
 func isDBUnavailableError(err error) bool {
 	if err == nil {
 		return false
