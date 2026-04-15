@@ -461,13 +461,15 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 
 // handleListInstances handles GET /v1/instances.
 // Returns 200 + ListInstancesResponse scoped to the calling principal.
+// VM-P2D Slice 2: extended to include project-owned instances where caller
+// has any membership role (OWNER, EDITOR, VIEWER). Source: P2_PROJECT_RBAC_MODEL §4.2.
 // Source: 08-01 §ListInstances.
 func (s *server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFromCtx(r.Context())
 
-	rows, err := s.repo.ListInstancesByOwner(r.Context(), principal)
+	rows, err := s.repo.ListInstancesVisible(r.Context(), principal)
 	if err != nil {
-		s.log.Error("ListInstancesByOwner failed", "error", err)
+		s.log.Error("ListInstancesVisible failed", "error", err)
 		writeDBError(w, err)
 		return
 	}
@@ -570,7 +572,11 @@ func (s *server) handleLifecycleAction(
 		}
 	}
 
-	row, ok := s.loadOwnedInstance(w, r, principal, id)
+	// VM-P2D Slice 2: use loadWritableInstance (not loadOwnedInstance) for lifecycle
+	// actions so that project VIEWER members receive 403 instead of being allowed
+	// to enqueue jobs. Direct account owners retain full access (Phase 1 unchanged).
+	// Source: P2_PROJECT_RBAC_MODEL.md §4.2, §7.
+	row, ok := s.loadWritableInstance(w, r, principal, id)
 	if !ok {
 		return
 	}

@@ -74,6 +74,9 @@ import (
 //
 // VM-P2C-P1: extended for image queries:
 //   - Images (used by GetImageForAdmission + ListImagesByPrincipal)
+//
+// VM-P2D Slice 2: extended for RBAC membership queries:
+//   - projectMembers (project_members table fake)
 type memPool struct {
 	instances           map[string]*db.InstanceRow
 	jobs                map[string]*db.JobRow
@@ -92,6 +95,7 @@ type memPool struct {
 	volumeAttachments   map[string]*db.VolumeAttachmentRow // VM-P2B; keyed by attachment ID
 	snapshots           map[string]*db.SnapshotRow         // VM-P2B-S2
 	images              map[string]*db.ImageRow            // VM-P2C-P1
+	projectMembers      map[string]*membershipEntry        // VM-P2D Slice 2; key: "projectID:accountID"
 }
 
 func newMemPool() *memPool {
@@ -113,7 +117,25 @@ func newMemPool() *memPool {
 		volumeAttachments:   make(map[string]*db.VolumeAttachmentRow),
 		snapshots:           make(map[string]*db.SnapshotRow), // VM-P2B-S2
 		images:              make(map[string]*db.ImageRow),    // VM-P2C-P1
+		projectMembers:      make(map[string]*membershipEntry), // VM-P2D Slice 2
 	}
+}
+
+// ── VM-P2D Slice 2: membership types ─────────────────────────────────────────
+
+// membershipEntry is the memPool in-memory representation of a project_members row.
+// Keyed in memPool.projectMembers by membershipKey(projectID, accountPrincipalID).
+type membershipEntry struct {
+	id                 string
+	projectID          string
+	accountPrincipalID string
+	role               string     // "OWNER" | "EDITOR" | "VIEWER"
+	removedAt          *time.Time // nil = active
+}
+
+// membershipKey builds the map key used in memPool.projectMembers.
+func membershipKey(projectID, accountPrincipalID string) string {
+	return projectID + ":" + accountPrincipalID
 }
 
 // seed adds an instance directly.
@@ -438,6 +460,25 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 		}
 		return &fakeTag{0}, nil
 
+	// VM-P2D Slice 2: AddProjectMember
+	case strings.Contains(sql, "INSERT INTO project_members"):
+		// $1=id, $2=project_id, $3=account_principal_id, $4=role, $5=invited_by
+		id := asStr(args[0])
+		projID := asStr(args[1])
+		accountID := asStr(args[2])
+		role := asStr(args[3])
+		key := membershipKey(projID, accountID)
+		if _, exists := p.projectMembers[key]; exists {
+			return &fakeTag{0}, fmt.Errorf("unique constraint idx_project_members_unique")
+		}
+		p.projectMembers[key] = &membershipEntry{
+			id:                 id,
+			projectID:          projID,
+			accountPrincipalID: accountID,
+			role:               role,
+		}
+		return &fakeTag{1}, nil
+
 	// M10 Slice 2: Root disk operations
 	case strings.Contains(sql, "INSERT INTO root_disks"):
 		// $1=disk_id, $2=instance_id, $3=source_image_id, $4=storage_pool_id,
@@ -574,7 +615,11 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 // Query handles ListInstancesByOwner and networking list queries.
 func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, error) {
 	switch {
-	case strings.Contains(sql, "FROM instances") && strings.Contains(sql, "owner_principal_id"):
+	// ListInstancesByOwner: WHERE owner_principal_id = $1 (single owner, Phase 1 path).
+	// Must NOT match ListInstancesVisible which uses owner_principal_id = ANY($1::text[]).
+	case strings.Contains(sql, "FROM instances") &&
+		strings.Contains(sql, "owner_principal_id") &&
+		!strings.Contains(sql, "ANY("):
 		ownerID := asStr(args[0])
 		var out []*db.InstanceRow
 		for _, r := range p.instances {
@@ -599,6 +644,41 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 			}
 		}
 		return &projRows{rows: out}, nil
+
+	// VM-P2D Slice 2: ListInstancesVisible — step 1: project principal_ids.
+	// Matches: SELECT p.principal_id FROM project_members pm JOIN projects p ...
+	// WHERE pm.account_principal_id = $1
+	case strings.Contains(sql, "project_members") && strings.Contains(sql, "principal_id"):
+		accountID := asStr(args[0])
+		var pids []string
+		for _, m := range p.projectMembers {
+			if m.accountPrincipalID == accountID && m.removedAt == nil {
+				// Resolve project's principal_id.
+				for _, proj := range p.projects {
+					if proj.ID == m.projectID && proj.DeletedAt == nil {
+						pids = append(pids, proj.PrincipalID)
+						break
+					}
+				}
+			}
+		}
+		return &stringRows{values: pids}, nil
+
+	// VM-P2D Slice 2: ListInstancesVisible — step 2: instances by owner set.
+	// Matches: WHERE owner_principal_id = ANY($1::text[])
+	case strings.Contains(sql, "FROM instances") && strings.Contains(sql, "ANY("):
+		ownerSet, _ := args[0].([]string)
+		ownerIndex := make(map[string]bool, len(ownerSet))
+		for _, o := range ownerSet {
+			ownerIndex[o] = true
+		}
+		var out []*db.InstanceRow
+		for _, r := range p.instances {
+			if ownerIndex[r.OwnerPrincipalID] && r.DeletedAt == nil {
+				out = append(out, r)
+			}
+		}
+		return &instRows{rows: out}, nil
 
 	// M10 Slice 2: ListDetachedRootDisks
 	case strings.Contains(sql, "FROM root_disks") && strings.Contains(sql, "status = $1"):
@@ -812,6 +892,52 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 			}
 		}
 		return &boolRow{value: exists}
+
+	// VM-P2D Slice 2: IsInstanceVisibleTo / IsInstanceWritableBy
+	// Matches: SELECT EXISTS( ... FROM projects p JOIN project_members pm ...
+	//          WHERE p.principal_id = $1 AND pm.account_principal_id = $2 ... )
+	// The writable variant additionally contains "IN ('OWNER','EDITOR')".
+	case strings.Contains(sql, "SELECT EXISTS") &&
+		strings.Contains(sql, "project_members") &&
+		strings.Contains(sql, "principal_id"):
+		projectPrincipalID := asStr(args[0])
+		accountPrincipalID := asStr(args[1])
+		requireEditor := strings.Contains(sql, "IN ('OWNER','EDITOR')")
+
+		// Find the project with this principal_id.
+		var projectID string
+		for _, proj := range p.projects {
+			if proj.PrincipalID == projectPrincipalID && proj.DeletedAt == nil {
+				projectID = proj.ID
+				break
+			}
+		}
+		if projectID == "" {
+			return &boolRow{value: false}
+		}
+		key := membershipKey(projectID, accountPrincipalID)
+		m, ok := p.projectMembers[key]
+		if !ok || m.removedAt != nil {
+			return &boolRow{value: false}
+		}
+		if requireEditor {
+			return &boolRow{value: m.role == "OWNER" || m.role == "EDITOR"}
+		}
+		return &boolRow{value: true}
+
+	// VM-P2D Slice 2: GetProjectMember
+	// Matches: FROM project_members WHERE project_id = $1 AND account_principal_id = $2
+	case strings.Contains(sql, "FROM project_members") &&
+		strings.Contains(sql, "project_id") &&
+		strings.Contains(sql, "account_principal_id"):
+		projectID := asStr(args[0])
+		accountID := asStr(args[1])
+		key := membershipKey(projectID, accountID)
+		m, ok := p.projectMembers[key]
+		if !ok || m.removedAt != nil {
+			return &errRow{fmt.Errorf("GetProjectMember: no rows in result set")}
+		}
+		return &membershipRow{m: m}
 
 	// M10 Slice 2: GetRootDiskByID
 	case strings.Contains(sql, "FROM root_disks") && strings.Contains(sql, "disk_id = $1"):
@@ -1237,6 +1363,29 @@ func (row *boolRow) Scan(dest ...any) error {
 		return fmt.Errorf("boolRow.Scan: need 1 dest")
 	}
 	*dest[0].(*bool) = row.value
+	return nil
+}
+
+// VM-P2D Slice 2: membershipRow scans a single membershipEntry.
+// Column order matches GetProjectMember SELECT:
+//
+//	0: id, 1: project_id, 2: account_principal_id, 3: role,
+//	4: invited_by (*string), 5: joined_at, 6: removed_at (*time.Time)
+type membershipRow struct{ m *membershipEntry }
+
+func (row *membershipRow) Scan(dest ...any) error {
+	m := row.m
+	if len(dest) < 7 {
+		return fmt.Errorf("membershipRow.Scan: need 7 dest, got %d", len(dest))
+	}
+	*dest[0].(*string) = m.id
+	*dest[1].(*string) = m.projectID
+	*dest[2].(*string) = m.accountPrincipalID
+	// role is scanned into MembershipRole (underlying string).
+	*dest[3].(*db.MembershipRole) = db.MembershipRole(m.role)
+	*dest[4].(**string) = nil // invited_by (not used in tests)
+	*dest[5].(*time.Time) = time.Now()
+	*dest[6].(**time.Time) = m.removedAt
 	return nil
 }
 
