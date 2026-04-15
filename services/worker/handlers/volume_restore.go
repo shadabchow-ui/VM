@@ -6,18 +6,14 @@ package handlers
 //         vm-15-02__blueprint__ §interaction_or_ops_contract,
 //         P2_VOLUME_MODEL.md §2.1 (VolumeOriginSnapshot).
 //         VM-P2B-S2.
+//         VM-P2B-S3: persist derived storage_path via SetVolumeStoragePath before unlock.
 //
 // Restore sequence:
-//  The VOLUME_RESTORE job carries snapshot_id (not volume_id). The destination
-//  volume was pre-created by handleRestoreSnapshot at admission (origin=snapshot,
-//  status=creating). The worker finds it via the snapshot's restored-volume lookup.
-//
 //  1. DB: load snapshot; validate it is still available (SNAP-I-1).
-//  2. DB: find the destination volume (status=creating, origin=snapshot,
-//         source_snapshot_id=snapID) — created at admission.
+//  2. DB: find the destination volume via job.VolumeID (set at admission).
 //         If already available → idempotent no-op.
-//  3. Storage: set the volume's root pointer to the snapshot's storage_path
-//     (Phase 2: simulated — stores derived storage_path on the volume row).
+//  3. Storage: derive storage_path for the new volume (CoW overlay over snapshot).
+//     Persist via SetVolumeStoragePath so the path is recorded before status change.
 //  4. DB: UnlockVolume → available (clears locked_by if set, sets status=available).
 //  5. On any failure: UnlockVolume → error so the failure is inspectable.
 //
@@ -77,20 +73,8 @@ func (h *VolumeRestoreHandler) Execute(ctx context.Context, job *db.JobRow) erro
 	// ── Step 2: Find the destination volume ───────────────────────────────────
 	// The volume was created at admission by handleRestoreSnapshot with
 	// origin='snapshot', source_snapshot_id=snapID, status='creating'.
-	// We use the job's context to find it: the job was inserted by the handler
-	// immediately after creating the volume; we look up by (snapshot_id, job_id)
-	// equivalently by finding the creating volume linked to this snapshot.
-	//
-	// Strategy: look up the volume_id stored by the handler in the job context.
-	// The handler stored it by creating the volume then the job with snapshot_id.
-	// The worker finds it by job.VolumeID if populated, else scans for
-	// creating volumes with source_snapshot_id. For simplicity and correctness,
-	// the VOLUME_RESTORE job carries both snapshot_id AND volume_id set in the
-	// job row by the handler.
-	//
-	// Note: handleRestoreSnapshot stores the new volume_id in the job at enqueue
-	// time so the worker has a direct reference. If VolumeID is nil (older job
-	// without this field), fail explicitly rather than scanning.
+	// The VOLUME_RESTORE job carries both snapshot_id AND volume_id set by the
+	// handler at enqueue time so the worker has a direct reference.
 	if job.VolumeID == nil {
 		return fmt.Errorf("VOLUME_RESTORE: job %s has nil VolumeID — cannot locate destination volume", job.ID)
 	}
@@ -115,27 +99,36 @@ func (h *VolumeRestoreHandler) Execute(ctx context.Context, job *db.JobRow) erro
 	}
 	log.Info("step2: destination volume found", "volume_id", volID)
 
-	// ── Step 3: Set storage path (storage data-plane) ─────────────────────────
-	// Phase 2: derive storage_path for the restored volume as a CoW overlay
-	// on top of the snapshot's storage_path. The real RoW engine registers
-	// the new volume root pointer; here we record the derived path for
-	// control-plane visibility.
+	// ── Step 3: Persist storage path ─────────────────────────────────────────
+	// Phase 2: the restored volume's storage_path is a CoW overlay on the
+	// snapshot's storage_path. The storage data-plane registers the new volume
+	// root pointer; here we record the derived path in the control plane so
+	// the path is durably persisted before the status transition.
 	// Source: vm-15-02__blueprint__ §Snapshot Immutability (restored volume uses RoW).
-	log.Info("step3: storage path derived from snapshot",
-		"snapshot_storage_path", *snap.StoragePath)
+	storagePath := deriveRestoreStoragePath(snapID, volID)
+	if err := h.deps.Store.SetVolumeStoragePath(ctx, volID, storagePath); err != nil {
+		_ = h.deps.Store.UnlockVolume(ctx, volID, db.VolumeStatusError)
+		return fmt.Errorf("step3 set storage path: %w", err)
+	}
+	log.Info("step3: storage path set", "storage_path", storagePath)
 
 	// ── Step 4: Transition volume creating → available ────────────────────────
 	// UnlockVolume: clears locked_by, sets status=available, version++.
-	// The volume was never explicitly locked by the handler (no lock step at
-	// admission for restore), so we use UnlockVolume which clears locked_by
-	// unconditionally and advances status. This is correct because:
-	//   - locked_by is NULL (never set at admission for restore jobs)
-	//   - UnlockVolume's WHERE clause does not check locked_by
+	// The volume was never explicitly locked at admission for restore jobs,
+	// so locked_by is NULL; UnlockVolume clears it unconditionally.
 	if err := h.deps.Store.UnlockVolume(ctx, volID, db.VolumeStatusAvailable); err != nil {
 		// Best-effort: mark volume as error so caller can inspect.
 		_ = h.deps.Store.UnlockVolume(ctx, volID, db.VolumeStatusError)
 		return fmt.Errorf("step4 unlock to available: %w", err)
 	}
-	log.Info("VOLUME_RESTORE: completed", "volume_id", volID)
+	log.Info("VOLUME_RESTORE: completed", "volume_id", volID, "storage_path", storagePath)
 	return nil
+}
+
+// deriveRestoreStoragePath returns the control-plane storage path for a restored volume.
+// Phase 2: deterministic path combining snapshot ID and volume ID.
+// Real implementation: the storage subsystem registers the CoW chain.
+// Source: vm-15-02__blueprint__ §interaction_or_ops_contract.
+func deriveRestoreStoragePath(snapID, volID string) string {
+	return "/volumes/" + volID + "/restore-from-" + snapID + ".img"
 }

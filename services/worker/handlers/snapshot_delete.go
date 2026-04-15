@@ -5,16 +5,19 @@ package handlers
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.5 (state machine), §2.7 (deletion rules),
 //         §2.9 (SNAP-I-2, SNAP-I-3), vm-15-02__skill__snapshot-clone-restore-retention-model.md.
 //         VM-P2B-S2.
+//         VM-P2B-S3: enforce SNAP-I-3 at the worker level via CountVolumesBySourceSnapshot.
 //
 // Delete sequence:
 //  1. DB: load snapshot; if already deleted (or not found) → idempotent no-op.
 //  2. Validate source state is available or error (or re-entrant deleting).
-//  3. DB: LockSnapshot. Skip if already deleting.
-//  4. DB: UpdateSnapshotStatus → deleting. Skip if re-entrant.
-//  5. Storage: release snapshot storage artifact (Phase 2: no-op stub).
-//  6. DB: SoftDeleteSnapshot — status=deleted, deleted_at=NOW(), locked_by=NULL,
+//  3. SNAP-I-3: CountVolumesBySourceSnapshot — fail if any non-deleted volumes
+//     were restored from this snapshot. Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.9 SNAP-I-3.
+//  4. DB: LockSnapshot. Skip if already deleting.
+//  5. DB: UpdateSnapshotStatus → deleting. Skip if re-entrant.
+//  6. Storage: release snapshot storage artifact (Phase 2: no-op stub).
+//  7. DB: SoftDeleteSnapshot — status=deleted, deleted_at=NOW(), locked_by=NULL,
 //     version++ atomically.
-//  7. On any failure after lock: UnlockSnapshot → error.
+//  8. On any failure after lock: UnlockSnapshot → error.
 //
 // Idempotency:
 //   - snapshot status deleted → immediate no-op.
@@ -27,6 +30,7 @@ package handlers
 //     images (VM-P2C) are wired. For now the check is a documented stub.
 //   SNAP-I-3: cannot delete while volumes restored from it still exist.
 //     Enforced here by counting non-deleted volumes with source_snapshot_id = snapID.
+//     Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.9 SNAP-I-3.
 
 import (
 	"context"
@@ -79,39 +83,55 @@ func (h *SnapshotDeleteHandler) Execute(ctx context.Context, job *db.JobRow) err
 
 	reentrant := snap.Status == db.SnapshotStatusDeleting
 
-	// ── Step 3: Lock snapshot ─────────────────────────────────────────────────
+	// ── Step 3: SNAP-I-3 — reject if restored volumes still exist ────────────
+	// Count non-deleted volumes whose source_snapshot_id = snapID.
+	// Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.9 SNAP-I-3.
+	// Skip on re-entrant: if we already transitioned to deleting in a prior
+	// run, this check passed then and we should not block completion.
+	if !reentrant {
+		volCount, err := h.deps.Store.CountVolumesBySourceSnapshot(ctx, snapID)
+		if err != nil {
+			return fmt.Errorf("step3 count restored volumes: %w", err)
+		}
+		if volCount > 0 {
+			return fmt.Errorf("SNAPSHOT_DELETE: SNAP-I-3: snapshot %s has %d non-deleted volume(s) restored from it — delete those volumes first", snapID, volCount)
+		}
+		log.Info("step3: SNAP-I-3 check passed — no active restored volumes")
+	}
+
+	// ── Step 4: Lock snapshot ─────────────────────────────────────────────────
 	if !reentrant {
 		lockStatus := snap.Status // available or error
 		if err := h.deps.Store.LockSnapshot(ctx, snapID, job.ID, lockStatus, snap.Version); err != nil {
-			return fmt.Errorf("step3 lock snapshot: %w", err)
+			return fmt.Errorf("step4 lock snapshot: %w", err)
 		}
 		snap.Version++
-		log.Info("step3: snapshot locked")
+		log.Info("step4: snapshot locked")
 	} else {
-		log.Info("step3: snapshot already deleting — skip lock (re-entrant)")
+		log.Info("step4: snapshot already deleting — skip lock (re-entrant)")
 	}
 
-	// ── Step 4: Transition → deleting ─────────────────────────────────────────
+	// ── Step 5: Transition → deleting ─────────────────────────────────────────
 	if !reentrant {
 		if err := h.deps.Store.UpdateSnapshotStatus(ctx, snapID,
 			snap.Status, db.SnapshotStatusDeleting, snap.Version); err != nil {
 			_ = h.unlock(ctx, snapID, db.SnapshotStatusError)
-			return fmt.Errorf("step4 transition to deleting: %w", err)
+			return fmt.Errorf("step5 transition to deleting: %w", err)
 		}
 		snap.Version++
-		log.Info("step4: transitioned to deleting")
+		log.Info("step5: transitioned to deleting")
 	}
 
-	// ── Step 5: Storage release ───────────────────────────────────────────────
+	// ── Step 6: Storage release ───────────────────────────────────────────────
 	// Phase 2: stub. The RoW GC process will handle reference-count decrement
 	// and block reclamation asynchronously.
 	// Source: vm-15-02__blueprint__ §interaction_or_ops_contract (DeleteSnapshot trigger).
-	log.Info("step5: storage release acknowledged (async GC)")
+	log.Info("step6: storage release acknowledged (async GC)")
 
-	// ── Step 6: Soft-delete ───────────────────────────────────────────────────
+	// ── Step 7: Soft-delete ───────────────────────────────────────────────────
 	if err := h.deps.Store.SoftDeleteSnapshot(ctx, snapID, snap.Version); err != nil {
 		_ = h.unlock(ctx, snapID, db.SnapshotStatusError)
-		return fmt.Errorf("step6 soft delete: %w", err)
+		return fmt.Errorf("step7 soft delete: %w", err)
 	}
 	log.Info("SNAPSHOT_DELETE: completed")
 	return nil

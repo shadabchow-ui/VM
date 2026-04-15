@@ -470,7 +470,7 @@ func TestRestoreSnapshot_HappyPath_Returns202(t *testing.T) {
 
 	var out RestoreSnapshotResponse
 	decodeBody(t, resp, &out)
-	if out.VolumeID == "" {
+	if out.Volume.ID == "" {
 		t.Error("want non-empty volume_id in restore response")
 	}
 	if out.JobID == "" {
@@ -478,9 +478,9 @@ func TestRestoreSnapshot_HappyPath_Returns202(t *testing.T) {
 	}
 
 	// Verify the new volume exists in the pool with status=creating, origin=snapshot.
-	vol := s.mem.volumes[out.VolumeID]
+	vol := s.mem.volumes[out.Volume.ID]
 	if vol == nil {
-		t.Fatalf("restored volume %s not found in memPool", out.VolumeID)
+		t.Fatalf("restored volume %s not found in memPool", out.Volume.ID)
 	}
 	if vol.Status != "creating" {
 		t.Errorf("want status=creating, got %q", vol.Status)
@@ -509,7 +509,7 @@ func TestRestoreSnapshot_SizeOverride_LargerThanSnap_Returns202(t *testing.T) {
 	}
 	var out RestoreSnapshotResponse
 	decodeBody(t, resp, &out)
-	vol := s.mem.volumes[out.VolumeID]
+	vol := s.mem.volumes[out.Volume.ID]
 	if vol == nil {
 		t.Fatalf("volume not found")
 	}

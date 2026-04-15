@@ -3,6 +3,9 @@ package main
 // snapshot_types.go — Public API request/response DTOs for snapshot resources.
 //
 // VM-P2B-S2: snapshot create/list/describe/delete + restore-to-volume.
+// VM-P2B-S3: RestoreSnapshotResponse now embeds the full VolumeResponse
+//            instead of only volume_id, matching the contract in
+//            P2_IMAGE_SNAPSHOT_MODEL.md §4.
 //
 // Follows the same conventions as volume_types.go:
 //   - Request structs use json tags with omitempty on optional fields.
@@ -89,8 +92,13 @@ type RestoreSnapshotRequest struct {
 
 // RestoreSnapshotResponse is returned from POST /v1/snapshots/{id}/restore with 202.
 // The new volume starts in 'creating' status and is advanced by the VOLUME_RESTORE worker.
-// Source: P2_IMAGE_SNAPSHOT_MODEL.md §2 (restore → new volume), JOB_MODEL_V1 §1.
+//
+// Returns the full volume resource so callers do not need a separate GET to inspect
+// the new volume's identity, AZ, and size.
+//
+// Source: P2_IMAGE_SNAPSHOT_MODEL.md §4 (restore → new volume), JOB_MODEL_V1 §1.
+// VM-P2B-S3: changed from {volume_id, job_id} to {volume, job_id}.
 type RestoreSnapshotResponse struct {
-	VolumeID string `json:"volume_id"`
-	JobID    string `json:"job_id"`
+	Volume VolumeResponse `json:"volume"`
+	JobID  string         `json:"job_id"`
 }

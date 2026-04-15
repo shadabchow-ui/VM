@@ -14,6 +14,11 @@ package handlers
 //
 // VM-P2B-S2: Added SnapshotStore interface + SnapshotDeps for snapshot
 // job handlers (SNAPSHOT_CREATE, SNAPSHOT_DELETE, VOLUME_RESTORE).
+//
+// VM-P2B-S3: Added SetVolumeStoragePath + CountActiveSnapshotsByVolume to
+// VolumeStore (required by VOLUME_CREATE handler and VOLUME_DELETE worker
+// invariant enforcement). Added CountVolumesBySourceSnapshot to SnapshotStore
+// (required by SNAPSHOT_DELETE worker to enforce SNAP-I-3).
 
 import (
 	"context"
@@ -83,11 +88,14 @@ type Deps struct {
 }
 
 // ── VolumeStore ───────────────────────────────────────────────────────────────
-// Subset of *db.Repo used by volume job handlers (VOLUME_ATTACH, VOLUME_DETACH,
-// VOLUME_DELETE). *db.Repo satisfies this interface. Tests inject fakeVolumeStore.
+// Subset of *db.Repo used by volume job handlers (VOLUME_CREATE, VOLUME_ATTACH,
+// VOLUME_DETACH, VOLUME_DELETE). *db.Repo satisfies this interface.
+// Tests inject fakeVolumeStore.
 // Source: P2_VOLUME_MODEL.md §7 VOL-I-5 (locked_by), §4 (attach/detach), §5 (delete).
 // VM-P2B Slice 1.
-
+// VM-P2B-S3: Added SetVolumeStoragePath (VOLUME_CREATE) and
+//
+//	CountActiveSnapshotsByVolume (VOLUME_DELETE invariant).
 type VolumeStore interface {
 	GetVolumeByID(ctx context.Context, id string) (*db.VolumeRow, error)
 	LockVolume(ctx context.Context, id, jobID, expectedStatus string, version int) error
@@ -96,6 +104,19 @@ type VolumeStore interface {
 	SoftDeleteVolume(ctx context.Context, id string, version int) error
 	GetActiveAttachmentByVolume(ctx context.Context, volumeID string) (*db.VolumeAttachmentRow, error)
 	CloseVolumeAttachment(ctx context.Context, attachmentID string) error
+
+	// SetVolumeStoragePath records the storage_path on a volume row after
+	// the storage data-plane has provisioned the block device.
+	// Source: P2_VOLUME_MODEL.md §5 (storage_path assigned on create completion).
+	// VM-P2B-S3.
+	SetVolumeStoragePath(ctx context.Context, id, storagePath string) error
+
+	// CountActiveSnapshotsByVolume returns the number of non-deleted snapshots
+	// whose source_volume_id is the given volume.
+	// Used by VOLUME_DELETE to enforce SNAP-I-3 at the worker level.
+	// Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.9 SNAP-I-3.
+	// VM-P2B-S3.
+	CountActiveSnapshotsByVolume(ctx context.Context, volumeID string) (int, error)
 }
 
 // VolumeDeps holds dependencies for volume job handlers.
@@ -109,9 +130,13 @@ type VolumeDeps struct {
 // SNAPSHOT_DELETE, VOLUME_RESTORE). *db.Repo satisfies this interface.
 // Tests inject fakeSnapshotStore.
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.9 (invariants),
-//         vm-15-02__skill__snapshot-clone-restore-retention-model.md.
+//
+//	vm-15-02__skill__snapshot-clone-restore-retention-model.md.
+//
 // VM-P2B-S2.
-
+// VM-P2B-S3: Added CountVolumesBySourceSnapshot to enforce SNAP-I-3
+//
+//	in SNAPSHOT_DELETE worker.
 type SnapshotStore interface {
 	// Snapshot operations
 	GetSnapshotByID(ctx context.Context, id string) (*db.SnapshotRow, error)
@@ -124,6 +149,15 @@ type SnapshotStore interface {
 	// Volume operations needed by VOLUME_RESTORE.
 	GetVolumeByID(ctx context.Context, id string) (*db.VolumeRow, error)
 	UnlockVolume(ctx context.Context, id, newStatus string) error
+	SetVolumeStoragePath(ctx context.Context, id, storagePath string) error
+
+	// CountVolumesBySourceSnapshot returns the number of non-deleted volumes
+	// whose source_snapshot_id is the given snapshot.
+	// Used by SNAPSHOT_DELETE to enforce SNAP-I-3: cannot delete a snapshot
+	// while volumes restored from it still exist.
+	// Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.9 SNAP-I-3.
+	// VM-P2B-S3.
+	CountVolumesBySourceSnapshot(ctx context.Context, snapshotID string) (int, error)
 }
 
 // SnapshotDeps holds dependencies for snapshot job handlers.

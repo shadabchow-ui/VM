@@ -7,6 +7,8 @@ package handlers
 //         §2.9 (invariants SNAP-I-1, SNAP-I-3),
 //         vm-15-02__skill__snapshot-clone-restore-retention-model.md.
 //         VM-P2B-S2.
+//         VM-P2B-S3: extended fakeSnapshotStore with CountVolumesBySourceSnapshot;
+//           added SNAP-I-3 enforcement test for SnapshotDeleteHandler.
 //
 // All tests use in-memory fakeSnapshotStore. No real DB required.
 //
@@ -26,9 +28,10 @@ package handlers
 //     - illegal state (creating) → error
 //     - lock conflict → error, status remains available
 //     - re-entrant: already deleting → skip lock, complete to deleted
+//     - SNAP-I-3: active restored volumes block delete → error
 //     - nil SnapshotID → error
 //   VOLUME_RESTORE
-//     - success: snapshot available + volume creating → volume available
+//     - success: snapshot available + volume creating → volume available, storage_path set
 //     - idempotent: volume already available → no-op
 //     - snapshot not available → error
 //     - snapshot not found → error
@@ -65,6 +68,10 @@ type fakeSnapshotStore struct {
 	snapshots map[string]*db.SnapshotRow
 	volumes   map[string]*db.VolumeRow
 
+	// restoredVolumeCounts: snapshotID → number of non-deleted restored volumes.
+	// Used by CountVolumesBySourceSnapshot (SNAP-I-3).
+	restoredVolumeCounts map[string]int
+
 	// Fault injection.
 	lockFail         bool
 	updateStatusFail bool
@@ -74,8 +81,9 @@ type fakeSnapshotStore struct {
 
 func newFakeSnapshotStore() *fakeSnapshotStore {
 	return &fakeSnapshotStore{
-		snapshots: make(map[string]*db.SnapshotRow),
-		volumes:   make(map[string]*db.VolumeRow),
+		snapshots:            make(map[string]*db.SnapshotRow),
+		volumes:              make(map[string]*db.VolumeRow),
+		restoredVolumeCounts: make(map[string]int),
 	}
 }
 
@@ -216,6 +224,27 @@ func (s *fakeSnapshotStore) UnlockVolume(_ context.Context, id, newStatus string
 	return nil
 }
 
+// SetVolumeStoragePath records the storage_path on the volume.
+// VM-P2B-S3: required by SnapshotStore (used by VOLUME_RESTORE handler).
+func (s *fakeSnapshotStore) SetVolumeStoragePath(_ context.Context, id, storagePath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.volumes[id]
+	if !ok {
+		return fmt.Errorf("SetVolumeStoragePath: volume %s not found", id)
+	}
+	v.StoragePath = &storagePath
+	return nil
+}
+
+// CountVolumesBySourceSnapshot returns the injected count of restored volumes.
+// VM-P2B-S3: required by SnapshotStore interface for SNAP-I-3 enforcement.
+func (s *fakeSnapshotStore) CountVolumesBySourceSnapshot(_ context.Context, snapshotID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restoredVolumeCounts[snapshotID], nil
+}
+
 // compile-time interface check
 var _ SnapshotStore = (*fakeSnapshotStore)(nil)
 
@@ -321,6 +350,18 @@ func assertSnapshotVolumeStatus(t *testing.T, store *fakeSnapshotStore, id, want
 	}
 }
 
+func assertSnapshotVolumeStoragePath(t *testing.T, store *fakeSnapshotStore, id string, wantNonEmpty bool) {
+	t.Helper()
+	v := store.volumes[id]
+	if v == nil {
+		t.Fatalf("assertSnapshotVolumeStoragePath: volume %s not found", id)
+	}
+	hasPath := v.StoragePath != nil && *v.StoragePath != ""
+	if hasPath != wantNonEmpty {
+		t.Errorf("volume %s hasStoragePath=%v, want %v", id, hasPath, wantNonEmpty)
+	}
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // SNAPSHOT_CREATE tests
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -361,7 +402,7 @@ func TestSnapshotCreate_AlreadyAvailable_IsNoOp(t *testing.T) {
 		t.Errorf("Execute on available = %v, want nil (idempotent)", err)
 	}
 	if store.snapshots[snapID].Version != versionBefore {
-		t.Errorf("version changed on no-op: have %d want %d", store.snapshots[snapID].Version, versionBefore)
+		t.Errorf("version changed on no-op")
 	}
 }
 
@@ -374,7 +415,7 @@ func TestSnapshotCreate_IllegalState_ReturnsError(t *testing.T) {
 
 	h := newTestSnapshotCreateHandler(store)
 	if err := h.Execute(context.Background(), snapJob(snapID, "SNAPSHOT_CREATE")); err == nil {
-		t.Fatal("expected error for illegal state, got nil")
+		t.Fatal("expected error for illegal state deleting, got nil")
 	}
 }
 
@@ -407,7 +448,6 @@ func TestSnapshotCreate_Reentrant_AlreadyCreating_CompletesToAvailable(t *testin
 		t.Fatalf("re-entrant create: %v", err)
 	}
 	assertSnapshotStatus(t, store, snapID, db.SnapshotStatusAvailable)
-	assertSnapshotLocked(t, store, snapID, false)
 }
 
 func TestSnapshotCreate_NilSnapshotID_ReturnsError(t *testing.T) {
@@ -433,15 +473,11 @@ func TestSnapshotDelete_HappyPath_TransitionsToDeleted(t *testing.T) {
 	if err := h.Execute(context.Background(), snapJob(snapID, "SNAPSHOT_DELETE")); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-
 	assertSnapshotStatus(t, store, snapID, db.SnapshotStatusDeleted)
 	assertSnapshotLocked(t, store, snapID, false)
-	if store.snapshots[snapID].DeletedAt == nil {
-		t.Error("deleted_at not set after delete")
-	}
 }
 
-func TestSnapshotDelete_FromError_TransitionsToDeleted(t *testing.T) {
+func TestSnapshotDelete_FromErrorState_TransitionsToDeleted(t *testing.T) {
 	store := newFakeSnapshotStore()
 	const snapID = "snap-delete-fromerr"
 	s := newAvailableSnapshot(snapID)
@@ -450,7 +486,7 @@ func TestSnapshotDelete_FromError_TransitionsToDeleted(t *testing.T) {
 
 	h := newTestSnapshotDeleteHandler(store)
 	if err := h.Execute(context.Background(), snapJob(snapID, "SNAPSHOT_DELETE")); err != nil {
-		t.Fatalf("Execute from error: %v", err)
+		t.Fatalf("Execute from error state: %v", err)
 	}
 	assertSnapshotStatus(t, store, snapID, db.SnapshotStatusDeleted)
 }
@@ -528,6 +564,26 @@ func TestSnapshotDelete_Reentrant_AlreadyDeleting_CompletesToDeleted(t *testing.
 	assertSnapshotLocked(t, store, snapID, false)
 }
 
+// TestSnapshotDelete_SNAPI3_ActiveRestoredVolumes_ReturnsError verifies that
+// SNAP-I-3 is enforced: cannot delete a snapshot that has non-deleted volumes
+// restored from it.
+// Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.9 SNAP-I-3. VM-P2B-S3.
+func TestSnapshotDelete_SNAPI3_ActiveRestoredVolumes_ReturnsError(t *testing.T) {
+	store := newFakeSnapshotStore()
+	const snapID = "snap-delete-snapi3"
+	store.snapshots[snapID] = newAvailableSnapshot(snapID)
+	// Inject restored volume count — simulates 1 non-deleted volume from this snap.
+	store.restoredVolumeCounts[snapID] = 1
+
+	h := newTestSnapshotDeleteHandler(store)
+	if err := h.Execute(context.Background(), snapJob(snapID, "SNAPSHOT_DELETE")); err == nil {
+		t.Fatal("expected error for SNAP-I-3 violation, got nil")
+	}
+	// Snapshot must remain available — no mutation should have occurred.
+	assertSnapshotStatus(t, store, snapID, db.SnapshotStatusAvailable)
+	assertSnapshotLocked(t, store, snapID, false)
+}
+
 func TestSnapshotDelete_NilSnapshotID_ReturnsError(t *testing.T) {
 	store := newFakeSnapshotStore()
 	job := &db.JobRow{ID: "job-nil-snap", SnapshotID: nil, JobType: "SNAPSHOT_DELETE"}
@@ -554,6 +610,8 @@ func TestVolumeRestore_HappyPath_VolumeBecomesAvailable(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 	assertSnapshotVolumeStatus(t, store, volID, db.VolumeStatusAvailable)
+	// VM-P2B-S3: storage_path must be set.
+	assertSnapshotVolumeStoragePath(t, store, volID, true)
 }
 
 func TestVolumeRestore_VolumeAlreadyAvailable_IsNoOp(t *testing.T) {

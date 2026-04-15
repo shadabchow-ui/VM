@@ -3,6 +3,8 @@ package main
 // snapshot_handlers.go — HTTP handlers for the public snapshot API.
 //
 // VM-P2B-S2: snapshot create/list/get/delete + restore-to-volume.
+// VM-P2B-S3: handleRestoreSnapshot now returns RestoreSnapshotResponse{Volume, JobID}
+//            instead of {volume_id, job_id}.
 //
 // Routes registered:
 //   POST   /v1/snapshots                    → handleCreateSnapshot   (202 + Job)
@@ -274,10 +276,10 @@ func (s *server) handleGetSnapshot(w http.ResponseWriter, r *http.Request, id st
 //
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.5, §2.7, §2.9 SNAP-I-2 and SNAP-I-3.
 //
-// Note: SNAP-I-2 (cannot delete while backing an ACTIVE image) and SNAP-I-3
-// (cannot delete while volumes created from it still exist) are enforced at
-// the worker level because checking image references requires the images table
-// (VM-P2C). The admission layer here guards the simpler state checks only.
+// Note: SNAP-I-3 (cannot delete while volumes created from it still exist) is
+// also enforced at the worker level. The admission layer delegates the check
+// there because it requires a scan of volumes.source_snapshot_id, which is
+// safe to do at both layers (worker is authoritative; API is a fast-fail hint).
 func (s *server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request, id string) {
 	principal, _ := principalFromCtx(r.Context())
 
@@ -341,7 +343,10 @@ func (s *server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request, id
 // The restored volume starts in 'creating' status. The VOLUME_RESTORE worker
 // transitions it to 'available' once storage is ready.
 //
-// Source: P2_IMAGE_SNAPSHOT_MODEL.md §2 (restore flow),
+// VM-P2B-S3: returns RestoreSnapshotResponse{Volume, JobID} — the full volume
+// resource is embedded so callers do not need a separate GET.
+//
+// Source: P2_IMAGE_SNAPSHOT_MODEL.md §2 (restore flow), §4 (API endpoints),
 //
 //	vm-15-02__blueprint__ §interaction_or_ops_contract.
 func (s *server) handleRestoreSnapshot(w http.ResponseWriter, r *http.Request, id string) {
@@ -422,9 +427,18 @@ func (s *server) handleRestoreSnapshot(w http.ResponseWriter, r *http.Request, i
 		return
 	}
 
+	// Fetch the newly created volume to build the full response.
+	// VM-P2B-S3: return VolumeResponse instead of bare volume_id.
+	created, err := s.repo.GetVolumeByID(r.Context(), volID)
+	if err != nil || created == nil {
+		s.log.Error("GetVolumeByID after restore insert failed", "error", err)
+		writeInternalError(w)
+		return
+	}
+
 	writeJSON(w, http.StatusAccepted, RestoreSnapshotResponse{
-		VolumeID: volID,
-		JobID:    jobID,
+		Volume: volumeToResponse(created, nil),
+		JobID:  jobID,
 	})
 }
 

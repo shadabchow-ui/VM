@@ -6,6 +6,8 @@ package db
 //         §2.9 (invariants), vm-15-02__skill__snapshot-clone-restore-retention-model.md.
 //
 // VM-P2B-S2: first-class snapshot resource persistence.
+// VM-P2B-S3: Added CountVolumesBySourceSnapshot for SNAP-I-3 enforcement in
+//            SNAPSHOT_DELETE worker.
 //
 // Ownership model: snapshots carry owner_principal_id. All list/get operations
 // that surface snapshots to API callers must filter by owner. Cross-account
@@ -288,8 +290,8 @@ func (r *Repo) HasActiveSnapshotJob(ctx context.Context, snapshotID, jobType str
 
 // CountActiveSnapshotsByVolume returns the number of non-deleted snapshots whose
 // source_volume_id matches the given volume.
-// Used to enforce SNAP-I-3: cannot delete a volume that has active snapshots
-// (conservative Phase 2 rule — prevents dangling CoW chains).
+// Used to enforce SNAP-I-3 at the API admission layer: cannot delete a volume
+// that has active snapshots (conservative Phase 2 rule).
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.7, §2.9 SNAP-I-3.
 func (r *Repo) CountActiveSnapshotsByVolume(ctx context.Context, volumeID string) (int, error) {
 	var count int
@@ -302,6 +304,27 @@ func (r *Repo) CountActiveSnapshotsByVolume(ctx context.Context, volumeID string
 	`, volumeID).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("CountActiveSnapshotsByVolume: %w", err)
+	}
+	return count, nil
+}
+
+// CountVolumesBySourceSnapshot returns the number of non-deleted volumes whose
+// source_snapshot_id matches the given snapshot.
+// Used by SNAPSHOT_DELETE worker to enforce SNAP-I-3: cannot delete a snapshot
+// while volumes restored from it still exist.
+// Source: P2_IMAGE_SNAPSHOT_MODEL.md §2.9 SNAP-I-3.
+// VM-P2B-S3.
+func (r *Repo) CountVolumesBySourceSnapshot(ctx context.Context, snapshotID string) (int, error) {
+	var count int
+	err := r.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM volumes
+		WHERE source_snapshot_id = $1
+		  AND status NOT IN ('deleted')
+		  AND deleted_at IS NULL
+	`, snapshotID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("CountVolumesBySourceSnapshot: %w", err)
 	}
 	return count, nil
 }

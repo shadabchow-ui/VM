@@ -11,7 +11,8 @@ package main
 //
 // VM-P2B Slice 1: VOLUME_ATTACH, VOLUME_DETACH, VOLUME_DELETE added to dispatch.
 // VM-P2B-S2: SNAPSHOT_CREATE, SNAPSHOT_DELETE, VOLUME_RESTORE added to dispatch.
-// Source: P2_VOLUME_MODEL.md §4, P2_IMAGE_SNAPSHOT_MODEL.md §4.
+// VM-P2B-S3: VOLUME_CREATE added to dispatch (handler was missing).
+// Source: P2_VOLUME_MODEL.md §3.2, §4, P2_IMAGE_SNAPSHOT_MODEL.md §4.
 
 import (
 	"context"
@@ -59,8 +60,9 @@ func main() {
 		},
 	}
 
-	// VM-P2B Slice 1: volume job handlers.
-	// Source: P2_VOLUME_MODEL.md §4.2 (VOLUME_ATTACH), §4.4 (VOLUME_DETACH), §5.2 (VOLUME_DELETE).
+	// VM-P2B: volume job handlers.
+	// Source: P2_VOLUME_MODEL.md §3.2 (VOLUME_CREATE), §4.2 (VOLUME_ATTACH),
+	//         §4.4 (VOLUME_DETACH), §5.2 (VOLUME_DELETE).
 	volumeDeps := &handlers.VolumeDeps{
 		Store: repo,
 	}
@@ -76,7 +78,9 @@ func main() {
 		"INSTANCE_DELETE": handlers.NewDeleteHandler(deps, log),
 		// INSTANCE_START, INSTANCE_STOP, INSTANCE_REBOOT: M3 — not yet registered.
 
-		// VM-P2B Slice 1: volume job handlers.
+		// VM-P2B: volume job handlers.
+		// VOLUME_CREATE was missing in prior slices — added in VM-P2B-S3.
+		"VOLUME_CREATE": handlers.NewVolumeCreateHandler(volumeDeps, log),
 		"VOLUME_ATTACH": handlers.NewVolumeAttachHandler(volumeDeps, log),
 		"VOLUME_DETACH": handlers.NewVolumeDetachHandler(volumeDeps, log),
 		"VOLUME_DELETE": handlers.NewVolumeDeleteHandler(volumeDeps, log),
@@ -93,7 +97,7 @@ func main() {
 	log.Info("worker starting",
 		"handlers", []string{
 			"INSTANCE_CREATE", "INSTANCE_DELETE",
-			"VOLUME_ATTACH", "VOLUME_DETACH", "VOLUME_DELETE",
+			"VOLUME_CREATE", "VOLUME_ATTACH", "VOLUME_DETACH", "VOLUME_DELETE",
 			"SNAPSHOT_CREATE", "SNAPSHOT_DELETE", "VOLUME_RESTORE",
 		},
 		"network_controller", ncURL,

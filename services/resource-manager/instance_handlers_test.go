@@ -850,6 +850,24 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 		return &intRow{value: count}
 
 	// VM-P2B-S2: GetSnapshotByID — WHERE id = $1 AND deleted_at IS NULL
+
+	// VM-P2B-S3: CountActiveSnapshotsByVolume — SELECT COUNT(*) FROM snapshots
+	// WHERE source_volume_id = $1 AND status NOT IN ('deleted') AND deleted_at IS NULL
+	case strings.Contains(sql, "SELECT COUNT(*)") &&
+		strings.Contains(sql, "FROM snapshots") &&
+		strings.Contains(sql, "source_volume_id"):
+		volumeID := args[0].(string)
+		count := 0
+		for _, snap := range p.snapshots {
+			if snap == nil || snap.DeletedAt != nil || snap.SourceVolumeID == nil {
+				continue
+			}
+			if *snap.SourceVolumeID == volumeID && snap.Status != "deleted" {
+				count++
+			}
+		}
+		return &intRow{value: count}
+
 	case strings.Contains(sql, "FROM snapshots") && strings.Contains(sql, "id = $1"):
 		id := asStr(args[0])
 		snap, ok := p.snapshots[id]
