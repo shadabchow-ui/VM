@@ -25,6 +25,17 @@ package db
 //   - ClearFenceRequired: new — operator/controller clears fence_required flag.
 //   - GetFenceRequiredHosts: new — scan for hosts with fence_required=TRUE.
 //   - ValidateHostTransition: new — guards illegal status transitions.
+//
+// VM-P2E Slice 4 changes:
+//   - HostRecord: added RetiredAt *time.Time field (requires migration column).
+//   - GetHostByID, GetAvailableHosts: scan retired_at.
+//   - legalTransitions: added drained→retiring, fenced→retiring, retiring→retired,
+//     drained→retired (direct admin path), unhealthy→retiring (for fenced-then-retire
+//     without an explicit fencing controller landing before Slice 5).
+//   - ReasonOperatorRetired: new constant for operator-initiated retirement.
+//   - MarkHostRetiring: new — CAS transition to 'retiring'; gated on zero active workload.
+//   - MarkHostRetired: new — CAS transition to 'retiring'→'retired'; sets retired_at.
+//   - GetRetiredHosts: new — replacement-seam query returning all 'retired' hosts.
 
 import (
 	"context"
@@ -127,6 +138,13 @@ const (
 	// ReasonOperatorUnhealthy: operator manually marked the host unhealthy.
 	// Does NOT set fence_required (operator knows the host state explicitly).
 	ReasonOperatorUnhealthy = "OPERATOR_UNHEALTHY"
+
+	// ReasonOperatorRetired: operator explicitly retired the host.
+	// Stored as reason_code on the retiring/retired transition so the audit log
+	// shows why the host was removed from service.
+	// Does NOT set fence_required (retirement is deliberate, not an ambiguous failure).
+	// Source: vm-13-03__blueprint__ §"Emergency Retirement" operator procedure.
+	ReasonOperatorRetired = "OPERATOR_RETIRED"
 )
 
 // fenceRequiredReasons is the set of reason codes that trigger fence_required=TRUE
@@ -151,7 +169,7 @@ var fenceRequiredReasons = map[string]bool{
 //   - Transition rules are derived from vm-13-03__blueprint__ and research docs.
 //   - Missing from this table = illegal; callers get ErrIllegalHostTransition.
 //
-// Allowed graph after Slice 3:
+// Allowed graph after Slice 4:
 //
 //	ready       → draining    (Slice 1: operator drain)
 //	ready       → degraded    (Slice 3: health monitor detects issues)
@@ -159,17 +177,20 @@ var fenceRequiredReasons = map[string]bool{
 //	draining    → drained     (Slice 2: drain complete)
 //	draining    → degraded    (Slice 3: health degrades during drain)
 //	draining    → unhealthy   (Slice 3: health fails during drain)
-//	drained     → ready       (Slice 4+: post-maintenance reactivation seam)
+//	drained     → ready       (post-maintenance reactivation seam)
 //	drained     → degraded    (Slice 3: health degrades after drain)
+//	drained     → retiring    (Slice 4: normal retirement path; requires zero active workload)
+//	drained     → retired     (Slice 4: direct admin-only shortcut; narrow and explicit)
 //	degraded    → ready       (Slice 3: recovery — transient issue resolved)
 //	degraded    → unhealthy   (Slice 3: escalation — issue persists)
 //	degraded    → draining    (Slice 3: operator decides to drain degraded host)
 //	unhealthy   → degraded    (Slice 3: partial recovery signal)
 //	unhealthy   → ready       (only via operator/explicit clearance after unhealthy)
-//
-// Reserved for Slice 4+:
-//   - → fenced      (unhealthy → fenced after STONITH)
-//   - → retired     (fenced or drained → retired)
+//	unhealthy   → retiring    (Slice 4: emergency retirement for confirmed-bad host
+//	                           without a full fencing controller; narrow admin path)
+//	fenced      → retiring    (Slice 4: seam for fenced-then-retire; fencing controller
+//	                           (Slice 5+) transitions fenced→retiring after STONITH)
+//	retiring    → retired     (Slice 4: retirement completes after operator confirms)
 //
 // NOTE: the generation-checked CAS in UpdateHostStatus/MarkHostDegraded/
 // MarkHostUnhealthy still applies — ValidateHostTransition is an additional
@@ -186,8 +207,10 @@ var legalTransitions = map[string]map[string]bool{
 		"unhealthy": true,
 	},
 	"drained": {
-		"ready":    true, // reactivation after maintenance (Slice 4+ path)
+		"ready":    true, // reactivation after maintenance
 		"degraded": true,
+		"retiring": true, // Slice 4: normal retirement path
+		"retired":  true, // Slice 4: direct admin-only shortcut
 	},
 	"degraded": {
 		"ready":     true, // transient issue resolved
@@ -197,6 +220,13 @@ var legalTransitions = map[string]map[string]bool{
 	"unhealthy": {
 		"degraded": true, // partial recovery
 		"ready":    true, // explicit operator clearance
+		"retiring": true, // Slice 4: emergency retirement (confirmed-bad, no fencing controller yet)
+	},
+	"fenced": {
+		"retiring": true, // Slice 4: seam for fencing-controller → retire path
+	},
+	"retiring": {
+		"retired": true, // Slice 4: retirement completes
 	},
 }
 
@@ -237,7 +267,8 @@ type HostRecord struct {
 	Generation       int64   // optimistic concurrency counter; incremented on every status CAS
 	DrainReason      *string // operator-supplied drain reason; nil if not set
 	ReasonCode       *string // machine-readable reason for current non-ready state; nil if ready
-	FenceRequired    bool    // TRUE when fence_required=TRUE: fencing must complete before recovery
+	FenceRequired    bool       // TRUE when fence_required=TRUE: fencing must complete before recovery
+	RetiredAt        *time.Time // wall-clock time host transitioned to 'retired'; nil until then
 	TotalCPU         int
 	TotalMemoryMB    int
 	TotalDiskGB      int
@@ -314,10 +345,11 @@ func (r *Repo) UpdateHeartbeat(ctx context.Context, hostID string, usedCPU, used
 // GetAvailableHosts returns all ready hosts with a recent heartbeat.
 // VM-P2E Slice 2: scans generation and drain_reason alongside existing columns.
 // VM-P2E Slice 3: scans reason_code and fence_required.
+// VM-P2E Slice 4: scans retired_at.
 func (r *Repo) GetAvailableHosts(ctx context.Context) ([]*HostRecord, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, availability_zone, status,
-		       generation, drain_reason, reason_code, fence_required,
+		       generation, drain_reason, reason_code, fence_required, retired_at,
 		       total_cpu, total_memory_mb, total_disk_gb,
 		       used_cpu, used_memory_mb, used_disk_gb,
 		       agent_version, last_heartbeat_at, registered_at, updated_at
@@ -336,7 +368,7 @@ func (r *Repo) GetAvailableHosts(ctx context.Context) ([]*HostRecord, error) {
 		h := &HostRecord{}
 		if err := rows.Scan(
 			&h.ID, &h.AvailabilityZone, &h.Status,
-			&h.Generation, &h.DrainReason, &h.ReasonCode, &h.FenceRequired,
+			&h.Generation, &h.DrainReason, &h.ReasonCode, &h.FenceRequired, &h.RetiredAt,
 			&h.TotalCPU, &h.TotalMemoryMB, &h.TotalDiskGB,
 			&h.UsedCPU, &h.UsedMemoryMB, &h.UsedDiskGB,
 			&h.AgentVersion, &h.LastHeartbeatAt, &h.RegisteredAt, &h.UpdatedAt,
@@ -352,18 +384,19 @@ func (r *Repo) GetAvailableHosts(ctx context.Context) ([]*HostRecord, error) {
 // Returns ErrHostNotFound if absent.
 // VM-P2E Slice 2: scans generation and drain_reason.
 // VM-P2E Slice 3: scans reason_code and fence_required.
+// VM-P2E Slice 4: scans retired_at.
 func (r *Repo) GetHostByID(ctx context.Context, hostID string) (*HostRecord, error) {
 	h := &HostRecord{}
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, availability_zone, status,
-		       generation, drain_reason, reason_code, fence_required,
+		       generation, drain_reason, reason_code, fence_required, retired_at,
 		       total_cpu, total_memory_mb, total_disk_gb,
 		       used_cpu, used_memory_mb, used_disk_gb,
 		       agent_version, last_heartbeat_at, registered_at, updated_at
 		FROM hosts WHERE id = $1
 	`, hostID).Scan(
 		&h.ID, &h.AvailabilityZone, &h.Status,
-		&h.Generation, &h.DrainReason, &h.ReasonCode, &h.FenceRequired,
+		&h.Generation, &h.DrainReason, &h.ReasonCode, &h.FenceRequired, &h.RetiredAt,
 		&h.TotalCPU, &h.TotalMemoryMB, &h.TotalDiskGB,
 		&h.UsedCPU, &h.UsedMemoryMB, &h.UsedDiskGB,
 		&h.AgentVersion, &h.LastHeartbeatAt, &h.RegisteredAt, &h.UpdatedAt,
@@ -621,7 +654,7 @@ func (r *Repo) ClearFenceRequired(ctx context.Context, hostID string, fromGenera
 func (r *Repo) GetFenceRequiredHosts(ctx context.Context) ([]*HostRecord, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, availability_zone, status,
-		       generation, drain_reason, reason_code, fence_required,
+		       generation, drain_reason, reason_code, fence_required, retired_at,
 		       total_cpu, total_memory_mb, total_disk_gb,
 		       used_cpu, used_memory_mb, used_disk_gb,
 		       agent_version, last_heartbeat_at, registered_at, updated_at
@@ -639,7 +672,7 @@ func (r *Repo) GetFenceRequiredHosts(ctx context.Context) ([]*HostRecord, error)
 		h := &HostRecord{}
 		if err := rows.Scan(
 			&h.ID, &h.AvailabilityZone, &h.Status,
-			&h.Generation, &h.DrainReason, &h.ReasonCode, &h.FenceRequired,
+			&h.Generation, &h.DrainReason, &h.ReasonCode, &h.FenceRequired, &h.RetiredAt,
 			&h.TotalCPU, &h.TotalMemoryMB, &h.TotalDiskGB,
 			&h.UsedCPU, &h.UsedMemoryMB, &h.UsedDiskGB,
 			&h.AgentVersion, &h.LastHeartbeatAt, &h.RegisteredAt, &h.UpdatedAt,
@@ -683,4 +716,142 @@ func (r *Repo) CountActiveInstancesOnHost(ctx context.Context, hostID string) (i
 		  AND status IN ('requested','provisioning','running','stopping','rebooting','deleting')
 	`, hostID).Scan(&n)
 	return n, err
+}
+
+// ── VM-P2E Slice 4: Retirement lifecycle methods ──────────────────────────────
+
+// MarkHostRetiring transitions a host to 'retiring'.
+//
+// Valid fromStatuses: drained, fenced, unhealthy (see legalTransitions).
+// The transition is generation-checked (CAS).
+//
+// The transition is BLOCKED (returns activeCount>0, false, nil) if any active
+// VM workload remains on the host. Active states: requested, provisioning,
+// running, stopping, rebooting, deleting.
+//
+// Design: mirrors MarkHostDrained's workload-gate semantics so callers have a
+// consistent pattern. Retirement requires a fully empty host for safety.
+//
+// reasonCode should be ReasonOperatorRetired or a caller-supplied code.
+// An empty reasonCode is stored as NULL.
+//
+// Return values:
+//   - (n>0, false, nil): n active instances remain; retirement blocked.
+//   - (0, false, nil):   CAS failed (generation mismatch, wrong status, host missing).
+//   - (0, true,  nil):   transition succeeded; host is now 'retiring'.
+//   - (0, false, err):   DB error or illegal transition.
+//
+// Source: vm-13-03__blueprint__ §"Emergency Retirement" and
+//         §core_contracts "Stopped Instance Ephemerality".
+func (r *Repo) MarkHostRetiring(ctx context.Context, hostID string, fromGeneration int64, fromStatus, reasonCode string) (activeCount int, updated bool, err error) {
+	if err := ValidateHostTransition(fromStatus, "retiring"); err != nil {
+		return 0, false, err
+	}
+
+	// Gate on zero active workload — a host must be empty to retire safely.
+	n, err := r.CountActiveInstancesOnHost(ctx, hostID)
+	if err != nil {
+		return 0, false, fmt.Errorf("MarkHostRetiring count: %w", err)
+	}
+	if n > 0 {
+		return n, false, nil
+	}
+
+	var reasonVal interface{}
+	if reasonCode != "" {
+		reasonVal = reasonCode
+	}
+
+	res, dbErr := r.pool.Exec(ctx, `
+		UPDATE hosts
+		SET status      = 'retiring',
+		    reason_code = $3,
+		    generation  = generation + 1,
+		    updated_at  = NOW()
+		WHERE id         = $1
+		  AND generation = $2
+		  AND status     = $4
+	`, hostID, fromGeneration, reasonVal, fromStatus)
+	if dbErr != nil {
+		return 0, false, fmt.Errorf("MarkHostRetiring: %w", dbErr)
+	}
+	return 0, res.RowsAffected() == 1, nil
+}
+
+// MarkHostRetired transitions a host from 'retiring' to 'retired'.
+//
+// Sets retired_at to NOW() — this timestamp is the replacement-seam anchor:
+// Slice 5+ capacity managers will query retired hosts ordered by retired_at
+// to know which capacity holes are oldest and need backfilling first.
+//
+// The transition is generation-checked (CAS) and requires status='retiring'.
+// This is intentional: callers must go through MarkHostRetiring first unless
+// they use the direct drained→retired path via UpdateHostStatus (admin shortcut).
+//
+// Returns (true, nil) on success.
+// Returns (false, nil) on CAS failure (wrong generation or not in 'retiring').
+// Returns (false, err) on DB error.
+//
+// Source: vm-13-03__blueprint__ §"Operator Procedures for Maintenance and
+//         Emergency Retirement", §"RETIRED state — terminal".
+func (r *Repo) MarkHostRetired(ctx context.Context, hostID string, fromGeneration int64) (bool, error) {
+	res, err := r.pool.Exec(ctx, `
+		UPDATE hosts
+		SET status      = 'retired',
+		    retired_at  = NOW(),
+		    generation  = generation + 1,
+		    updated_at  = NOW()
+		WHERE id         = $1
+		  AND generation = $2
+		  AND status     = 'retiring'
+	`, hostID, fromGeneration)
+	if err != nil {
+		return false, fmt.Errorf("MarkHostRetired: %w", err)
+	}
+	return res.RowsAffected() == 1, nil
+}
+
+// GetRetiredHosts returns all hosts with status='retired', ordered by retired_at DESC.
+//
+// This is the replacement-seam query for Slice 5+ capacity planning.
+// A Slice 5 replacement orchestrator queries this surface to discover capacity
+// holes (retired hosts that have not yet been replaced) and trigger bare-metal
+// provisioning. Results are ordered oldest-retired-first so the orchestrator
+// can prioritize the longest-standing capacity deficits.
+//
+// This is a pure read — no state mutations.
+//
+// Source: vm-13-03__blueprint__ §"Capacity Rebalancing and Spare-Capacity Strategy",
+//         §components "Capacity Manager" (Slice 5+ seam).
+func (r *Repo) GetRetiredHosts(ctx context.Context) ([]*HostRecord, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, availability_zone, status,
+		       generation, drain_reason, reason_code, fence_required, retired_at,
+		       total_cpu, total_memory_mb, total_disk_gb,
+		       used_cpu, used_memory_mb, used_disk_gb,
+		       agent_version, last_heartbeat_at, registered_at, updated_at
+		FROM hosts
+		WHERE status = 'retired'
+		ORDER BY retired_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("GetRetiredHosts: %w", err)
+	}
+	defer rows.Close()
+
+	var hosts []*HostRecord
+	for rows.Next() {
+		h := &HostRecord{}
+		if err := rows.Scan(
+			&h.ID, &h.AvailabilityZone, &h.Status,
+			&h.Generation, &h.DrainReason, &h.ReasonCode, &h.FenceRequired, &h.RetiredAt,
+			&h.TotalCPU, &h.TotalMemoryMB, &h.TotalDiskGB,
+			&h.UsedCPU, &h.UsedMemoryMB, &h.UsedDiskGB,
+			&h.AgentVersion, &h.LastHeartbeatAt, &h.RegisteredAt, &h.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("GetRetiredHosts scan: %w", err)
+		}
+		hosts = append(hosts, h)
+	}
+	return hosts, rows.Err()
 }

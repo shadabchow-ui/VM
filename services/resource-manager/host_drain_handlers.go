@@ -21,13 +21,25 @@ package main
 //   - handleGetFenceRequired: GET /internal/v1/hosts/fence-required
 //     — observable list of hosts with fence_required=TRUE (fencing groundwork).
 //
+// VM-P2E Slice 4:
+//   - hostStatusResponse: added retired_at field.
+//   - handleMarkRetiring: POST /internal/v1/hosts/{id}/retire
+//     — transition to 'retiring'; blocked (202) if active workload remains.
+//   - handleMarkRetired: POST /internal/v1/hosts/{id}/retired
+//     — transition retiring→retired; sets retired_at.
+//   - handleGetRetiredHosts: GET /internal/v1/hosts/retired
+//     — replacement-seam list of all retired hosts with retired_at.
+//
 // Endpoints (all /internal/v1/hosts/{host_id}/... unless noted):
 //   POST .../drain           — mark host draining, detach stopped VMs (Slice 1)
 //   POST .../drain-complete  — attempt draining→drained (blocked if active VMs) (Slice 2)
 //   POST .../degraded        — mark host degraded with reason_code (Slice 3)
 //   POST .../unhealthy       — mark host unhealthy with reason_code; sets fence_required (Slice 3)
-//   GET  .../status          — observable host lifecycle state (Slice 1/2/3)
+//   POST .../retire          — mark host retiring (blocked if active VMs) (Slice 4)
+//   POST .../retired         — mark retiring host retired; sets retired_at (Slice 4)
+//   GET  .../status          — observable host lifecycle state (Slice 1/2/3/4)
 //   GET  /internal/v1/hosts/fence-required — list hosts needing fencing (Slice 3)
+//   GET  /internal/v1/hosts/retired        — list retired hosts (Slice 4)
 //
 // Auth: mTLS required (enforced by RequireMTLS middleware in api.go routes).
 // These endpoints are operator/control-plane tools, not user-facing.
@@ -51,6 +63,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/compute-platform/compute-platform/internal/db"
 )
@@ -108,13 +121,18 @@ type drainCompleteResponse struct {
 //   - reason_code: non-nil for hosts in degraded or unhealthy state; nil otherwise.
 //   - fence_required: true when the host's failure is ambiguous enough that
 //     fencing must complete before recovery automation may proceed.
+//
+// VM-P2E Slice 4: added RetiredAt field.
+//   - retired_at: non-nil when the host has been permanently retired.
+//     Exposes the replacement-seam timestamp for operator tooling.
 type hostStatusResponse struct {
-	HostID        string  `json:"host_id"`
-	Status        string  `json:"status"`
-	Generation    int64   `json:"generation"`
-	DrainReason   *string `json:"drain_reason,omitempty"`
-	ReasonCode    *string `json:"reason_code,omitempty"`
-	FenceRequired bool    `json:"fence_required"`
+	HostID        string     `json:"host_id"`
+	Status        string     `json:"status"`
+	Generation    int64      `json:"generation"`
+	DrainReason   *string    `json:"drain_reason,omitempty"`
+	ReasonCode    *string    `json:"reason_code,omitempty"`
+	FenceRequired bool       `json:"fence_required"`
+	RetiredAt     *time.Time `json:"retired_at,omitempty"`
 }
 
 // markDegradedRequest is the payload for POST /internal/v1/hosts/{host_id}/degraded.
@@ -598,6 +616,7 @@ func (s *server) handleGetHostStatus(w http.ResponseWriter, r *http.Request) {
 		DrainReason:   host.DrainReason,
 		ReasonCode:    host.ReasonCode,
 		FenceRequired: host.FenceRequired,
+		RetiredAt:     host.RetiredAt,
 	})
 }
 
@@ -606,4 +625,300 @@ func (s *server) handleGetHostStatus(w http.ResponseWriter, r *http.Request) {
 // isIllegalTransitionErr returns true when err wraps or equals ErrIllegalHostTransition.
 func isIllegalTransitionErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), db.ErrIllegalHostTransition.Error())
+}
+
+// ── VM-P2E Slice 4: Retirement request/response types ────────────────────────
+
+// retireRequest is the payload for POST /internal/v1/hosts/{host_id}/retire.
+//
+// Initiates retirement by transitioning the host to 'retiring'.
+// Blocked if active VM workload remains on the host.
+type retireRequest struct {
+	// Generation is the caller's expected current generation of the host record.
+	// Required for CAS. Obtain from GET .../status first.
+	Generation int64 `json:"generation"`
+	// FromStatus is the caller's expected current status.
+	// Must be one of: drained, fenced, unhealthy (see legalTransitions).
+	FromStatus string `json:"from_status"`
+	// ReasonCode is an optional machine-readable code for the retirement.
+	// Defaults to OPERATOR_RETIRED if omitted.
+	ReasonCode string `json:"reason_code,omitempty"`
+}
+
+// retireResponse is returned by POST .../retire.
+type retireResponse struct {
+	HostID              string  `json:"host_id"`
+	Status              string  `json:"status"`
+	Generation          int64   `json:"generation"`
+	ReasonCode          *string `json:"reason_code,omitempty"`
+	// ActiveInstanceCount is non-zero when the transition was blocked.
+	// In that case HTTP status is 202 Accepted and Status is still the fromStatus.
+	ActiveInstanceCount int  `json:"active_instance_count"`
+	// Blocked is true when the transition was not applied due to active workload.
+	Blocked bool `json:"blocked"`
+}
+
+// retiredCompleteRequest is the payload for POST /internal/v1/hosts/{host_id}/retired.
+type retiredCompleteRequest struct {
+	// Generation is the current generation of the host record (post-retire).
+	// Obtain from GET .../status or from the retire response.
+	Generation int64 `json:"generation"`
+}
+
+// retiredCompleteResponse is returned by POST .../retired.
+type retiredCompleteResponse struct {
+	HostID     string     `json:"host_id"`
+	Status     string     `json:"status"`
+	Generation int64      `json:"generation"`
+	RetiredAt  *time.Time `json:"retired_at,omitempty"`
+}
+
+// retiredListResponse is returned by GET /internal/v1/hosts/retired.
+type retiredListResponse struct {
+	Hosts []retiredListEntry `json:"hosts"`
+	Count int                `json:"count"`
+}
+
+// retiredListEntry represents one host in the retired list.
+// RetiredAt is the replacement-seam anchor: Slice 5+ capacity planners use it
+// to calculate how long a capacity hole has existed and prioritise backfill.
+type retiredListEntry struct {
+	HostID     string     `json:"host_id"`
+	Status     string     `json:"status"`
+	Generation int64      `json:"generation"`
+	RetiredAt  *time.Time `json:"retired_at,omitempty"`
+	ReasonCode *string    `json:"reason_code,omitempty"`
+}
+
+// ── VM-P2E Slice 4: Handlers ──────────────────────────────────────────────────
+
+// handleMarkRetiring handles POST /internal/v1/hosts/{host_id}/retire.
+//
+// Transitions the host to 'retiring'. Blocked (returns 202 Accepted) if any
+// active VM workload remains. Callers should poll again when workloads finish.
+//
+// The normal retirement path is:
+//   drain → drain-complete → retire → retired
+//
+// Requires from_status in request so transition validation is server-side
+// without a redundant DB read in the hot path (same pattern as Slice 3).
+//
+// Error mapping:
+//   - 400: invalid JSON or missing required fields.
+//   - 404: host not found.
+//   - 409: generation mismatch or host not in expected status.
+//   - 422: illegal state transition (e.g., ready → retiring).
+//   - 202: blocked; active instances remain on host.
+//   - 200: host transitioned to 'retiring'.
+//   - 500: unexpected DB error.
+//
+// Source: vm-13-03__blueprint__ §"Emergency Retirement" operator procedure,
+//         §core_contracts "Stopped Instance Ephemerality".
+func (s *server) handleMarkRetiring(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	hostID := extractPathSegment(r.URL.Path, "hosts", "retire")
+	if hostID == "" {
+		writeError(w, http.StatusBadRequest, "missing host_id in path")
+		return
+	}
+
+	var req retireRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.FromStatus == "" {
+		writeError(w, http.StatusBadRequest, "from_status is required")
+		return
+	}
+	// Default reason code when caller omits it.
+	if req.ReasonCode == "" {
+		req.ReasonCode = db.ReasonOperatorRetired
+	}
+
+	activeCount, updated, err := s.inventory.RetireHost(r.Context(), hostID, req.Generation, req.FromStatus, req.ReasonCode)
+	if err != nil {
+		if isIllegalTransitionErr(err) {
+			writeError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		s.log.Error("RetireHost failed", "host_id", hostID, "error", err)
+		writeError(w, http.StatusInternalServerError, "retire failed: "+err.Error())
+		return
+	}
+
+	if !updated && activeCount == 0 {
+		// CAS failed: generation mismatch or wrong fromStatus.
+		host, lookupErr := s.inventory.repo.GetHostByID(r.Context(), hostID)
+		if lookupErr != nil || host == nil {
+			writeError(w, http.StatusNotFound, "host not found: "+hostID)
+			return
+		}
+		writeError(w, http.StatusConflict, "generation mismatch or host not in expected status")
+		return
+	}
+
+	if activeCount > 0 {
+		// Transition blocked by active workload. Return 202 Accepted.
+		host, _ := s.inventory.repo.GetHostByID(r.Context(), hostID)
+		var gen int64
+		var currentStatus = req.FromStatus
+		var reasonCode *string
+		if host != nil {
+			gen = host.Generation
+			currentStatus = host.Status
+			reasonCode = host.ReasonCode
+		}
+		writeJSON(w, http.StatusAccepted, retireResponse{
+			HostID:              hostID,
+			Status:              currentStatus,
+			Generation:          gen,
+			ReasonCode:          reasonCode,
+			ActiveInstanceCount: activeCount,
+			Blocked:             true,
+		})
+		return
+	}
+
+	// Transition succeeded. Re-read for post-transition generation and reason_code.
+	host, err := s.inventory.repo.GetHostByID(r.Context(), hostID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "status lookup failed after retire")
+		return
+	}
+
+	s.log.Info("host marked retiring",
+		"host_id", hostID,
+		"reason_code", req.ReasonCode,
+		"generation", host.Generation,
+	)
+
+	writeJSON(w, http.StatusOK, retireResponse{
+		HostID:              host.ID,
+		Status:              host.Status,
+		Generation:          host.Generation,
+		ReasonCode:          host.ReasonCode,
+		ActiveInstanceCount: 0,
+		Blocked:             false,
+	})
+}
+
+// handleMarkRetired handles POST /internal/v1/hosts/{host_id}/retired.
+//
+// Transitions the host from 'retiring' to 'retired'. Sets retired_at to NOW().
+// This is the terminal state — no further status transitions are allowed from 'retired'.
+//
+// retired_at is the replacement-seam anchor: it is returned in the response
+// and persisted in the DB for Slice 5+ capacity planning queries.
+//
+// Error mapping:
+//   - 400: invalid JSON.
+//   - 404: host not found.
+//   - 409: generation mismatch or host not in 'retiring' state.
+//   - 200: host transitioned to 'retired'; retired_at returned.
+//   - 500: unexpected DB error.
+//
+// Source: vm-13-03__blueprint__ §"RETIRED state — terminal",
+//         §components "Capacity Manager" (Slice 5+ seam via retired_at).
+func (s *server) handleMarkRetired(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	hostID := extractPathSegment(r.URL.Path, "hosts", "retired")
+	if hostID == "" {
+		writeError(w, http.StatusBadRequest, "missing host_id in path")
+		return
+	}
+
+	var req retiredCompleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	updated, err := s.inventory.CompleteRetirement(r.Context(), hostID, req.Generation)
+	if err != nil {
+		s.log.Error("CompleteRetirement failed", "host_id", hostID, "error", err)
+		writeError(w, http.StatusInternalServerError, "retired failed: "+err.Error())
+		return
+	}
+
+	if !updated {
+		// CAS failed: generation mismatch or host not in 'retiring'.
+		host, lookupErr := s.inventory.repo.GetHostByID(r.Context(), hostID)
+		if lookupErr != nil || host == nil {
+			writeError(w, http.StatusNotFound, "host not found: "+hostID)
+			return
+		}
+		writeError(w, http.StatusConflict, "host is not in retiring state or generation mismatch")
+		return
+	}
+
+	// Re-read for post-transition state including retired_at.
+	host, err := s.inventory.repo.GetHostByID(r.Context(), hostID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "status lookup failed after retired")
+		return
+	}
+
+	s.log.Info("host retired",
+		"host_id", hostID,
+		"retired_at", host.RetiredAt,
+		"generation", host.Generation,
+	)
+
+	writeJSON(w, http.StatusOK, retiredCompleteResponse{
+		HostID:     host.ID,
+		Status:     host.Status,
+		Generation: host.Generation,
+		RetiredAt:  host.RetiredAt,
+	})
+}
+
+// handleGetRetiredHosts handles GET /internal/v1/hosts/retired.
+//
+// Returns all hosts with status='retired', ordered by retired_at DESC.
+// This is the replacement-seam query surface for Slice 5+ capacity planning.
+// An empty list means no hosts are permanently retired and awaiting replacement.
+// A non-empty list means capacity holes exist; Slice 5+ automation will consume
+// this list to trigger bare-metal provisioning for replacement hosts.
+//
+// This is a pure read endpoint — no state mutations.
+// Status 200 always; empty list when no hosts are retired.
+//
+// Source: vm-13-03__blueprint__ §components "Capacity Manager" (Slice 5+ seam).
+func (s *server) handleGetRetiredHosts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	hosts, err := s.inventory.GetRetiredHosts(r.Context())
+	if err != nil {
+		s.log.Error("GetRetiredHosts failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "retired-hosts lookup failed")
+		return
+	}
+
+	entries := make([]retiredListEntry, 0, len(hosts))
+	for _, h := range hosts {
+		entries = append(entries, retiredListEntry{
+			HostID:     h.ID,
+			Status:     h.Status,
+			Generation: h.Generation,
+			RetiredAt:  h.RetiredAt,
+			ReasonCode: h.ReasonCode,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, retiredListResponse{
+		Hosts: entries,
+		Count: len(entries),
+	})
 }

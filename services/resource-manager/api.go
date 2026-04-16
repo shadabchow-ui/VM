@@ -9,10 +9,13 @@ package main
 //   GET  /internal/v1/hosts                           ← scheduler reads available hosts (mTLS required)
 //   POST /internal/v1/hosts/{host_id}/drain           ← VM-P2E Slice 1: operator drain
 //   POST /internal/v1/hosts/{host_id}/drain-complete  ← VM-P2E Slice 2: explicit draining→drained
-//   GET  /internal/v1/hosts/{host_id}/status          ← VM-P2E Slice 1/2/3: observable host state
+//   GET  /internal/v1/hosts/{host_id}/status          ← VM-P2E Slice 1/2/3/4: observable host state
 //   POST /internal/v1/hosts/{host_id}/degraded        ← VM-P2E Slice 3: mark host degraded
 //   POST /internal/v1/hosts/{host_id}/unhealthy       ← VM-P2E Slice 3: mark host unhealthy
 //   GET  /internal/v1/hosts/fence-required            ← VM-P2E Slice 3: fencing groundwork list
+//   POST /internal/v1/hosts/{host_id}/retire          ← VM-P2E Slice 4: initiate retirement
+//   POST /internal/v1/hosts/{host_id}/retired         ← VM-P2E Slice 4: complete retirement
+//   GET  /internal/v1/hosts/retired                   ← VM-P2E Slice 4: replacement-seam list
 //
 // Source: IMPLEMENTATION_PLAN_V1 §B2, AUTH_OWNERSHIP_MODEL_V1 §6,
 //         05-02-host-runtime-worker-design.md §Bootstrap + §Heartbeating,
@@ -199,6 +202,10 @@ func (s *server) routes() http.Handler {
 	// VM-P2E Slice 3: /fence-required is a fixed subpath under /hosts — register
 	// before the wildcard /hosts/ handler to prevent shadowing.
 	protected.HandleFunc("/internal/v1/hosts/fence-required", s.handleGetFenceRequired)
+	// VM-P2E Slice 4: /retired is a fixed subpath — register before the wildcard
+	// /hosts/ handler. Must come after /fence-required (both are fixed paths;
+	// order between them does not matter, but both must precede /hosts/).
+	protected.HandleFunc("/internal/v1/hosts/retired", s.handleGetRetiredHosts)
 	protected.HandleFunc("/internal/v1/hosts/", s.handleHostsSubpath)
 	protected.HandleFunc("/internal/v1/hosts", s.handleListHosts)
 
@@ -241,13 +248,16 @@ func corsMiddleware(next http.Handler) http.Handler {
 // VM-P2E Slice 1: added /drain and /status.
 // VM-P2E Slice 2: added /drain-complete.
 // VM-P2E Slice 3: added /degraded and /unhealthy.
+// VM-P2E Slice 4: added /retire and /retired.
 //
 // Ordering rules:
 //   - /drain-complete must be checked before /drain (HasSuffix("/drain") is true
 //     for "/drain-complete" paths).
+//   - /retired must be checked before /retire (HasSuffix("/retire") is true
+//     for "/retired" paths — same shadow risk as drain/drain-complete).
 //   - /degraded and /unhealthy are unambiguous.
-//   - /fence-required is a fixed path registered directly on the protected mux,
-//     so it does NOT flow through this handler.
+//   - /fence-required and /retired (the list endpoint) are fixed paths registered
+//     directly on the protected mux, so they do NOT flow through this handler.
 //
 // Source: vm-13-03__blueprint__ §components "Fleet Management Service" REST API.
 func (s *server) handleHostsSubpath(w http.ResponseWriter, r *http.Request) {
@@ -270,9 +280,18 @@ func (s *server) handleHostsSubpath(w http.ResponseWriter, r *http.Request) {
 		// POST /internal/v1/hosts/{host_id}/unhealthy
 		// VM-P2E Slice 3: mark host unhealthy; sets fence_required for ambiguous failures.
 		s.handleMarkUnhealthy(w, r)
+	case strings.HasSuffix(r.URL.Path, "/retired"):
+		// POST /internal/v1/hosts/{host_id}/retired
+		// VM-P2E Slice 4: complete retirement (retiring→retired); sets retired_at.
+		// Must be checked before /retire to avoid suffix shadow.
+		s.handleMarkRetired(w, r)
+	case strings.HasSuffix(r.URL.Path, "/retire"):
+		// POST /internal/v1/hosts/{host_id}/retire
+		// VM-P2E Slice 4: initiate retirement (→retiring); blocked if active VMs remain.
+		s.handleMarkRetiring(w, r)
 	case strings.HasSuffix(r.URL.Path, "/status"):
 		// GET /internal/v1/hosts/{host_id}/status
-		// VM-P2E Slice 1/2/3: observable host lifecycle state.
+		// VM-P2E Slice 1/2/3/4: observable host lifecycle state.
 		s.handleGetHostStatus(w, r)
 	default:
 		http.NotFound(w, r)

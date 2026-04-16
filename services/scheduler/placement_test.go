@@ -97,3 +97,39 @@ func TestCanFit_ReadyHost_FullyLoaded_ReturnsFalse(t *testing.T) {
 		t.Error("expected CanFit=false: host is fully loaded")
 	}
 }
+
+// ── VM-P2E Slice 4: Retirement scheduler contract ─────────────────────────────
+//
+// These tests make the scheduler contract for retiring/retired hosts explicit.
+// The table-driven test above already covers both statuses through the generic
+// non-ready case; these named tests document the Slice 4 contract by name so
+// any future change to CanFit that accidentally re-admits retiring or retired
+// hosts produces a clearly named failure.
+
+func TestCanFit_RetiringHost_NeverReceivesNewPlacements(t *testing.T) {
+	// A host in 'retiring' state has been marked for permanent removal.
+	// It must never receive new VM placements, regardless of available resources.
+	h := &HostSummary{
+		Status:        "retiring",
+		TotalCPU:      64, UsedCPU: 0,
+		TotalMemoryMB: 262144, UsedMemoryMB: 0,
+		TotalDiskGB:   2000, UsedDiskGB: 0,
+	}
+	if h.CanFit(1, 512, 1) {
+		t.Error("retiring host must never receive new VM placements regardless of free resources")
+	}
+}
+
+func TestCanFit_RetiredHost_NeverReceivesNewPlacements(t *testing.T) {
+	// A host in 'retired' state is permanently removed from service.
+	// Scheduler must exclude it unconditionally — it is a terminal state.
+	h := &HostSummary{
+		Status:        "retired",
+		TotalCPU:      64, UsedCPU: 0,
+		TotalMemoryMB: 262144, UsedMemoryMB: 0,
+		TotalDiskGB:   2000, UsedDiskGB: 0,
+	}
+	if h.CanFit(1, 512, 1) {
+		t.Error("retired host must never receive new VM placements — terminal state")
+	}
+}

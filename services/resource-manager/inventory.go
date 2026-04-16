@@ -16,6 +16,11 @@ package main
 //     for ambiguous failure reason codes.
 //   - ClearFenceRequired: new — operator-initiated fence_required clearance.
 //   - GetFenceRequiredHosts: new — observable query for hosts needing fencing.
+//
+// VM-P2E Slice 4 additions:
+//   - RetireHost: transitions a host to 'retiring'; blocked if active workload remains.
+//   - CompleteRetirement: transitions a retiring host to 'retired'; sets retired_at.
+//   - GetRetiredHosts: replacement-seam query returning all retired hosts.
 
 import (
 	"context"
@@ -296,4 +301,63 @@ func generateRawToken() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// ── VM-P2E Slice 4: Retirement ────────────────────────────────────────────────
+
+// RetireHost transitions a host to 'retiring'.
+//
+// The transition is gated on zero active VM workload — a host must be empty
+// to retire safely. If active workload remains, returns (activeCount, false, nil)
+// and the caller should poll again after workloads complete.
+//
+// fromStatus must be one of: drained, fenced, unhealthy (see db.legalTransitions).
+// fromGeneration is the expected current generation for CAS.
+// reasonCode should be db.ReasonOperatorRetired or a caller-supplied code.
+//
+// Returns:
+//   - (n>0, false, nil): n active instances remain; retirement blocked.
+//   - (0, false, nil):   CAS failed (generation mismatch or wrong fromStatus).
+//   - (0, true,  nil):   transition succeeded; host is now 'retiring'.
+//   - (0, false, err):   DB error or illegal transition.
+//
+// Source: vm-13-03__blueprint__ §"Emergency Retirement", §"Operator Procedures".
+func (i *HostInventory) RetireHost(ctx context.Context, hostID string, fromGeneration int64, fromStatus, reasonCode string) (activeCount int, updated bool, err error) {
+	n, ok, err := i.repo.MarkHostRetiring(ctx, hostID, fromGeneration, fromStatus, reasonCode)
+	if err != nil {
+		return 0, false, fmt.Errorf("RetireHost: %w", err)
+	}
+	return n, ok, nil
+}
+
+// CompleteRetirement transitions a host from 'retiring' to 'retired'.
+//
+// Sets retired_at to the current wall-clock time. This timestamp is the
+// replacement-seam anchor for Slice 5+ capacity planning.
+//
+// fromGeneration is the expected current generation for CAS (must be the
+// generation returned after RetireHost succeeded).
+//
+// Returns (true, nil) on success.
+// Returns (false, nil) on CAS failure (wrong generation or not in 'retiring').
+// Returns (false, err) on DB error.
+//
+// Source: vm-13-03__blueprint__ §"RETIRED state — terminal".
+func (i *HostInventory) CompleteRetirement(ctx context.Context, hostID string, fromGeneration int64) (updated bool, err error) {
+	ok, err := i.repo.MarkHostRetired(ctx, hostID, fromGeneration)
+	if err != nil {
+		return false, fmt.Errorf("CompleteRetirement: %w", err)
+	}
+	return ok, nil
+}
+
+// GetRetiredHosts returns all hosts with status='retired', ordered by retired_at DESC.
+//
+// This is the replacement-seam query surface. Slice 5+ capacity planners use
+// this to discover capacity holes and trigger bare-metal provisioning for hosts
+// that have been retired but not yet replaced.
+//
+// Source: vm-13-03__blueprint__ §components "Capacity Manager" (Slice 5+ seam).
+func (i *HostInventory) GetRetiredHosts(ctx context.Context) ([]*db.HostRecord, error) {
+	return i.repo.GetRetiredHosts(ctx)
 }
