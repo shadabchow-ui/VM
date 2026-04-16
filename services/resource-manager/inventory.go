@@ -157,3 +157,19 @@ func generateRawToken() (string, error) {
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
+
+
+func (i *HostInventory) DrainHost(ctx context.Context, hostID string, reason string) (int, bool, error) {
+	ok, err := i.repo.UpdateHostStatus(ctx, hostID, 0, "draining", reason)
+	if err != nil {
+		return 0, false, err
+	}
+	if err := i.repo.DetachStoppedInstancesFromHost(ctx, hostID); err != nil {
+		return 0, ok, err
+	}
+	n, err := i.repo.CountActiveInstancesOnHost(ctx, hostID)
+	if err != nil {
+		return 0, ok, err
+	}
+	return n, ok, nil
+}

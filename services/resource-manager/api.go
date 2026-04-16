@@ -3,13 +3,16 @@ package main
 // api.go — Resource Manager HTTP handlers.
 //
 // Endpoints:
-//   POST /internal/v1/certificate_signing_request  ← bootstrap-token + CSR → signed cert
-//   POST /internal/v1/hosts/register               ← Host Agent startup (mTLS required)
-//   POST /internal/v1/hosts/{host_id}/heartbeat    ← periodic inventory update (mTLS required)
-//   GET  /internal/v1/hosts                        ← scheduler reads available hosts (mTLS required)
+//   POST /internal/v1/certificate_signing_request     ← bootstrap-token + CSR → signed cert
+//   POST /internal/v1/hosts/register                  ← Host Agent startup (mTLS required)
+//   POST /internal/v1/hosts/{host_id}/heartbeat       ← periodic inventory update (mTLS required)
+//   GET  /internal/v1/hosts                           ← scheduler reads available hosts (mTLS required)
+//   POST /internal/v1/hosts/{host_id}/drain           ← VM-P2E Slice 1: operator drain
+//   GET  /internal/v1/hosts/{host_id}/status          ← VM-P2E Slice 1: observable host lifecycle state
 //
 // Source: IMPLEMENTATION_PLAN_V1 §B2, AUTH_OWNERSHIP_MODEL_V1 §6,
-//         05-02-host-runtime-worker-design.md §Bootstrap + §Heartbeating.
+//         05-02-host-runtime-worker-design.md §Bootstrap + §Heartbeating,
+//         vm-13-03__blueprint__ §components "Fleet Management Service".
 //
 // Auth model:
 //   /certificate_signing_request: validated by bootstrap token only (no cert yet).
@@ -275,13 +278,25 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// handleHostsSubpath routes /internal/v1/hosts/{id}/heartbeat to the right handler.
+// handleHostsSubpath routes /internal/v1/hosts/{id}/* to the right handler.
+//
+// VM-P2E Slice 1: added /drain and /status dispatch.
+// Source: vm-13-03__blueprint__ §components "Fleet Management Service" REST API.
 func (s *server) handleHostsSubpath(w http.ResponseWriter, r *http.Request) {
-	if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+	switch {
+	case strings.HasSuffix(r.URL.Path, "/heartbeat"):
 		s.handleHeartbeat(w, r)
-		return
+	case strings.HasSuffix(r.URL.Path, "/drain"):
+		// POST /internal/v1/hosts/{host_id}/drain
+		// VM-P2E Slice 1: operator-initiated single-host drain.
+		s.handleDrainHost(w, r)
+	case strings.HasSuffix(r.URL.Path, "/status"):
+		// GET /internal/v1/hosts/{host_id}/status
+		// VM-P2E Slice 1: observable host lifecycle state.
+		s.handleGetHostStatus(w, r)
+	default:
+		http.NotFound(w, r)
 	}
-	http.NotFound(w, r)
 }
 
 // --- helpers ---

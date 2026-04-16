@@ -272,3 +272,37 @@ func (r *Repo) InsertBootstrapToken(ctx context.Context, tokenHash, hostID strin
 	`, tokenHash, hostID, expiresAt)
 	return err
 }
+
+
+func (r *Repo) UpdateHostStatus(ctx context.Context, hostID string, fromGeneration int64, newStatus, drainReason string) (bool, error) {
+	res, err := r.pool.Exec(ctx, `
+		UPDATE hosts
+		SET status = $2,
+		    drain_reason = $3,
+		    generation = generation + 1
+		WHERE id = $1 AND generation = $4
+	`, hostID, newStatus, drainReason, fromGeneration)
+	if err != nil {
+		return false, err
+	}
+	return res.RowsAffected() == 1, nil
+}
+
+func (r *Repo) DetachStoppedInstancesFromHost(ctx context.Context, hostID string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE instances
+		SET host_id = NULL
+		WHERE host_id = $1 AND status = 'stopped'
+	`, hostID)
+	return err
+}
+
+func (r *Repo) CountActiveInstancesOnHost(ctx context.Context, hostID string) (int, error) {
+	var n int
+	err := r.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM instances
+		WHERE host_id = $1 AND status IN ('requested','provisioning','running','stopping','rebooting','deleting')
+	`, hostID).Scan(&n)
+	return n, err
+}

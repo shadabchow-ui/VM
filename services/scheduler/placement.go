@@ -40,9 +40,23 @@ func (h *HostSummary) AvailableMemoryMB() int { return h.TotalMemoryMB - h.UsedM
 func (h *HostSummary) AvailableDiskGB() int   { return h.TotalDiskGB - h.UsedDiskGB }
 
 // CanFit reports whether the host has enough free resources.
+//
+// VM-P2E Slice 1: draining, drained, degraded, unhealthy, fenced, retired, offline,
+// and maintenance hosts are ALL excluded from placement. Only status=ready qualifies.
+//
+// This matches ListReadyHosts on the DB side — the scheduler's admission filter and
+// the DB query must agree on which statuses are schedulable.
+//
+// Source: vm-13-03__blueprint__ §core_contracts "Host State Atomicity" (drain must be
+//         immediately visible to scheduler), 05-02 §Placement.
 func (h *HostSummary) CanFit(cpuCores, memoryMB, diskGB int) bool {
-	return h.Status == "ready" &&
-		h.AvailableCPU() >= cpuCores &&
+	// Only status=ready hosts receive new placements.
+	// Draining hosts that were ready before the drain command must stop receiving
+	// new VMs immediately — the status change is the admission gate.
+	if h.Status != "ready" {
+		return false
+	}
+	return h.AvailableCPU() >= cpuCores &&
 		h.AvailableMemoryMB() >= memoryMB &&
 		h.AvailableDiskGB() >= diskGB
 }
