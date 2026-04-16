@@ -8,7 +8,8 @@ package main
 //   POST /internal/v1/hosts/{host_id}/heartbeat       ← periodic inventory update (mTLS required)
 //   GET  /internal/v1/hosts                           ← scheduler reads available hosts (mTLS required)
 //   POST /internal/v1/hosts/{host_id}/drain           ← VM-P2E Slice 1: operator drain
-//   GET  /internal/v1/hosts/{host_id}/status          ← VM-P2E Slice 1: observable host lifecycle state
+//   POST /internal/v1/hosts/{host_id}/drain-complete  ← VM-P2E Slice 2: explicit draining→drained
+//   GET  /internal/v1/hosts/{host_id}/status          ← VM-P2E Slice 1/2: observable host state
 //
 // Source: IMPLEMENTATION_PLAN_V1 §B2, AUTH_OWNERSHIP_MODEL_V1 §6,
 //         05-02-host-runtime-worker-design.md §Bootstrap + §Heartbeating,
@@ -42,9 +43,6 @@ type csrResponse struct {
 }
 
 // handleCSR handles POST /internal/v1/certificate_signing_request.
-// This is the ONLY unauthenticated endpoint in the Resource Manager.
-// It is protected by the bootstrap token, not a client cert.
-// After this call, the host agent has a signed cert and all subsequent calls use mTLS.
 func (s *server) handleCSR(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -61,23 +59,17 @@ func (s *server) handleCSR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate and consume the bootstrap token.
-	// ConsumeBootstrapToken is atomic: if it returns a hostID, the token is now used.
-	// Source: AUTH_OWNERSHIP_MODEL_V1 §6.
 	tokenHostID, err := s.inventory.ConsumeBootstrapToken(r.Context(), req.BootstrapToken)
 	if err != nil {
-		// Do not reveal whether the token exists. Always 401.
 		writeError(w, http.StatusUnauthorized, "invalid bootstrap token")
 		return
 	}
 
-	// Verify the host_id in the request matches what the token was issued for.
 	if tokenHostID != req.HostID {
 		writeError(w, http.StatusUnauthorized, "host_id does not match bootstrap token")
 		return
 	}
 
-	// Sign the CSR. The CA verifies the CN matches host-{host_id}.
 	certPEM, err := s.ca.SignCSR([]byte(req.CSRPEM), req.HostID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "CSR signing failed: "+err.Error())
@@ -91,9 +83,6 @@ func (s *server) handleCSR(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRegister handles POST /internal/v1/hosts/register.
-// RequireMTLS middleware runs first — host_id is extracted from the cert CN.
-// Idempotent: re-registration after agent restart is normal operation.
-// Source: 05-02-host-runtime-worker-design.md §Bootstrap step 8.
 func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -102,7 +91,6 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	certHostID, ok := auth.HostIDFromCtx(r.Context())
 	if !ok {
-		// Middleware should have caught this; defence-in-depth.
 		writeError(w, http.StatusUnauthorized, "not authenticated")
 		return
 	}
@@ -126,9 +114,6 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleHeartbeat handles POST /internal/v1/hosts/{host_id}/heartbeat.
-// host_id in the URL path is verified to match the cert CN — an agent may not
-// update another host's heartbeat.
-// Source: RUNTIMESERVICE_GRPC_V1 §8.
 func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -141,15 +126,12 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract {host_id} from path: /internal/v1/hosts/{host_id}/heartbeat
 	pathHostID := extractPathSegment(r.URL.Path, "hosts", "heartbeat")
 	if pathHostID == "" {
 		writeError(w, http.StatusBadRequest, "missing host_id in path")
 		return
 	}
 
-	// A host agent may only update its own heartbeat.
-	// Source: AUTH_OWNERSHIP_MODEL_V1 §6 (CN authorises access to own resources).
 	if certHostID != pathHostID {
 		writeError(w, http.StatusForbidden, "cert host_id does not match path host_id")
 		return
@@ -170,9 +152,6 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleListHosts handles GET /internal/v1/hosts.
-// Returns all ready, recently-heartbeating hosts for scheduler consumption.
-// Requires mTLS — only authenticated internal services (scheduler, worker) call this.
-// Source: IMPLEMENTATION_PLAN_V1 §C3 (Scheduler depends on Resource Manager).
 func (s *server) handleListHosts(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -190,7 +169,6 @@ func (s *server) handleListHosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return minimal fields needed by the scheduler.
 	type hostSummary struct {
 		ID               string `json:"id"`
 		AvailabilityZone string `json:"availability_zone"`
@@ -238,33 +216,24 @@ func (s *server) routes() http.Handler {
 	mux.Handle("/internal/v1/hosts", auth.RequireMTLS(protected))
 	mux.Handle("/internal/v1/hosts/", auth.RequireMTLS(protected))
 
-	// Public instance management API — PASS 1: create, get, list.
-	// Auth middleware added in PASS 2.
+	// Public instance management API.
 	s.registerInstanceRoutes(mux)
 
 	// M7: SSH key management.
 	s.registerSSHKeyRoutes(mux)
 
 	// VM-P2B: Volume management API.
-	// Source: P2_VOLUME_MODEL.md §8.
 	s.registerVolumeRoutes(mux)
 
 	// VM-P2B-S2: Snapshot management API.
-	// Source: P2_IMAGE_SNAPSHOT_MODEL.md §4.
 	s.registerSnapshotRoutes(mux)
 
 	// VM-P2D: Project management API.
-	// Source: P2_PROJECT_RBAC_MODEL.md §9.
 	s.registerProjectRoutes(mux)
 
-	// M7: CORS middleware so the browser console SPA can call the API.
-	// In production this is handled by the API gateway / reverse proxy.
 	return corsMiddleware(mux)
 }
 
-// corsMiddleware adds CORS headers to allow the console SPA (running on a
-// different origin during development) to reach the resource-manager API.
-// Source: M7 console requirement — browser-accessible API.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -280,19 +249,29 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 // handleHostsSubpath routes /internal/v1/hosts/{id}/* to the right handler.
 //
-// VM-P2E Slice 1: added /drain and /status dispatch.
+// VM-P2E Slice 1: added /drain and /status.
+// VM-P2E Slice 2: added /drain-complete.
+//
+// Note: drain-complete must be matched before drain to avoid the drain suffix
+// matching drain-complete paths (HasSuffix("/drain") would match "drain-complete"
+// only if we checked after drain-complete — ordering matters here).
+//
 // Source: vm-13-03__blueprint__ §components "Fleet Management Service" REST API.
 func (s *server) handleHostsSubpath(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasSuffix(r.URL.Path, "/heartbeat"):
 		s.handleHeartbeat(w, r)
+	case strings.HasSuffix(r.URL.Path, "/drain-complete"):
+		// POST /internal/v1/hosts/{host_id}/drain-complete
+		// VM-P2E Slice 2: explicit draining→drained transition.
+		s.handleCompleteDrainHost(w, r)
 	case strings.HasSuffix(r.URL.Path, "/drain"):
 		// POST /internal/v1/hosts/{host_id}/drain
 		// VM-P2E Slice 1: operator-initiated single-host drain.
 		s.handleDrainHost(w, r)
 	case strings.HasSuffix(r.URL.Path, "/status"):
 		// GET /internal/v1/hosts/{host_id}/status
-		// VM-P2E Slice 1: observable host lifecycle state.
+		// VM-P2E Slice 1/2: observable host lifecycle state.
 		s.handleGetHostStatus(w, r)
 	default:
 		http.NotFound(w, r)
@@ -318,7 +297,6 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // extractPathSegment extracts the segment between 'before' and 'after' in the URL path.
 // Example: extractPathSegment("/internal/v1/hosts/host-abc/heartbeat", "hosts", "heartbeat") → "host-abc"
 func extractPathSegment(path, before, after string) string {
-	// Find the segment between /before/ and /after
 	prefix := fmt.Sprintf("/%s/", before)
 	suffix := fmt.Sprintf("/%s", after)
 	idx := strings.Index(path, prefix)

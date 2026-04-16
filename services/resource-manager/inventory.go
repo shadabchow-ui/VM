@@ -5,6 +5,10 @@ package main
 // Source: IMPLEMENTATION_PLAN_V1 §B2 (Resource Manager v1),
 //         05-02-host-runtime-worker-design.md §Bootstrap + §Heartbeating,
 //         AUTH_OWNERSHIP_MODEL_V1 §6 (bootstrap token lifecycle).
+//
+// VM-P2E Slice 2 additions:
+//   - DrainHost: now accepts and forwards fromGeneration (was always 0 in Slice 1).
+//   - CompleteDrain: new — attempts draining→drained transition via MarkHostDrained.
 
 import (
 	"context"
@@ -124,6 +128,63 @@ func (s *HostInventory) IssueBootstrapToken(ctx context.Context, hostID string) 
 	return rawToken, nil
 }
 
+// DrainHost transitions a host to 'draining', detaches stopped VMs, and
+// returns the active running VM count so callers know whether drain is complete.
+//
+// fromGeneration is the caller's expected current generation of the host record.
+// A mismatch returns (0, false, nil) — the handler maps this to 409 Conflict.
+//
+// VM-P2E Slice 1: existed but always passed fromGeneration=0 (bug fixed in Slice 2).
+// VM-P2E Slice 2: fromGeneration is now forwarded from the handler's request body.
+//
+// Source: vm-13-03__blueprint__ §interaction_or_ops_contract "Operator initiates
+//         single-host drain".
+func (i *HostInventory) DrainHost(ctx context.Context, hostID string, fromGeneration int64, reason string) (runningCount int, updated bool, err error) {
+	// Attempt CAS: ready → draining.
+	// If the host is already draining (repeated call), the generation check
+	// will fail (generation was already incremented). The handler treats this
+	// as a 409 unless the caller re-reads the current generation first.
+	ok, err := i.repo.UpdateHostStatus(ctx, hostID, fromGeneration, "draining", reason)
+	if err != nil {
+		return 0, false, fmt.Errorf("DrainHost transition: %w", err)
+	}
+	if !ok {
+		// CAS failed: either generation mismatch or host not found.
+		// Return (0, false, nil) — the handler discriminates via GetHostByID.
+		return 0, false, nil
+	}
+
+	// Detach stopped VMs so they don't block drain completion.
+	// Idempotent: safe even if some instances were already detached.
+	if err := i.repo.DetachStoppedInstancesFromHost(ctx, hostID); err != nil {
+		return 0, true, fmt.Errorf("DrainHost detach stopped: %w", err)
+	}
+
+	// Count remaining active workload for the caller's response.
+	n, err := i.repo.CountActiveInstancesOnHost(ctx, hostID)
+	if err != nil {
+		return 0, true, fmt.Errorf("DrainHost count active: %w", err)
+	}
+	return n, true, nil
+}
+
+// CompleteDrain attempts the draining → drained transition for a host.
+//
+// Returns:
+//   - (activeCount>0, false, nil): drain blocked; active workload count returned.
+//   - (0, false, nil):             CAS failed (wrong generation or not in draining state).
+//   - (0, true,  nil):             transition succeeded; host is now drained.
+//   - (0, false, err):             unexpected DB error.
+//
+// Idempotent: safe to call repeatedly. Once drained the status='draining'
+// guard in MarkHostDrained prevents re-application.
+//
+// Source: vm-13-03__blueprint__ §interaction_or_ops_contract
+//         "Operator confirms drain complete / drain watch signals completion".
+func (i *HostInventory) CompleteDrain(ctx context.Context, hostID string, fromGeneration int64) (activeCount int, updated bool, err error) {
+	return i.repo.MarkHostDrained(ctx, hostID, fromGeneration)
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func validateRegisterRequest(req *RegisterRequest) error {
@@ -156,20 +217,4 @@ func generateRawToken() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-
-func (i *HostInventory) DrainHost(ctx context.Context, hostID string, reason string) (int, bool, error) {
-	ok, err := i.repo.UpdateHostStatus(ctx, hostID, 0, "draining", reason)
-	if err != nil {
-		return 0, false, err
-	}
-	if err := i.repo.DetachStoppedInstancesFromHost(ctx, hostID); err != nil {
-		return 0, ok, err
-	}
-	n, err := i.repo.CountActiveInstancesOnHost(ctx, hostID)
-	if err != nil {
-		return 0, ok, err
-	}
-	return n, ok, nil
 }
