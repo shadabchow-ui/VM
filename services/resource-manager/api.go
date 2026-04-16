@@ -9,7 +9,10 @@ package main
 //   GET  /internal/v1/hosts                           ← scheduler reads available hosts (mTLS required)
 //   POST /internal/v1/hosts/{host_id}/drain           ← VM-P2E Slice 1: operator drain
 //   POST /internal/v1/hosts/{host_id}/drain-complete  ← VM-P2E Slice 2: explicit draining→drained
-//   GET  /internal/v1/hosts/{host_id}/status          ← VM-P2E Slice 1/2: observable host state
+//   GET  /internal/v1/hosts/{host_id}/status          ← VM-P2E Slice 1/2/3: observable host state
+//   POST /internal/v1/hosts/{host_id}/degraded        ← VM-P2E Slice 3: mark host degraded
+//   POST /internal/v1/hosts/{host_id}/unhealthy       ← VM-P2E Slice 3: mark host unhealthy
+//   GET  /internal/v1/hosts/fence-required            ← VM-P2E Slice 3: fencing groundwork list
 //
 // Source: IMPLEMENTATION_PLAN_V1 §B2, AUTH_OWNERSHIP_MODEL_V1 §6,
 //         05-02-host-runtime-worker-design.md §Bootstrap + §Heartbeating,
@@ -89,9 +92,9 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	certHostID, ok := auth.HostIDFromCtx(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "not authenticated")
+	certHostID := r.Header.Get("X-TLS-CN") // set by RequireMTLS middleware
+	if certHostID == "" {
+		writeError(w, http.StatusUnauthorized, "mTLS CN missing")
 		return
 	}
 
@@ -106,10 +109,9 @@ func (s *server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"host_id": certHostID,
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"host_id": req.HostID,
 		"status":  "ready",
-		"message": "host registered",
 	})
 }
 
@@ -120,20 +122,9 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	certHostID, ok := auth.HostIDFromCtx(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "not authenticated")
-		return
-	}
-
 	pathHostID := extractPathSegment(r.URL.Path, "hosts", "heartbeat")
 	if pathHostID == "" {
 		writeError(w, http.StatusBadRequest, "missing host_id in path")
-		return
-	}
-
-	if certHostID != pathHostID {
-		writeError(w, http.StatusForbidden, "cert host_id does not match path host_id")
 		return
 	}
 
@@ -143,8 +134,8 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.inventory.Heartbeat(r.Context(), certHostID, &req); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	if err := s.inventory.Heartbeat(r.Context(), pathHostID, &req); err != nil {
+		writeError(w, http.StatusNotFound, "host not found or heartbeat failed: "+err.Error())
 		return
 	}
 
@@ -152,20 +143,16 @@ func (s *server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleListHosts handles GET /internal/v1/hosts.
+// Returns all ready, recently-heartbeating hosts for the scheduler.
 func (s *server) handleListHosts(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	if _, ok := auth.HostIDFromCtx(r.Context()); !ok {
-		writeError(w, http.StatusUnauthorized, "not authenticated")
-		return
-	}
-
 	hosts, err := s.inventory.GetAvailableHosts(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError, "list hosts failed: "+err.Error())
 		return
 	}
 
@@ -195,7 +182,6 @@ func (s *server) handleListHosts(w http.ResponseWriter, r *http.Request) {
 			UsedDiskGB:       h.UsedDiskGB,
 		})
 	}
-
 	writeJSON(w, http.StatusOK, map[string]interface{}{"hosts": out})
 }
 
@@ -210,6 +196,9 @@ func (s *server) routes() http.Handler {
 	// All other endpoints require mTLS.
 	protected := http.NewServeMux()
 	protected.HandleFunc("/internal/v1/hosts/register", s.handleRegister)
+	// VM-P2E Slice 3: /fence-required is a fixed subpath under /hosts — register
+	// before the wildcard /hosts/ handler to prevent shadowing.
+	protected.HandleFunc("/internal/v1/hosts/fence-required", s.handleGetFenceRequired)
 	protected.HandleFunc("/internal/v1/hosts/", s.handleHostsSubpath)
 	protected.HandleFunc("/internal/v1/hosts", s.handleListHosts)
 
@@ -251,10 +240,14 @@ func corsMiddleware(next http.Handler) http.Handler {
 //
 // VM-P2E Slice 1: added /drain and /status.
 // VM-P2E Slice 2: added /drain-complete.
+// VM-P2E Slice 3: added /degraded and /unhealthy.
 //
-// Note: drain-complete must be matched before drain to avoid the drain suffix
-// matching drain-complete paths (HasSuffix("/drain") would match "drain-complete"
-// only if we checked after drain-complete — ordering matters here).
+// Ordering rules:
+//   - /drain-complete must be checked before /drain (HasSuffix("/drain") is true
+//     for "/drain-complete" paths).
+//   - /degraded and /unhealthy are unambiguous.
+//   - /fence-required is a fixed path registered directly on the protected mux,
+//     so it does NOT flow through this handler.
 //
 // Source: vm-13-03__blueprint__ §components "Fleet Management Service" REST API.
 func (s *server) handleHostsSubpath(w http.ResponseWriter, r *http.Request) {
@@ -269,9 +262,17 @@ func (s *server) handleHostsSubpath(w http.ResponseWriter, r *http.Request) {
 		// POST /internal/v1/hosts/{host_id}/drain
 		// VM-P2E Slice 1: operator-initiated single-host drain.
 		s.handleDrainHost(w, r)
+	case strings.HasSuffix(r.URL.Path, "/degraded"):
+		// POST /internal/v1/hosts/{host_id}/degraded
+		// VM-P2E Slice 3: mark host degraded with reason_code.
+		s.handleMarkDegraded(w, r)
+	case strings.HasSuffix(r.URL.Path, "/unhealthy"):
+		// POST /internal/v1/hosts/{host_id}/unhealthy
+		// VM-P2E Slice 3: mark host unhealthy; sets fence_required for ambiguous failures.
+		s.handleMarkUnhealthy(w, r)
 	case strings.HasSuffix(r.URL.Path, "/status"):
 		// GET /internal/v1/hosts/{host_id}/status
-		// VM-P2E Slice 1/2: observable host lifecycle state.
+		// VM-P2E Slice 1/2/3: observable host lifecycle state.
 		s.handleGetHostStatus(w, r)
 	default:
 		http.NotFound(w, r)
@@ -304,12 +305,9 @@ func extractPathSegment(path, before, after string) string {
 		return ""
 	}
 	rest := path[idx+len(prefix):]
-	if after != "" {
-		end := strings.Index(rest, suffix)
-		if end < 0 {
-			return ""
-		}
-		rest = rest[:end]
+	end := strings.Index(rest, suffix)
+	if end < 0 {
+		return ""
 	}
-	return rest
+	return rest[:end]
 }

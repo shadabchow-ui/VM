@@ -9,6 +9,13 @@ package main
 // VM-P2E Slice 2 additions:
 //   - DrainHost: now accepts and forwards fromGeneration (was always 0 in Slice 1).
 //   - CompleteDrain: new — attempts draining→drained transition via MarkHostDrained.
+//
+// VM-P2E Slice 3 additions:
+//   - MarkDegraded: new — transitions a host to 'degraded' with reason code.
+//   - MarkUnhealthy: new — transitions a host to 'unhealthy'; sets fence_required
+//     for ambiguous failure reason codes.
+//   - ClearFenceRequired: new — operator-initiated fence_required clearance.
+//   - GetFenceRequiredHosts: new — observable query for hosts needing fencing.
 
 import (
 	"context"
@@ -183,6 +190,78 @@ func (i *HostInventory) DrainHost(ctx context.Context, hostID string, fromGenera
 //         "Operator confirms drain complete / drain watch signals completion".
 func (i *HostInventory) CompleteDrain(ctx context.Context, hostID string, fromGeneration int64) (activeCount int, updated bool, err error) {
 	return i.repo.MarkHostDrained(ctx, hostID, fromGeneration)
+}
+
+// MarkDegraded transitions a host to 'degraded' with a reason code.
+//
+// fromStatus is the caller's expected current status of the host (used for
+// transition validation). fromGeneration is the expected generation for CAS.
+//
+// Valid fromStatuses: ready, draining, drained (see db.legalTransitions).
+// Illegal transitions return (false, ErrIllegalHostTransition).
+// CAS failure (generation mismatch or fromStatus mismatch) returns (false, nil).
+//
+// reasonCode should be one of the db.ReasonXxx constants.
+//
+// Source: vm-13-03__blueprint__ §"DEGRADED state",
+//         §implementation_decisions "Introduce a DEGRADED state".
+func (i *HostInventory) MarkDegraded(ctx context.Context, hostID string, fromGeneration int64, fromStatus, reasonCode string) (updated bool, err error) {
+	ok, err := i.repo.MarkHostDegraded(ctx, hostID, fromGeneration, fromStatus, reasonCode)
+	if err != nil {
+		return false, fmt.Errorf("MarkDegraded: %w", err)
+	}
+	return ok, nil
+}
+
+// MarkUnhealthy transitions a host to 'unhealthy' with a reason code.
+//
+// fromStatus is the caller's expected current status (used for transition
+// validation). fromGeneration is the expected generation for CAS.
+//
+// Valid fromStatuses: ready, draining, degraded (see db.legalTransitions).
+// Illegal transitions return (false, false, ErrIllegalHostTransition).
+// CAS failure returns (false, false, nil).
+//
+// fenceRequired return value indicates whether fence_required was set TRUE
+// in the DB. This happens for reason codes in the ambiguous-failure set
+// (AGENT_UNRESPONSIVE, HYPERVISOR_FAILED, NETWORK_UNREACHABLE).
+//
+// Source: vm-13-03__blueprint__ §"Fencing Decision Logic".
+func (i *HostInventory) MarkUnhealthy(ctx context.Context, hostID string, fromGeneration int64, fromStatus, reasonCode string) (fenceRequired bool, updated bool, err error) {
+	fr, ok, err := i.repo.MarkHostUnhealthy(ctx, hostID, fromGeneration, fromStatus, reasonCode)
+	if err != nil {
+		return false, false, fmt.Errorf("MarkUnhealthy: %w", err)
+	}
+	return fr, ok, nil
+}
+
+// ClearFenceRequired clears the fence_required flag on a host.
+//
+// Called by an operator after confirming the host is isolated, or (in Slice 4+)
+// by the fencing controller after STONITH completion. The host status is NOT
+// changed by this call — a separate status transition (e.g., → fenced) should
+// follow if needed.
+//
+// Returns (true, nil) when the flag was cleared.
+// Returns (false, nil) on CAS failure (wrong generation or flag already false).
+//
+// Source: vm-13-03__blueprint__ §"Fencing Controller" (Slice 4+ seam).
+func (i *HostInventory) ClearFenceRequired(ctx context.Context, hostID string, fromGeneration int64) (updated bool, err error) {
+	ok, err := i.repo.ClearFenceRequired(ctx, hostID, fromGeneration)
+	if err != nil {
+		return false, fmt.Errorf("ClearFenceRequired: %w", err)
+	}
+	return ok, nil
+}
+
+// GetFenceRequiredHosts returns all hosts with fence_required=TRUE.
+//
+// Observable surface for operator tooling and the future fencing controller.
+// A non-empty result means recovery automation must NOT proceed for those hosts.
+//
+// Source: vm-13-03__blueprint__ §"Fencing Controller".
+func (i *HostInventory) GetFenceRequiredHosts(ctx context.Context) ([]*db.HostRecord, error) {
+	return i.repo.GetFenceRequiredHosts(ctx)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
