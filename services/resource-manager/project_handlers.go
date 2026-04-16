@@ -11,6 +11,11 @@ package main
 //   PATCH  /v1/projects/{id}     → handleUpdateProject   (200 OK)
 //   DELETE /v1/projects/{id}     → handleDeleteProject   (204 No Content)
 //
+// VM-P16A additions: handleProjectByID now routes recognised IAM sub-paths
+// to handleIAMSubpath (defined in iam_handlers.go) instead of 404ing:
+//   /v1/projects/{id}/service-accounts[/...]
+//   /v1/projects/{id}/iam/bindings[/...]
+//
 // Auth: X-Principal-ID header (same pattern as instance handlers).
 // Cross-account access always returns 404. Source: AUTH_OWNERSHIP_MODEL_V1 §3.
 // Error envelope: writeAPIError / writeAPIErrors. Source: API_ERROR_CONTRACT_V1 §1.
@@ -92,19 +97,48 @@ func (s *server) handleProjects(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleProjectByID dispatches GET, PATCH, DELETE on /v1/projects/{id}.
-// Sub-paths (e.g. /v1/projects/{id}/members) are rejected with 404 until
-// member management is implemented in a later slice.
+//
+// VM-P16A: IAM sub-paths are now routed to handleIAMSubpath instead of 404ing.
+// Recognised sub-paths:
+//   service-accounts[/...]  — service account CRUD
+//   iam/bindings[/...]      — role binding CRUD
+//
+// All other sub-paths (e.g. /v1/projects/{id}/members) still return 404.
+// Member management remains deferred per VM-P2D scope.
 func (s *server) handleProjectByID(w http.ResponseWriter, r *http.Request) {
-	// Strip prefix and isolate the id segment.
-	// Path pattern: /v1/projects/{id}   (no further segments in this slice)
 	tail := strings.TrimPrefix(r.URL.Path, "/v1/projects/")
-	if tail == "" || strings.Contains(tail, "/") {
-		// Either empty id or a sub-path not yet implemented.
+	if tail == "" {
 		writeAPIError(w, http.StatusNotFound, errInstanceNotFound, "Project not found.", "")
 		return
 	}
-	id := tail
 
+	// Split on the first "/" to separate the project ID from any sub-path.
+	parts := strings.SplitN(tail, "/", 2)
+	id := parts[0]
+	if id == "" {
+		writeAPIError(w, http.StatusNotFound, errInstanceNotFound, "Project not found.", "")
+		return
+	}
+
+	// Sub-path present — check for recognised IAM routes before falling through.
+	// VM-P16A: route service-account and iam/bindings sub-paths to handleIAMSubpath.
+	if len(parts) == 2 {
+		subpath := parts[1]
+		if isIAMSubpath(subpath) {
+			principalID := r.Header.Get("X-Principal-ID")
+			if principalID == "" {
+				writeAPIError(w, http.StatusUnauthorized, errAuthRequired, "Authentication required.", "")
+				return
+			}
+			s.handleIAMSubpath(w, r, id, principalID, subpath)
+			return
+		}
+		// Unknown sub-path — 404 (e.g. /members not yet implemented).
+		writeAPIError(w, http.StatusNotFound, errInstanceNotFound, "Project not found.", "")
+		return
+	}
+
+	// Bare /v1/projects/{id} — dispatch by method.
 	switch r.Method {
 	case http.MethodGet:
 		s.handleGetProject(w, r, id)
@@ -115,6 +149,16 @@ func (s *server) handleProjectByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeAPIError(w, http.StatusMethodNotAllowed, errInvalidRequest, "Method not allowed.", "")
 	}
+}
+
+// isIAMSubpath returns true when subpath begins with a recognised Phase 16A
+// IAM sub-path prefix.
+// Source: iam_handlers.go handleIAMSubpath.
+func isIAMSubpath(subpath string) bool {
+	return subpath == "service-accounts" ||
+		strings.HasPrefix(subpath, "service-accounts/") ||
+		subpath == "iam/bindings" ||
+		strings.HasPrefix(subpath, "iam/bindings/")
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────

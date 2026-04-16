@@ -14,6 +14,10 @@ package main
 //   Source: API_ERROR_CONTRACT_V1 §4 (error code catalog).
 // VM-P2D Slice 4: Added errProjectNotFound.
 //   Source: AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account).
+// VM-P16A: Added errServiceAccountNotFound, errRoleBindingNotFound,
+//   errRoleBindingConflict, errBudgetExceeded.
+//   Source: vm-16-01__blueprint__ §core_contracts (404-for-cross-account on SA),
+//           vm-16-02__blueprint__ §core_contracts "Non-Destructive Budget Enforcement".
 //
 // Source: API_ERROR_CONTRACT_V1 §1 (envelope shape),
 //         §2 (HTTP status mapping),
@@ -68,6 +72,30 @@ const (
 	errProjectNotFound = "project_not_found"
 
 	// VM-P2C-P3: image family alias errors.
+
+	// VM-P16A: Service Account error codes.
+	// service_account_not_found: SA does not exist, is soft-deleted, or belongs to
+	// a different project (404-for-cross-account per AUTH_OWNERSHIP_MODEL_V1 §3).
+	// Source: vm-16-01__blueprint__ §core_contracts, AUTH_OWNERSHIP_MODEL_V1 §3.
+	errServiceAccountNotFound = "service_account_not_found"
+
+	// VM-P16A: IAM Role Binding error codes.
+	// role_binding_not_found: binding does not exist or belongs to a different project.
+	// Source: vm-16-01__blueprint__ §components "IAM Policy Service".
+	errRoleBindingNotFound = "role_binding_not_found"
+
+	// role_binding_conflict: the (principal, role, resource) binding already exists.
+	// Maps to HTTP 409. Source: API_ERROR_CONTRACT_V1 §2.
+	errRoleBindingConflict = "role_binding_conflict"
+
+	// VM-P16A: Budget enforcement error code.
+	// budget_exceeded: the scope's active budget policy with enforcement_action=
+	// 'block_create' has reached its spending limit. New resource creation is blocked.
+	// Maps to HTTP 422 (client-correctable — reduce scope usage or raise limit).
+	// Must NOT be confused with errQuotaExceeded (count-based) or
+	// errServiceUnavailable (connectivity failure).
+	// Source: vm-16-02__blueprint__ §core_contracts "Non-Destructive Budget Enforcement".
+	errBudgetExceeded = "budget_exceeded"
 )
 
 // apiError is the structured error envelope sent in every error response.
