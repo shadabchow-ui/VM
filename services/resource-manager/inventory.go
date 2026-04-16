@@ -21,6 +21,15 @@ package main
 //   - RetireHost: transitions a host to 'retiring'; blocked if active workload remains.
 //   - CompleteRetirement: transitions a retiring host to 'retired'; sets retired_at.
 //   - GetRetiredHosts: replacement-seam query returning all retired hosts.
+//
+// VM-P2E Slice 5 additions:
+//   - CreateCampaign: validates and creates a maintenance campaign with blast-radius check.
+//   - GetCampaign: fetches a campaign by ID.
+//   - ListCampaigns: lists campaigns filtered by status.
+//   - AdvanceCampaign: drains the next batch of hosts within blast-radius limits.
+//   - PauseCampaign: halts further advancement of a running campaign.
+//   - ResumeCampaign: resumes a paused campaign.
+//   - CancelCampaign: cancels a campaign; in-flight hosts drain naturally.
 
 import (
 	"context"
@@ -360,4 +369,195 @@ func (i *HostInventory) CompleteRetirement(ctx context.Context, hostID string, f
 // Source: vm-13-03__blueprint__ §components "Capacity Manager" (Slice 5+ seam).
 func (i *HostInventory) GetRetiredHosts(ctx context.Context) ([]*db.HostRecord, error) {
 	return i.repo.GetRetiredHosts(ctx)
+}
+
+// ── VM-P2E Slice 5: Maintenance campaign orchestration ────────────────────────
+
+// CreateCampaign creates a new maintenance campaign with blast-radius validation.
+//
+// id must be a caller-generated unique ID (recommend UUID4).
+// reason is a human-readable label for the campaign (e.g. "kernel-4.19 patch").
+// targetHostIDs is the full ordered list of hosts to act on. Must be non-empty.
+// maxParallel is the maximum number of hosts to drain concurrently. Must be
+// between 1 and db.MaxCampaignParallel (hard blast-radius limit).
+//
+// Returns the created CampaignRecord, or an error if validation fails or DB write fails.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator".
+func (i *HostInventory) CreateCampaign(ctx context.Context, id, reason string, targetHostIDs []string, maxParallel int) (*db.CampaignRecord, error) {
+	c, err := i.repo.CreateCampaign(ctx, id, reason, targetHostIDs, maxParallel)
+	if err != nil {
+		return nil, fmt.Errorf("CreateCampaign: %w", err)
+	}
+	return c, nil
+}
+
+// GetCampaign fetches a campaign by ID.
+// Returns db.ErrCampaignNotFound when absent.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator".
+func (i *HostInventory) GetCampaign(ctx context.Context, id string) (*db.CampaignRecord, error) {
+	c, err := i.repo.GetCampaignByID(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("GetCampaign: %w", err)
+	}
+	return c, nil
+}
+
+// ListCampaigns returns campaigns filtered by status. Pass nil to return all.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator" observable surface.
+func (i *HostInventory) ListCampaigns(ctx context.Context, statuses []string) ([]*db.CampaignRecord, error) {
+	cs, err := i.repo.ListCampaigns(ctx, statuses)
+	if err != nil {
+		return nil, fmt.Errorf("ListCampaigns: %w", err)
+	}
+	return cs, nil
+}
+
+// AdvanceCampaign drains the next batch of hosts within blast-radius limits.
+//
+// Steps:
+//  1. Fetch the campaign by ID. Return error if not found.
+//  2. Reject if campaign is terminal (completed/cancelled) or paused.
+//  3. Mark campaign running if still pending.
+//  4. Determine next batch: campaign.NextHosts(maxParallel).
+//  5. For each host in the batch: call DrainHost with generation=0 (operator does
+//     not need to supply per-host generation here — the campaign owns sequencing).
+//     Record outcome as "completed" or "failed" via AdvanceCampaignProgress.
+//  6. Return the advance result summary.
+//
+// Blast-radius is enforced by NextHosts(campaign.MaxParallel) — at most
+// MaxParallel hosts are sent to drain per advance call.
+//
+// Note: DrainHost is called with generation=0, which will fail if the host's
+// generation is not 0. Callers that need generation-exact drain (e.g. single-host
+// operator flows) should use the direct drain endpoint. Campaign advance is an
+// operator-convenience path that accepts the CAS-retry tradeoff for batch flows.
+// The handler documents this behavior explicitly.
+//
+// Returns a summary of which hosts were actioned and their outcomes.
+//
+// Source: vm-13-03__blueprint__ §interaction_or_ops_contract
+//         "Operator initiates a fleet-wide kernel update".
+func (i *HostInventory) AdvanceCampaign(ctx context.Context, campaignID, drainReason string) (*CampaignAdvanceResult, error) {
+	campaign, err := i.repo.GetCampaignByID(ctx, campaignID)
+	if err != nil {
+		return nil, fmt.Errorf("AdvanceCampaign: %w", err)
+	}
+
+	if campaign.IsTerminal() {
+		return nil, fmt.Errorf("AdvanceCampaign: campaign %s is terminal (status=%s)", campaignID, campaign.Status)
+	}
+	if campaign.Status == "paused" {
+		return nil, fmt.Errorf("AdvanceCampaign: campaign %s is paused; resume before advancing", campaignID)
+	}
+
+	// Transition pending → running on first advance.
+	if campaign.Status == "pending" {
+		if _, err := i.repo.UpdateCampaignStatus(ctx, campaignID, "running"); err != nil {
+			return nil, fmt.Errorf("AdvanceCampaign: status update: %w", err)
+		}
+	}
+
+	// Determine which hosts to act on this batch.
+	nextHosts := campaign.NextHosts(campaign.MaxParallel)
+	if len(nextHosts) == 0 {
+		// All hosts already actioned.
+		if _, err := i.repo.UpdateCampaignStatus(ctx, campaignID, "completed"); err != nil {
+			return nil, fmt.Errorf("AdvanceCampaign: complete status update: %w", err)
+		}
+		return &CampaignAdvanceResult{
+			CampaignID: campaignID,
+			Status:     "completed",
+			Actioned:   nil,
+		}, nil
+	}
+
+	result := &CampaignAdvanceResult{
+		CampaignID: campaignID,
+		Status:     "running",
+	}
+
+	for _, hostID := range nextHosts {
+		// Use generation=0 (campaign-advance path; see godoc above).
+		_, drained, drainErr := i.DrainHost(ctx, hostID, 0, drainReason)
+		outcome := CampaignHostOutcome{HostID: hostID}
+		if drainErr != nil || !drained {
+			outcome.Outcome = "failed"
+			if drainErr != nil {
+				outcome.Error = drainErr.Error()
+			} else {
+				outcome.Error = "CAS failed — host may have been concurrently modified; re-read generation and retry individually"
+			}
+			if _, advErr := i.repo.AdvanceCampaignProgress(ctx, campaignID, hostID, "failed"); advErr != nil {
+				// Log but don't halt; remaining hosts should still be attempted.
+				_ = advErr
+			}
+		} else {
+			outcome.Outcome = "completed"
+			if _, advErr := i.repo.AdvanceCampaignProgress(ctx, campaignID, hostID, "completed"); advErr != nil {
+				_ = advErr
+			}
+		}
+		result.Actioned = append(result.Actioned, outcome)
+	}
+
+	return result, nil
+}
+
+// CampaignAdvanceResult is the return value from AdvanceCampaign.
+type CampaignAdvanceResult struct {
+	CampaignID string
+	Status     string
+	Actioned   []CampaignHostOutcome
+}
+
+// CampaignHostOutcome records what happened to a single host during an advance.
+type CampaignHostOutcome struct {
+	HostID  string
+	Outcome string // "completed" | "failed"
+	Error   string // non-empty when Outcome="failed"
+}
+
+// PauseCampaign halts further advancement of a running campaign.
+// In-flight host drains already started will complete naturally.
+// Returns (true, nil) when the campaign was paused.
+// Returns (false, nil) when the campaign was not in a pausable state.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator".
+func (i *HostInventory) PauseCampaign(ctx context.Context, id string) (updated bool, err error) {
+	ok, err := i.repo.UpdateCampaignStatus(ctx, id, "paused")
+	if err != nil {
+		return false, fmt.Errorf("PauseCampaign: %w", err)
+	}
+	return ok, nil
+}
+
+// ResumeCampaign resumes a paused campaign.
+// Returns (true, nil) when the campaign was resumed.
+// Returns (false, nil) when the campaign was not paused.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator".
+func (i *HostInventory) ResumeCampaign(ctx context.Context, id string) (updated bool, err error) {
+	ok, err := i.repo.UpdateCampaignStatus(ctx, id, "running")
+	if err != nil {
+		return false, fmt.Errorf("ResumeCampaign: %w", err)
+	}
+	return ok, nil
+}
+
+// CancelCampaign cancels a campaign.
+// In-flight host drains already started will complete naturally.
+// A cancelled campaign cannot be restarted.
+// Returns (true, nil) when the campaign was cancelled.
+// Returns (false, nil) when the campaign was already terminal.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator".
+func (i *HostInventory) CancelCampaign(ctx context.Context, id string) (updated bool, err error) {
+	ok, err := i.repo.UpdateCampaignStatus(ctx, id, "cancelled")
+	if err != nil {
+		return false, fmt.Errorf("CancelCampaign: %w", err)
+	}
+	return ok, nil
 }

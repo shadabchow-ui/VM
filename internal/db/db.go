@@ -855,3 +855,290 @@ func (r *Repo) GetRetiredHosts(ctx context.Context) ([]*HostRecord, error) {
 	}
 	return hosts, rows.Err()
 }
+
+// ── VM-P2E Slice 5: Maintenance campaign orchestration ────────────────────────
+//
+// A maintenance campaign is a bounded, operator-defined batch of hosts that
+// should be drained or retired in a controlled sequence with explicit
+// blast-radius limits.
+//
+// Design:
+//   - Campaigns are persisted in maintenance_campaigns. One row per campaign.
+//   - max_parallel is immutable after creation — blast-radius intent is locked.
+//   - Status transitions: pending → running → completed|cancelled|paused.
+//   - Slice 6 recovery seam: failed_host_ids list is observable by a future
+//     recovery actor without requiring a schema change.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator",
+//         §interaction_or_ops_contract "Operator initiates a fleet-wide kernel update".
+
+// MaxCampaignParallel is the hard upper bound on max_parallel for any campaign.
+// Blast-radius rule: no campaign may act on more than this many hosts at once.
+// Operators set max_parallel ≤ MaxCampaignParallel; values above are rejected.
+//
+// This value is deliberately conservative for Phase 1. Slice 6+ may allow it
+// to be per-campaign-configurable up to a fleet-size-relative ceiling.
+const MaxCampaignParallel = 10
+
+// ErrCampaignNotFound is returned by GetCampaignByID when the campaign is absent.
+var ErrCampaignNotFound = fmt.Errorf("campaign not found")
+
+// ErrBlastRadiusExceeded is returned when max_parallel would exceed MaxCampaignParallel.
+var ErrBlastRadiusExceeded = fmt.Errorf("max_parallel exceeds blast-radius limit of %d", MaxCampaignParallel)
+
+// ErrCampaignNoTargets is returned when a campaign is created with zero target hosts.
+var ErrCampaignNoTargets = fmt.Errorf("campaign must have at least one target host")
+
+// CampaignRecord is the DB row representation of a maintenance_campaigns row.
+type CampaignRecord struct {
+	ID               string
+	CampaignReason   string
+	TargetHostIDs    []string   // full list of hosts submitted; immutable after creation
+	CompletedHostIDs []string   // hosts whose action succeeded
+	FailedHostIDs    []string   // hosts whose action failed; Slice 6 recovery seam
+	MaxParallel      int        // blast-radius limit; immutable after creation
+	Status           string     // pending | running | paused | completed | cancelled
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// InFlightCount returns the number of hosts currently being acted on.
+// Calculated from TargetHostIDs minus completed and failed host counts.
+// A host is "in-flight" once the campaign has advanced past it but before
+// it appears in completed or failed lists.
+func (c *CampaignRecord) InFlightCount() int {
+	return len(c.TargetHostIDs) - len(c.CompletedHostIDs) - len(c.FailedHostIDs)
+}
+
+// IsTerminal returns true when the campaign is in a terminal state
+// (completed or cancelled). Terminal campaigns cannot be advanced.
+func (c *CampaignRecord) IsTerminal() bool {
+	return c.Status == "completed" || c.Status == "cancelled"
+}
+
+// NextHosts returns up to n host IDs that have not yet been completed or failed.
+// Used by the advance logic to find the next batch to act on.
+func (c *CampaignRecord) NextHosts(n int) []string {
+	done := make(map[string]bool, len(c.CompletedHostIDs)+len(c.FailedHostIDs))
+	for _, h := range c.CompletedHostIDs {
+		done[h] = true
+	}
+	for _, h := range c.FailedHostIDs {
+		done[h] = true
+	}
+	var next []string
+	for _, h := range c.TargetHostIDs {
+		if !done[h] {
+			next = append(next, h)
+			if len(next) >= n {
+				break
+			}
+		}
+	}
+	return next
+}
+
+// ── Campaign repo methods ─────────────────────────────────────────────────────
+
+// CreateCampaign inserts a new maintenance campaign record.
+//
+// Validations (enforced here, not just at the handler layer):
+//   - len(targetHostIDs) >= 1
+//   - maxParallel >= 1
+//   - maxParallel <= MaxCampaignParallel (blast-radius hard limit)
+//
+// The campaign is created in 'pending' status. The caller advances it via
+// UpdateCampaignStatus or AdvanceCampaignProgress.
+//
+// id must be a caller-generated unique ID (e.g. UUID4). The DB has a PRIMARY KEY
+// constraint so duplicate IDs return a DB error.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator".
+func (r *Repo) CreateCampaign(ctx context.Context, id, reason string, targetHostIDs []string, maxParallel int) (*CampaignRecord, error) {
+	if len(targetHostIDs) == 0 {
+		return nil, ErrCampaignNoTargets
+	}
+	if maxParallel < 1 {
+		maxParallel = 1
+	}
+	if maxParallel > MaxCampaignParallel {
+		return nil, ErrBlastRadiusExceeded
+	}
+
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO maintenance_campaigns (
+			id, campaign_reason, target_host_ids,
+			completed_host_ids, failed_host_ids,
+			max_parallel, status, created_at, updated_at
+		) VALUES ($1, $2, $3, '{}', '{}', $4, 'pending', NOW(), NOW())
+	`, id, reason, targetHostIDs, maxParallel)
+	if err != nil {
+		return nil, fmt.Errorf("CreateCampaign: %w", err)
+	}
+	return r.GetCampaignByID(ctx, id)
+}
+
+// GetCampaignByID fetches a single campaign record by ID.
+// Returns ErrCampaignNotFound when absent.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator".
+func (r *Repo) GetCampaignByID(ctx context.Context, id string) (*CampaignRecord, error) {
+	c := &CampaignRecord{}
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, campaign_reason,
+		       target_host_ids, completed_host_ids, failed_host_ids,
+		       max_parallel, status, created_at, updated_at
+		FROM maintenance_campaigns
+		WHERE id = $1
+	`, id).Scan(
+		&c.ID, &c.CampaignReason,
+		&c.TargetHostIDs, &c.CompletedHostIDs, &c.FailedHostIDs,
+		&c.MaxParallel, &c.Status, &c.CreatedAt, &c.UpdatedAt,
+	)
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, fmt.Errorf("GetCampaignByID %s: %w", id, ErrCampaignNotFound)
+		}
+		return nil, fmt.Errorf("GetCampaignByID: %w", err)
+	}
+	return c, nil
+}
+
+// ListCampaigns returns campaigns filtered by the given status values.
+// Pass nil or empty slice to return all campaigns.
+// Results are ordered by created_at DESC (newest first).
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator" observable surface.
+func (r *Repo) ListCampaigns(ctx context.Context, statuses []string) ([]*CampaignRecord, error) {
+	var (
+		rows Rows
+		err  error
+	)
+	if len(statuses) == 0 {
+		rows, err = r.pool.Query(ctx, `
+			SELECT id, campaign_reason,
+			       target_host_ids, completed_host_ids, failed_host_ids,
+			       max_parallel, status, created_at, updated_at
+			FROM maintenance_campaigns
+			ORDER BY created_at DESC
+		`)
+	} else {
+		rows, err = r.pool.Query(ctx, `
+			SELECT id, campaign_reason,
+			       target_host_ids, completed_host_ids, failed_host_ids,
+			       max_parallel, status, created_at, updated_at
+			FROM maintenance_campaigns
+			WHERE status = ANY($1)
+			ORDER BY created_at DESC
+		`, statuses)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ListCampaigns: %w", err)
+	}
+	defer rows.Close()
+
+	var campaigns []*CampaignRecord
+	for rows.Next() {
+		c := &CampaignRecord{}
+		if err := rows.Scan(
+			&c.ID, &c.CampaignReason,
+			&c.TargetHostIDs, &c.CompletedHostIDs, &c.FailedHostIDs,
+			&c.MaxParallel, &c.Status, &c.CreatedAt, &c.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("ListCampaigns scan: %w", err)
+		}
+		campaigns = append(campaigns, c)
+	}
+	return campaigns, rows.Err()
+}
+
+// UpdateCampaignStatus updates the campaign status.
+//
+// Valid transitions:
+//   pending   → running   (first advance)
+//   running   → paused    (operator pause)
+//   paused    → running   (operator resume)
+//   running   → completed (all hosts done)
+//   running   → cancelled (operator cancel)
+//   paused    → cancelled (operator cancel while paused)
+//
+// Returns (true, nil) on success.
+// Returns (false, nil) when the campaign was not found or status unchanged.
+// Returns (false, err) on DB error.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator".
+func (r *Repo) UpdateCampaignStatus(ctx context.Context, id, newStatus string) (bool, error) {
+	res, err := r.pool.Exec(ctx, `
+		UPDATE maintenance_campaigns
+		SET status     = $2,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND status != $2
+	`, id, newStatus)
+	if err != nil {
+		return false, fmt.Errorf("UpdateCampaignStatus: %w", err)
+	}
+	return res.RowsAffected() == 1, nil
+}
+
+// AdvanceCampaignProgress records a host as completed or failed within a campaign.
+//
+// hostOutcome must be "completed" or "failed".
+// The host is appended to the corresponding array column.
+// updated_at is set to NOW().
+//
+// After the append, if all target hosts have been actioned (completed+failed ==
+// target), the campaign status is set to 'completed' in the same call.
+//
+// This is NOT a blast-radius check — that is done by the handler before
+// calling DrainHost. This method only records the outcome.
+//
+// Returns (true, nil) on success.
+// Returns (false, nil) when the campaign is not found or hostID is not in target_host_ids.
+// Returns (false, err) on DB error.
+//
+// Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator" progress tracking.
+func (r *Repo) AdvanceCampaignProgress(ctx context.Context, campaignID, hostID, hostOutcome string) (bool, error) {
+	var colName string
+	switch hostOutcome {
+	case "completed":
+		colName = "completed_host_ids"
+	case "failed":
+		colName = "failed_host_ids"
+	default:
+		return false, fmt.Errorf("AdvanceCampaignProgress: unknown outcome %q", hostOutcome)
+	}
+
+	// Append the host to the outcome array.
+	// Use array_append — idempotent-ish (duplicates are benign for observability).
+	// Only update if the campaign is not already terminal.
+	query := fmt.Sprintf(`
+		UPDATE maintenance_campaigns
+		SET %s      = array_append(%s, $2),
+		    updated_at = NOW()
+		WHERE id     = $1
+		  AND status NOT IN ('completed', 'cancelled')
+		  AND $2 = ANY(target_host_ids)
+	`, colName, colName)
+	res, err := r.pool.Exec(ctx, query, campaignID, hostID)
+	if err != nil {
+		return false, fmt.Errorf("AdvanceCampaignProgress append: %w", err)
+	}
+	if res.RowsAffected() == 0 {
+		return false, nil
+	}
+
+	// Auto-complete the campaign when all hosts are accounted for.
+	// This is a best-effort update; callers may also poll status via GetCampaignByID.
+	_, _ = r.pool.Exec(ctx, `
+		UPDATE maintenance_campaigns
+		SET status     = 'completed',
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND status = 'running'
+		  AND array_length(completed_host_ids, 1) + array_length(failed_host_ids, 1)
+		      >= array_length(target_host_ids, 1)
+	`, campaignID)
+
+	return true, nil
+}

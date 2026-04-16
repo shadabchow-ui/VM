@@ -16,6 +16,13 @@ package main
 //   POST /internal/v1/hosts/{host_id}/retire          ← VM-P2E Slice 4: initiate retirement
 //   POST /internal/v1/hosts/{host_id}/retired         ← VM-P2E Slice 4: complete retirement
 //   GET  /internal/v1/hosts/retired                   ← VM-P2E Slice 4: replacement-seam list
+//   POST /internal/v1/maintenance/campaigns           ← VM-P2E Slice 5: create maintenance campaign
+//   GET  /internal/v1/maintenance/campaigns           ← VM-P2E Slice 5: list campaigns
+//   GET  /internal/v1/maintenance/campaigns/{id}      ← VM-P2E Slice 5: get campaign by ID
+//   POST /internal/v1/maintenance/campaigns/{id}/advance ← VM-P2E Slice 5: drain next batch
+//   POST /internal/v1/maintenance/campaigns/{id}/pause   ← VM-P2E Slice 5: pause campaign
+//   POST /internal/v1/maintenance/campaigns/{id}/resume  ← VM-P2E Slice 5: resume campaign
+//   POST /internal/v1/maintenance/campaigns/{id}/cancel  ← VM-P2E Slice 5: cancel campaign
 //
 // Source: IMPLEMENTATION_PLAN_V1 §B2, AUTH_OWNERSHIP_MODEL_V1 §6,
 //         05-02-host-runtime-worker-design.md §Bootstrap + §Heartbeating,
@@ -212,6 +219,24 @@ func (s *server) routes() http.Handler {
 	mux.Handle("/internal/v1/hosts", auth.RequireMTLS(protected))
 	mux.Handle("/internal/v1/hosts/", auth.RequireMTLS(protected))
 
+	// VM-P2E Slice 5: Maintenance campaign orchestration.
+	// All campaign endpoints require mTLS — operator/control-plane tools only.
+	//
+	// Route ordering:
+	//   /maintenance/campaigns/{id}/advance must be registered before the bare
+	//   /maintenance/campaigns/{id} GET handler so the fixed subpath is reached
+	//   first. Go's ServeMux longest-prefix match handles this naturally for
+	//   the /maintenance/campaigns/ wildcard, but subpath actions (/advance,
+	//   /pause, /resume, /cancel) are dispatched via handleCampaignSubpath.
+	//
+	//   The fixed-path /maintenance/campaigns endpoint (list/create) is
+	//   registered separately to avoid the wildcard catching it.
+	campaignMux := http.NewServeMux()
+	campaignMux.HandleFunc("/internal/v1/maintenance/campaigns", s.handleCampaignsCollection)
+	campaignMux.HandleFunc("/internal/v1/maintenance/campaigns/", s.handleCampaignSubpath)
+
+	mux.Handle("/internal/v1/maintenance/", auth.RequireMTLS(campaignMux))
+
 	// Public instance management API.
 	s.registerInstanceRoutes(mux)
 
@@ -299,6 +324,47 @@ func (s *server) handleHostsSubpath(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers ---
+
+// handleCampaignsCollection routes /internal/v1/maintenance/campaigns (no trailing slash).
+// GET → handleListCampaigns, POST → handleCreateCampaign.
+func (s *server) handleCampaignsCollection(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleListCampaigns(w, r)
+	case http.MethodPost:
+		s.handleCreateCampaign(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleCampaignSubpath routes /internal/v1/maintenance/campaigns/{id}[/action].
+//
+// VM-P2E Slice 5: campaign CRUD and lifecycle actions.
+//
+// Ordering rules:
+//   - Subpath actions (/advance, /pause, /resume, /cancel) are checked before
+//     the bare /{id} GET so a suffix match cannot shadow them.
+//   - All action endpoints are POST-only; the bare /{id} path is GET-only.
+func (s *server) handleCampaignSubpath(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case strings.HasSuffix(r.URL.Path, "/advance"):
+		// POST /internal/v1/maintenance/campaigns/{id}/advance
+		s.handleAdvanceCampaign(w, r)
+	case strings.HasSuffix(r.URL.Path, "/pause"):
+		// POST /internal/v1/maintenance/campaigns/{id}/pause
+		s.handlePauseCampaign(w, r)
+	case strings.HasSuffix(r.URL.Path, "/resume"):
+		// POST /internal/v1/maintenance/campaigns/{id}/resume
+		s.handleResumeCampaign(w, r)
+	case strings.HasSuffix(r.URL.Path, "/cancel"):
+		// POST /internal/v1/maintenance/campaigns/{id}/cancel
+		s.handleCancelCampaign(w, r)
+	default:
+		// GET /internal/v1/maintenance/campaigns/{id}
+		s.handleGetCampaign(w, r)
+	}
+}
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
