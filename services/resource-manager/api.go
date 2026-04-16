@@ -213,6 +213,9 @@ func (s *server) routes() http.Handler {
 	// /hosts/ handler. Must come after /fence-required (both are fixed paths;
 	// order between them does not matter, but both must precede /hosts/).
 	protected.HandleFunc("/internal/v1/hosts/retired", s.handleGetRetiredHosts)
+	// VM-P2E Slice 6: /recovery-eligible is a fixed subpath — register before
+	// the wildcard /hosts/ handler to prevent shadowing.
+	protected.HandleFunc("/internal/v1/hosts/recovery-eligible", s.handleGetRecoveryEligibleHosts)
 	protected.HandleFunc("/internal/v1/hosts/", s.handleHostsSubpath)
 	protected.HandleFunc("/internal/v1/hosts", s.handleListHosts)
 
@@ -314,6 +317,14 @@ func (s *server) handleHostsSubpath(w http.ResponseWriter, r *http.Request) {
 		// POST /internal/v1/hosts/{host_id}/retire
 		// VM-P2E Slice 4: initiate retirement (→retiring); blocked if active VMs remain.
 		s.handleMarkRetiring(w, r)
+	case strings.HasSuffix(r.URL.Path, "/recovery-log"):
+		// GET /internal/v1/hosts/{host_id}/recovery-log
+		// VM-P2E Slice 6: per-host recovery attempt history.
+		s.handleGetHostRecoveryLog(w, r)
+	case strings.HasSuffix(r.URL.Path, "/recover"):
+		// POST /internal/v1/hosts/{host_id}/recover
+		// VM-P2E Slice 6: bounded, fencing-gated recovery action.
+		s.handleRecoverHost(w, r)
 	case strings.HasSuffix(r.URL.Path, "/status"):
 		// GET /internal/v1/hosts/{host_id}/status
 		// VM-P2E Slice 1/2/3/4: observable host lifecycle state.
@@ -360,6 +371,10 @@ func (s *server) handleCampaignSubpath(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(r.URL.Path, "/cancel"):
 		// POST /internal/v1/maintenance/campaigns/{id}/cancel
 		s.handleCancelCampaign(w, r)
+	case strings.HasSuffix(r.URL.Path, "/failed-hosts/recovery"):
+		// GET /internal/v1/maintenance/campaigns/{id}/failed-hosts/recovery
+		// VM-P2E Slice 6: read-only assessment of failed campaign host recovery eligibility.
+		s.handleGetCampaignFailedHostsRecovery(w, r)
 	default:
 		// GET /internal/v1/maintenance/campaigns/{id}
 		s.handleGetCampaign(w, r)
