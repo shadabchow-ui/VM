@@ -31,6 +31,21 @@ package main
 //         existing admission checks. Resolution is ownership-safe and
 //         lifecycle-safe. Direct image_id launch is unchanged.
 //         Source: vm-13-01__blueprint__ §family_seam.
+// VM-P2D Slice 3: Project-aware quota/admission check.
+//         CheckAndDecrementQuota is called with the effective scope ID (project's
+//         principal_id in project mode, user principal in classic mode).
+//         ErrQuotaExceeded → 422 quota_exceeded. Distinct from scheduler capacity.
+//         Source: vm-13-02__blueprint__ §core_contracts "Error Code Separation".
+// VM-P2D Slice 4: Project scoping and tenant-safe resource accounting.
+//         When project_id is set in CreateInstanceRequest:
+//           - Project is fetched and ownership verified (404-for-cross-account).
+//           - owner_principal_id is set to project.principal_id.
+//           - Quota check uses project.principal_id as the scope.
+//         GET /v1/instances accepts ?project_id= to scope the list.
+//         Classic (no project_id) behavior is entirely unchanged.
+//         Source: vm-16-01__blueprint__ §quota_enforcement_point,
+//                 AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account),
+//                 P2_PROJECT_RBAC_MODEL.md §2.4.
 //
 // Control-plane rule: lifecycle handlers enqueue a job via InsertJob.
 // They never call runtime directly. Workers drive all state transitions.
@@ -200,6 +215,13 @@ func (s *server) handleInstanceByID(w http.ResponseWriter, r *http.Request) {
 //   - Resolution is ownership-safe (PRIVATE families resolve only for owner).
 //   - Resolution is lifecycle-safe (OBSOLETE/FAILED/PENDING_VALIDATION excluded).
 //   - Source: vm-13-01__blueprint__ §family_seam.
+//
+// VM-P2D Slice 4: Project scope resolution.
+//   - When req.ProjectID is set, the project is fetched and ownership verified.
+//   - owner_principal_id is set to project.principal_id.
+//   - Quota check uses project.principal_id as the scope.
+//   - Classic (no project_id) path is entirely unchanged.
+//   - Source: AUTH_OWNERSHIP_MODEL_V1 §3, vm-16-01__blueprint__ §quota_enforcement_point.
 //
 // Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, JOB_MODEL_V1 §6,
 //
@@ -374,17 +396,69 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// VM-P2D Slice 4: Project scope resolution.
+	//
+	// When project_id is provided in the request, the instance is created in
+	// project scope. The project must exist, be active, and be owned by the
+	// calling principal (404-for-cross-account per AUTH_OWNERSHIP_MODEL_V1 §3).
+	//
+	// Scope anchor: owner_principal_id is set to the project's principal_id
+	// (the project's entry in the principals table). This is the Phase 1 model:
+	// project membership is expressed as owner_principal_id == project.principal_id.
+	// Quota, list, and describe operations all use owner_principal_id as the scope
+	// anchor — setting it to the project's principal_id makes all three project-safe
+	// without any schema change.
+	//
+	// Classic (no project_id): ownerPrincipalID = principal, quotaScopeID = principal.
+	// All prior behaviour is unchanged when project_id is absent.
+	//
+	// Source: vm-16-01__blueprint__ §quota_enforcement_point,
+	//         AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account),
+	//         quota_repo.go §Phase 1 project-aware mode,
+	//         P2_PROJECT_RBAC_MODEL.md §2.4.
+	ownerPrincipalID := principal // default: classic/no-project mode
+	quotaScopeID := principal     // scope for quota check
+
+	if req.ProjectID != nil {
+		proj, err := s.repo.GetProjectByID(r.Context(), *req.ProjectID)
+		if err != nil {
+			if isProjectNotFound(err) {
+				writeAPIError(w, http.StatusNotFound, errProjectNotFound,
+					"Project not found.", "project_id")
+				return
+			}
+			s.log.Error("GetProjectByID failed in create", "project_id", *req.ProjectID, "error", err)
+			writeDBError(w, err)
+			return
+		}
+		// Cross-account: hide existence per AUTH_OWNERSHIP_MODEL_V1 §3.
+		if proj.CreatedBy != principal {
+			writeAPIError(w, http.StatusNotFound, errProjectNotFound,
+				"Project not found.", "project_id")
+			return
+		}
+		if proj.Status != "active" {
+			writeAPIError(w, http.StatusUnprocessableEntity, errProjectNotFound,
+				"Project '"+*req.ProjectID+"' is not active.", "project_id")
+			return
+		}
+		// Project scope: owner_principal_id = project's principal_id.
+		// This is the single scope anchor: quota, list, and accounting all key
+		// off owner_principal_id, which now equals the project's principal_id.
+		ownerPrincipalID = proj.PrincipalID
+		quotaScopeID = proj.PrincipalID
+	}
+
 	// VM-P2D Slice 3: Project-aware quota/admission check.
 	//
 	// Runs after image admission (image validity confirmed) and before InsertInstance
 	// (quota is not charged for requests that fail field or image validation).
 	//
-	// Scope resolution:
-	//   - Classic/no-project mode (Phase 1): principal == ownerPrincipalID.
-	//     CheckAndDecrementQuota counts instances owned by this principal_id.
-	//   - Project-aware mode (Phase 2+): principal is the project's principal_id.
-	//     Same call — owner_principal_id is the single scope anchor in Phase 1.
-	//   No parallel scope model is introduced. The existing ownership model drives both.
+	// Scope resolution (VM-P2D Slice 4):
+	//   - Classic/no-project mode: quotaScopeID == principal (user's principal_id).
+	//   - Project-aware mode: quotaScopeID == project.principal_id.
+	//   CheckAndDecrementQuota counts instances with owner_principal_id == quotaScopeID.
+	//   No parallel scope model is introduced. owner_principal_id drives both.
 	//
 	// Error separation (vm-13-02__blueprint__ §core_contracts "Error Code Separation"):
 	//   - db.ErrQuotaExceeded   → 422 quota_exceeded  (client-correctable)
@@ -399,7 +473,7 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	// Source: vm-13-02__blueprint__ §mvp, §core_contracts "Transactional Quota Integrity",
 	//         vm-13-02__blueprint__ §core_contracts "Error Code Separation",
 	//         vm-16-01__blueprint__ §quota_enforcement_point.
-	if err := s.repo.CheckAndDecrementQuota(r.Context(), principal); err != nil {
+	if err := s.repo.CheckAndDecrementQuota(r.Context(), quotaScopeID); err != nil {
 		if errors.Is(err, db.ErrQuotaExceeded) {
 			writeAPIError(w, http.StatusUnprocessableEntity, errQuotaExceeded,
 				"Instance quota exceeded for this account or project. "+
@@ -407,7 +481,7 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 				"instance_type")
 			return
 		}
-		s.log.Error("CheckAndDecrementQuota failed", "principal", principal, "error", err)
+		s.log.Error("CheckAndDecrementQuota failed", "scope", quotaScopeID, "error", err)
 		writeDBError(w, err)
 		return
 	}
@@ -416,7 +490,7 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	row := &db.InstanceRow{
 		ID:               instanceID,
 		Name:             req.Name,
-		OwnerPrincipalID: principal,
+		OwnerPrincipalID: ownerPrincipalID, // project.PrincipalID or user principal
 		VMState:          "requested",
 		InstanceTypeID:   req.InstanceType,
 		ImageID:          req.ImageID,
@@ -467,6 +541,10 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	ip, _ := s.repo.GetIPByInstance(r.Context(), created.ID)
 	resp := instanceToResponse(created, s.region, ip)
 
+	// VM-P2D Slice 4: populate project_id in the response so the caller can
+	// confirm which project scope the instance was created in.
+	resp.ProjectID = req.ProjectID
+
 	// M10 Slice 4: attach the block_devices from the request to the response.
 	resp.BlockDevices = req.BlockDevices
 
@@ -500,11 +578,44 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 
 // handleListInstances handles GET /v1/instances.
 // Returns 200 + ListInstancesResponse scoped to the calling principal.
-// Source: 08-01 §ListInstances.
+//
+// VM-P2D Slice 4: Project-scoped list.
+// When ?project_id= is provided, the list is scoped to that project's instances
+// (owner_principal_id == project.principal_id). The project must exist and be
+// owned by the calling principal (404-for-cross-account).
+// Without ?project_id=, the list returns instances owned by the user principal
+// (classic/no-project mode) — identical to prior behavior.
+//
+// Source: 08-01 §ListInstances, AUTH_OWNERSHIP_MODEL_V1 §3.
 func (s *server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFromCtx(r.Context())
 
-	rows, err := s.repo.ListInstancesByOwner(r.Context(), principal)
+	// VM-P2D Slice 4: Project-scoped list.
+	// listScopeID defaults to the user principal (classic mode).
+	// When ?project_id= is provided, resolve to project.principal_id.
+	listScopeID := principal
+	if pidParam := r.URL.Query().Get("project_id"); pidParam != "" {
+		proj, err := s.repo.GetProjectByID(r.Context(), pidParam)
+		if err != nil {
+			if isProjectNotFound(err) {
+				writeAPIError(w, http.StatusNotFound, errProjectNotFound,
+					"Project not found.", "project_id")
+				return
+			}
+			s.log.Error("GetProjectByID failed in list", "project_id", pidParam, "error", err)
+			writeDBError(w, err)
+			return
+		}
+		// Cross-account: hide existence per AUTH_OWNERSHIP_MODEL_V1 §3.
+		if proj.CreatedBy != principal {
+			writeAPIError(w, http.StatusNotFound, errProjectNotFound,
+				"Project not found.", "project_id")
+			return
+		}
+		listScopeID = proj.PrincipalID
+	}
+
+	rows, err := s.repo.ListInstancesByOwner(r.Context(), listScopeID)
 	if err != nil {
 		s.log.Error("ListInstancesByOwner failed", "error", err)
 		writeDBError(w, err)
@@ -707,6 +818,9 @@ func writeDBError(w http.ResponseWriter, err error) {
 // instanceToResponse maps a db.InstanceRow to the canonical InstanceResponse.
 // M7: ip param carries the allocated IP from GetIPByInstance (empty string = nil fields).
 // M10 Slice 4: BlockDevices initialized to empty slice (populated by caller or enrichment).
+// VM-P2D Slice 4: ProjectID is not populated here — set by the caller when known
+//   (create path has it from the request; get/list paths do not reconstruct it from DB
+//   since owner_principal_id alone does not reveal the original project_id string).
 // Source: INSTANCE_MODEL_V1 §2, §4.
 func instanceToResponse(row *db.InstanceRow, region, ip string) InstanceResponse {
 	resp := InstanceResponse{

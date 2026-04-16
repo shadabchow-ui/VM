@@ -12,6 +12,8 @@ package main
 //   all DB connectivity errors produce HTTP 500, which fails DB-6.
 // M10 Slice 4: Added errInvalidBlockDeviceMapping, errDeleteOnTerminationRequired.
 //   Source: API_ERROR_CONTRACT_V1 §4 (error code catalog).
+// VM-P2D Slice 4: Added errProjectNotFound.
+//   Source: AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account).
 //
 // Source: API_ERROR_CONTRACT_V1 §1 (envelope shape),
 //         §2 (HTTP status mapping),
@@ -56,6 +58,16 @@ const (
 	// Must NOT be confused with errServiceUnavailable (503) or scheduler capacity failure.
 	// Source: vm-13-02__blueprint__ §core_contracts "Error Code Separation".
 	errQuotaExceeded = "quota_exceeded"
+
+	// VM-P2D Slice 4: project scoping errors.
+	// project_not_found is returned when the specified project_id does not exist,
+	// is not owned by the calling principal (404-for-cross-account per
+	// AUTH_OWNERSHIP_MODEL_V1 §3), is soft-deleted, or is not in active status.
+	// Always HTTP 404 — never 403 — to prevent project enumeration.
+	// Source: AUTH_OWNERSHIP_MODEL_V1 §3, API_ERROR_CONTRACT_V1 §4.
+	errProjectNotFound = "project_not_found"
+
+	// VM-P2C-P3: image family alias errors.
 )
 
 // apiError is the structured error envelope sent in every error response.

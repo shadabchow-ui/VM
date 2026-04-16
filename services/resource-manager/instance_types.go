@@ -12,6 +12,13 @@ package main
 //         and InstanceResponse. Source: INSTANCE_MODEL_V1 §2 (block_devices),
 //         execution_blueprint §7.7 (block_devices: [{image_id, size_gb, delete_on_termination}]),
 //         P2_VOLUME_MODEL §1, P2_MIGRATION_COMPATIBILITY_RULES §7.2.
+// VM-P2D Slice 4: Added ProjectID to CreateInstanceRequest and InstanceResponse.
+//         When project_id is set in the request, the instance is created in project
+//         scope: owner_principal_id is set to the project's principal_id, and quota
+//         is scoped to that project's principal_id.
+//         Source: vm-16-01__blueprint__ §quota_enforcement_point,
+//                 AUTH_OWNERSHIP_MODEL_V1 §3 (project-scoped ownership),
+//                 P2_PROJECT_RBAC_MODEL.md §2.4.
 //
 // Source: INSTANCE_MODEL_V1 §2, JOB_MODEL_V1 §1, 08-01 §3,
 //         09-01 §detail card, 10-02 §SSH key handling.
@@ -23,24 +30,30 @@ import "time"
 // InstanceResponse is the canonical JSON shape returned by instance endpoints.
 // M7: added PublicIP, PrivateIP from ip_allocations join.
 // M10 Slice 4: added BlockDevices.
+// VM-P2D Slice 4: added ProjectID (omitempty — nil for classic/no-project instances).
 // Source: INSTANCE_MODEL_V1 §2.
 type InstanceResponse struct {
-	ID               string                       `json:"id"`
-	Name             string                       `json:"name"`
-	Status           string                       `json:"status"`
-	InstanceType     string                       `json:"instance_type"`
-	ImageID          string                       `json:"image_id"`
-	ImageFamily  string  `json:"image_family,omitempty"`
-	ImageVersion *string `json:"image_version,omitempty"`
-	AvailabilityZone string                       `json:"availability_zone"`
-	Region           string                       `json:"region"`
-	Labels           map[string]string             `json:"labels"`
-	BlockDevices     []BlockDeviceMapping          `json:"block_devices"`
-	Networking       *InstanceNetworkingResponse   `json:"networking,omitempty"`
-	PublicIP         *string                       `json:"public_ip"`
-	PrivateIP        *string                       `json:"private_ip"`
-	CreatedAt        time.Time                     `json:"created_at"`
-	UpdatedAt        time.Time                     `json:"updated_at"`
+	ID               string                     `json:"id"`
+	Name             string                     `json:"name"`
+	Status           string                     `json:"status"`
+	InstanceType     string                     `json:"instance_type"`
+	ImageID          string                     `json:"image_id"`
+	ImageFamily      string                     `json:"image_family,omitempty"`
+	ImageVersion     *string                    `json:"image_version,omitempty"`
+	AvailabilityZone string                     `json:"availability_zone"`
+	Region           string                     `json:"region"`
+	// ProjectID is the project this instance belongs to.
+	// Nil for classic (no-project) instances created without a project_id.
+	// When set, owner_principal_id in DB equals the project's principal_id.
+	// Source: VM-P2D Slice 4, AUTH_OWNERSHIP_MODEL_V1 §3.
+	ProjectID        *string                    `json:"project_id,omitempty"`
+	Labels           map[string]string          `json:"labels"`
+	BlockDevices     []BlockDeviceMapping       `json:"block_devices"`
+	Networking       *InstanceNetworkingResponse `json:"networking,omitempty"`
+	PublicIP         *string                    `json:"public_ip"`
+	PrivateIP        *string                    `json:"private_ip"`
+	CreatedAt        time.Time                  `json:"created_at"`
+	UpdatedAt        time.Time                  `json:"updated_at"`
 }
 
 // ── Block device mapping (M10 Slice 4) ──────────────────────────────────────
@@ -51,9 +64,9 @@ type InstanceResponse struct {
 // Source: INSTANCE_MODEL_V1 §2 (block_devices item shape),
 //         execution_blueprint §7.7, 12-03-risks-and-phase-2-expansion.md.
 type BlockDeviceMapping struct {
-	ImageID              string `json:"image_id"`
-	SizeGB               int    `json:"size_gb"`
-	DeleteOnTermination  bool   `json:"delete_on_termination"`
+	ImageID             string `json:"image_id"`
+	SizeGB              int    `json:"size_gb"`
+	DeleteOnTermination bool   `json:"delete_on_termination"`
 }
 
 // ── Create ────────────────────────────────────────────────────────────────────
@@ -61,8 +74,10 @@ type BlockDeviceMapping struct {
 // CreateInstanceRequest is the payload for POST /v1/instances.
 // M10 Slice 4: added BlockDevices. When omitted, the handler synthesizes
 // a default entry from image_id + shape disk size + delete_on_termination=true.
+// VM-P2D Slice 4: added ProjectID. When set, the instance is created in project
+// scope. The project must exist and be owned by the calling principal.
 // Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, 08-02 §validation,
-//         execution_blueprint §7.7.
+//         execution_blueprint §7.7, AUTH_OWNERSHIP_MODEL_V1 §3.
 type CreateInstanceRequest struct {
 	Name             string               `json:"name"`
 	InstanceType     string               `json:"instance_type"`
@@ -73,7 +88,13 @@ type CreateInstanceRequest struct {
 	Labels           map[string]string    `json:"labels"`
 	Networking       *NetworkingConfig    `json:"networking,omitempty"`
 	BlockDevices     []BlockDeviceMapping `json:"block_devices,omitempty"`
+	// ProjectID scopes the instance to a project. When present the project must
+	// exist and be owned by the calling principal; owner_principal_id is set to
+	// the project's principal_id. When absent, classic (user-principal) scope is used.
+	// Source: VM-P2D Slice 4, AUTH_OWNERSHIP_MODEL_V1 §3.
+	ProjectID        *string              `json:"project_id,omitempty"`
 }
+
 
 // CreateInstanceResponse is returned from POST /v1/instances with 202 Accepted.
 // Source: 08-01 §CreateInstance response.
@@ -164,27 +185,26 @@ type ListEventsResponse struct {
 	Total  int             `json:"total"`
 }
 
-
 // ── M9 Slice 4: Networking types ──────────────────────────────────────────────
 
 // NetworkingConfig holds optional networking config for instance creation.
 type NetworkingConfig struct {
-    SubnetID         string   `json:"subnet_id,omitempty"`
-    SecurityGroupIDs []string `json:"security_group_ids,omitempty"`
+	SubnetID         string   `json:"subnet_id,omitempty"`
+	SecurityGroupIDs []string `json:"security_group_ids,omitempty"`
 }
 
 // InstanceNetworkingResponse holds networking info in responses.
 type InstanceNetworkingResponse struct {
-    VPCID            string                    `json:"vpc_id"`
-    SubnetID         string                    `json:"subnet_id"`
-    PrimaryInterface *NetworkInterfaceResponse `json:"primary_interface,omitempty"`
+	VPCID            string                    `json:"vpc_id"`
+	SubnetID         string                    `json:"subnet_id"`
+	PrimaryInterface *NetworkInterfaceResponse `json:"primary_interface,omitempty"`
 }
 
 // NetworkInterfaceResponse represents a NIC in API responses.
 type NetworkInterfaceResponse struct {
-    ID               string   `json:"id"`
-    PrivateIP        string   `json:"private_ip"`
-    MACAddress       string   `json:"mac_address"`
-    Status           string   `json:"status"`
-    SecurityGroupIDs []string `json:"security_group_ids,omitempty"`
+	ID               string   `json:"id"`
+	PrivateIP        string   `json:"private_ip"`
+	MACAddress       string   `json:"mac_address"`
+	Status           string   `json:"status"`
+	SecurityGroupIDs []string `json:"security_group_ids,omitempty"`
 }

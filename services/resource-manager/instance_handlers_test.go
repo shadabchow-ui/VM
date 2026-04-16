@@ -2339,3 +2339,375 @@ func TestCreate_CustomQuotaLimit(t *testing.T) {
 		t.Errorf("want %q, got %q", errQuotaExceeded, env.Error.Code)
 	}
 }
+
+// ── VM-P2D Slice 4: Project scoping and tenant-safe resource accounting ───────
+//
+// These tests verify:
+//   1. project_id in CreateInstanceRequest resolves to project.principal_id as owner.
+//   2. Quota is scoped per project.principal_id, independent of user principal.
+//   3. GET /v1/instances?project_id= lists only that project's instances.
+//   4. Cross-project access returns 404 (hide-existence contract).
+//   5. Classic (no-project) paths are entirely unchanged.
+//
+// Source: AUTH_OWNERSHIP_MODEL_V1 §3, vm-16-01__blueprint__ §quota_enforcement_point,
+//         vm-13-02__blueprint__ §core_contracts "Error Code Separation".
+
+// seedProject adds a project and its principal to the memPool for Slice 4 tests.
+// principalID is the project's entry in the principals table (proj.PrincipalID).
+// This is the value used as owner_principal_id for project-scoped instances.
+func seedProject(mem *memPool, projectID, principalID, createdBy, name string) {
+	now := time.Now()
+	mem.principals[principalID] = "PROJECT"
+	mem.projects[projectID] = &db.ProjectRow{
+		ID:          projectID,
+		PrincipalID: principalID,
+		CreatedBy:   createdBy,
+		Name:        name,
+		DisplayName: name,
+		Status:      "active",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+}
+
+// TestCreate_WithProjectScope_Happy verifies that POST /v1/instances with a valid
+// project_id creates an instance with owner_principal_id = project.principal_id,
+// and returns project_id in the response.
+func TestCreate_WithProjectScope_Happy(t *testing.T) {
+	s := newTestSrv(t)
+	seedProject(s.mem, "proj_alice_s4", "prin_proj_alice_s4", alice, "alice-project-s4")
+
+	pid := "proj_alice_s4"
+	body := validCreateBody()
+	body.ProjectID = &pid
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202, got %d", resp.StatusCode)
+	}
+
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+
+	if out.Instance.ID == "" {
+		t.Error("want non-empty instance ID")
+	}
+	// project_id must round-trip in the response.
+	if out.Instance.ProjectID == nil || *out.Instance.ProjectID != "proj_alice_s4" {
+		t.Errorf("want project_id=proj_alice_s4 in response, got %v", out.Instance.ProjectID)
+	}
+
+	// The instance must be stored with owner_principal_id = project's principal_id,
+	// not alice's own principal_id.
+	var found *db.InstanceRow
+	for _, inst := range s.mem.instances {
+		found = inst
+		break
+	}
+	if found == nil {
+		t.Fatal("no instance row created")
+	}
+	if found.OwnerPrincipalID != "prin_proj_alice_s4" {
+		t.Errorf("want owner_principal_id=prin_proj_alice_s4, got %q", found.OwnerPrincipalID)
+	}
+}
+
+// TestCreate_WithProjectScope_ProjectNotFound verifies that an unknown project_id
+// returns 404 project_not_found, not 422 or 500.
+// Source: AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account).
+func TestCreate_WithProjectScope_ProjectNotFound(t *testing.T) {
+	s := newTestSrv(t)
+	pid := "proj_does_not_exist"
+	body := validCreateBody()
+	body.ProjectID = &pid
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for missing project, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errProjectNotFound {
+		t.Errorf("want code %q, got %q", errProjectNotFound, env.Error.Code)
+	}
+}
+
+// TestCreate_WithProjectScope_CrossProject verifies that Alice cannot create an
+// instance in Bob's project. Existence of Bob's project is hidden (404, not 403).
+// Source: AUTH_OWNERSHIP_MODEL_V1 §3.
+func TestCreate_WithProjectScope_CrossProject(t *testing.T) {
+	s := newTestSrv(t)
+	seedProject(s.mem, "proj_bob_s4", "prin_proj_bob_s4", bob, "bob-project-s4")
+
+	pid := "proj_bob_s4"
+	body := validCreateBody()
+	body.ProjectID = &pid
+
+	// Alice tries to create in Bob's project.
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for cross-project create, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errProjectNotFound {
+		t.Errorf("want code %q, got %q", errProjectNotFound, env.Error.Code)
+	}
+	// No instance must have been created.
+	if len(s.mem.instances) != 0 {
+		t.Errorf("want 0 instances after cross-project rejection, got %d", len(s.mem.instances))
+	}
+}
+
+// TestCreate_WithProjectScope_QuotaIsolation verifies that quota is scoped per
+// project.principal_id, not per user principal.
+//
+// Setup:
+//   - Alice's USER quota is exhausted (10 instances with owner=alice).
+//   - Alice's PROJECT quota starts fresh (0 instances with owner=project principal_id).
+//   - A project-scoped create must succeed (project quota not exhausted).
+//   - After 10 project-scoped creates, the project quota is also exhausted.
+//
+// This confirms that project scope and user scope are independent quota pools.
+// Source: vm-13-02__blueprint__ §core_contracts "Error Code Separation",
+//         vm-16-01__blueprint__ §quota_enforcement_point.
+func TestCreate_WithProjectScope_QuotaIsolation(t *testing.T) {
+	s := newTestSrv(t)
+	seedProject(s.mem, "proj_quota_s4", "prin_proj_quota_s4", alice, "quota-project-s4")
+
+	// Exhaust Alice's USER quota (classic scope, owner=alice principal).
+	for i := 0; i < 10; i++ {
+		seedInstance(s.mem, fmt.Sprintf("inst_user_s4_%d", i), fmt.Sprintf("user-s4-%d", i), alice, "running")
+	}
+
+	// Alice's project scope is a separate quota pool — create must succeed.
+	pid := "proj_quota_s4"
+	body := validCreateBody()
+	body.ProjectID = &pid
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202 for project-scoped create when user quota is exhausted, got %d", resp.StatusCode)
+	}
+
+	// Now seed 9 more project-scoped instances (total=10 after the one created above).
+	for i := 0; i < 9; i++ {
+		seedInstance(s.mem,
+			fmt.Sprintf("inst_proj_s4_%d", i),
+			fmt.Sprintf("proj-s4-%d", i),
+			"prin_proj_quota_s4", // owner = project's principal_id
+			"running",
+		)
+	}
+
+	// The project quota is now exhausted — next create must be rejected.
+	resp2 := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
+	if resp2.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422 quota_exceeded when project quota exhausted, got %d", resp2.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp2, &env)
+	if env.Error.Code != errQuotaExceeded {
+		t.Errorf("want code %q, got %q", errQuotaExceeded, env.Error.Code)
+	}
+}
+
+// TestCreate_NoProject_ClassicScopeUnchanged verifies that omitting project_id
+// preserves the classic (user-principal-scoped) behavior from prior slices.
+// owner_principal_id must equal alice's principal, not a project principal.
+func TestCreate_NoProject_ClassicScopeUnchanged(t *testing.T) {
+	s := newTestSrv(t)
+	body := validCreateBody()
+	// No ProjectID set — classic mode.
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202, got %d", resp.StatusCode)
+	}
+	var out CreateInstanceResponse
+	decodeBody(t, resp, &out)
+
+	// project_id must be absent (nil) in the response for classic creates.
+	if out.Instance.ProjectID != nil {
+		t.Errorf("want nil project_id for classic create, got %v", *out.Instance.ProjectID)
+	}
+
+	// owner_principal_id must be alice's principal (not any project principal).
+	var found *db.InstanceRow
+	for _, inst := range s.mem.instances {
+		found = inst
+		break
+	}
+	if found == nil {
+		t.Fatal("no instance created")
+	}
+	if found.OwnerPrincipalID != alice {
+		t.Errorf("classic create: want owner=%q, got %q", alice, found.OwnerPrincipalID)
+	}
+}
+
+// TestList_WithProjectFilter_Happy verifies that GET /v1/instances?project_id=
+// returns only instances whose owner_principal_id == project.principal_id.
+// Classic-scoped instances with owner=alice must not appear.
+func TestList_WithProjectFilter_Happy(t *testing.T) {
+	s := newTestSrv(t)
+	seedProject(s.mem, "proj_list_s4", "prin_proj_list_s4", alice, "list-project-s4")
+
+	// Seed one project-scoped instance (owner = project's principal_id).
+	seedInstance(s.mem, "inst_proj_list_01", "proj-list-01", "prin_proj_list_s4", "running")
+	// Seed one classic alice instance (owner = alice).
+	seedInstance(s.mem, "inst_alice_classic", "alice-classic", alice, "running")
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances?project_id=proj_list_s4", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	var out ListInstancesResponse
+	decodeBody(t, resp, &out)
+
+	if out.Total != 1 {
+		t.Errorf("want 1 instance in project scope, got %d", out.Total)
+	}
+	if len(out.Instances) > 0 && out.Instances[0].ID != "inst_proj_list_01" {
+		t.Errorf("want inst_proj_list_01, got %q", out.Instances[0].ID)
+	}
+	// Classic instance must not appear in project-scoped list.
+	for _, inst := range out.Instances {
+		if inst.ID == "inst_alice_classic" {
+			t.Error("classic-scoped instance must not appear in project-scoped list")
+		}
+	}
+}
+
+// TestList_WithProjectFilter_CrossProject verifies that Alice gets 404 when
+// listing Bob's project. Existence is hidden per AUTH_OWNERSHIP_MODEL_V1 §3.
+func TestList_WithProjectFilter_CrossProject(t *testing.T) {
+	s := newTestSrv(t)
+	seedProject(s.mem, "proj_bob_list_s4", "prin_proj_bob_list_s4", bob, "bob-list-s4")
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances?project_id=proj_bob_list_s4", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for cross-project list, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errProjectNotFound {
+		t.Errorf("want code %q, got %q", errProjectNotFound, env.Error.Code)
+	}
+}
+
+// TestList_WithProjectFilter_ProjectNotFound verifies 404 for a nonexistent project.
+func TestList_WithProjectFilter_ProjectNotFound(t *testing.T) {
+	s := newTestSrv(t)
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances?project_id=proj_ghost", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errProjectNotFound {
+		t.Errorf("want code %q, got %q", errProjectNotFound, env.Error.Code)
+	}
+}
+
+// TestList_NoProjectFilter_ClassicScopeUnchanged verifies that omitting ?project_id=
+// returns exactly the classic (user-principal-scoped) list — Slice 2 behavior preserved.
+func TestList_NoProjectFilter_ClassicScopeUnchanged(t *testing.T) {
+	s := newTestSrv(t)
+	seedProject(s.mem, "proj_classic_s4", "prin_proj_classic_s4", alice, "classic-s4")
+
+	// Classic-scoped instances for alice.
+	seedInstance(s.mem, "inst_classic_1", "classic-1", alice, "running")
+	seedInstance(s.mem, "inst_classic_2", "classic-2", alice, "stopped")
+	// Project-scoped instance (owner = project principal) — must not appear in classic list.
+	seedInstance(s.mem, "inst_proj_x", "proj-x", "prin_proj_classic_s4", "running")
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	var out ListInstancesResponse
+	decodeBody(t, resp, &out)
+
+	if out.Total != 2 {
+		t.Errorf("want 2 classic instances for alice, got %d", out.Total)
+	}
+	for _, inst := range out.Instances {
+		if inst.ID == "inst_proj_x" {
+			t.Error("project-scoped instance must not appear in classic list")
+		}
+	}
+}
+
+// TestCreate_WithProjectScope_DeletedProject verifies that a soft-deleted (status=deleted)
+// project returns 422 (project not active), not a generic 500.
+// The status check prevents use of deleted project scope.
+func TestCreate_WithProjectScope_DeletedProject(t *testing.T) {
+	s := newTestSrv(t)
+	// Seed a deleted project.
+	now := time.Now()
+	s.mem.projects["proj_deleted_s4"] = &db.ProjectRow{
+		ID:          "proj_deleted_s4",
+		PrincipalID: "prin_proj_deleted_s4",
+		CreatedBy:   alice,
+		Name:        "deleted-project",
+		DisplayName: "deleted-project",
+		Status:      "deleted",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		DeletedAt:   &now,
+	}
+
+	pid := "proj_deleted_s4"
+	body := validCreateBody()
+	body.ProjectID = &pid
+
+	// Deleted projects have deleted_at set — GetProjectByID in the real repo
+	// returns no rows for deleted projects. In the memPool, deleted_at != nil
+	// triggers errRow (no rows in result set) → isProjectNotFound → 404.
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
+	// The memPool treats deleted_at != nil as "not found" (consistent with project_repo.go
+	// WHERE deleted_at IS NULL clause). So we expect 404.
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for deleted project (deleted_at set), got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errProjectNotFound {
+		t.Errorf("want code %q, got %q", errProjectNotFound, env.Error.Code)
+	}
+}
+
+// TestCreate_WithProjectScope_QuotaErrorStillDistinctFromCapacity verifies that
+// the quota vs capacity error separation (Slice 3) is preserved when quota is
+// checked via project scope.
+// Source: vm-13-02__blueprint__ §core_contracts "Error Code Separation".
+func TestCreate_WithProjectScope_QuotaErrorStillDistinctFromCapacity(t *testing.T) {
+	s := newTestSrv(t)
+	seedProject(s.mem, "proj_cap_s4", "prin_proj_cap_s4", alice, "cap-project-s4")
+
+	// Exhaust the project's quota.
+	for i := 0; i < 10; i++ {
+		seedInstance(s.mem, fmt.Sprintf("inst_cap_s4_%d", i), fmt.Sprintf("cap-s4-%d", i), "prin_proj_cap_s4", "running")
+	}
+
+	pid := "proj_cap_s4"
+	body := validCreateBody()
+	body.ProjectID = &pid
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", body, authHdr(alice))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+
+	// Must be quota_exceeded, NOT insufficient_capacity or service_unavailable.
+	if env.Error.Code == "insufficient_capacity" || env.Error.Code == "service_unavailable" {
+		t.Errorf("project quota failure must not be coded as capacity failure, got %q", env.Error.Code)
+	}
+	if env.Error.Code != errQuotaExceeded {
+		t.Errorf("want %q, got %q", errQuotaExceeded, env.Error.Code)
+	}
+}
