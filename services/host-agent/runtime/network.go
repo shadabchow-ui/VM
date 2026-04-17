@@ -1,6 +1,6 @@
 package runtime
 
-// network.go — TAP device creation/deletion and iptables DNAT/SNAT rule programming.
+// network.go — TAP device creation/deletion and iptables/ip6tables NAT rule programming.
 //
 // Source: RUNTIMESERVICE_GRPC_V1 §7 steps 2-4,
 //         07-01-phase-1-network-architecture-and-ip-model.md,
@@ -10,13 +10,22 @@ package runtime
 //   CreateTAP(instanceID, macAddr) → tap device name (e.g. tap-<8 chars of instanceID>)
 //   DeleteTAP(instanceID)          → idempotent; no-op if device absent
 //
-// iptables rules (public IP only — Phase 1 NAT):
+// IPv4 NAT rules (public IP only — Phase 1 NAT):
 //   ProgramNAT(instanceID, privateIP, publicIP)  → DNAT inbound, SNAT outbound
 //   RemoveNAT(instanceID, privateIP, publicIP)   → idempotent removal
 //
+// IPv6 NAT rules (VM-P3A Job 1 — dual-stack foundation):
+//   ProgramNATv6(instanceID, privateIPv6, publicIPv6)  → ip6tables DNAT+SNAT
+//   RemoveNATv6(instanceID, privateIPv6, publicIPv6)   → idempotent removal
+//
+// Dual-stack convenience wrappers:
+//   ProgramDualStackNAT(instanceID, privateIP, publicIP, privateIPv6, publicIPv6)
+//   RemoveDualStackNAT(instanceID, privateIP, publicIP, privateIPv6, publicIPv6)
+//
 // All operations are idempotent. Callers may retry on transient failures.
 //
-// Requires: ip(8), iptables(8) on PATH. Must run as root (or with CAP_NET_ADMIN).
+// Requires: ip(8), iptables(8), ip6tables(8) on PATH.
+// Must run as root (or with CAP_NET_ADMIN).
 
 import (
 	"context"
@@ -243,6 +252,154 @@ func (n *NetworkManager) RemoveNAT(ctx context.Context, instanceID, privateIP, p
 	return nil
 }
 
+// ── IPv6 NAT rules — VM-P3A Job 1 ────────────────────────────────────────────
+//
+// IPv6 NAT uses ip6tables with the same PREROUTING DNAT + POSTROUTING SNAT
+// pattern as the IPv4 path. Requires net.ipv6.conf.all.forwarding=1 on the host.
+//
+// Source: vm-14-03__blueprint__ §future_phases "IPv6 Integration"
+//   (Egress-Only Internet Gateways for IPv6).
+// Note: full Egress-Only IGW semantics are a later job; these methods establish
+// the host-agent seam so callers can wire IPv6 NAT without future surgery here.
+
+// ProgramNATv6 installs ip6tables DNAT (inbound) and SNAT (outbound) rules
+// to route traffic between a public IPv6 address and the instance's private IPv6 address.
+//
+// Mirrors ProgramNAT exactly, using ip6tables instead of iptables.
+// Idempotent: uses -C (check) before -A (append) to avoid duplicate rules.
+// publicIPv6 may be empty — in that case, no rules are installed.
+//
+// Source: vm-14-03__blueprint__ §future_phases "IPv6 Integration".
+func (n *NetworkManager) ProgramNATv6(ctx context.Context, instanceID, privateIPv6, publicIPv6 string) error {
+	if n.dryRun {
+		n.log.Warn("NETWORK_DRY_RUN=true: skipping IPv6 NAT programming — no ip6tables changes made",
+			"instance_id", instanceID,
+			"private_ipv6", privateIPv6,
+			"public_ipv6", publicIPv6,
+		)
+		return nil
+	}
+	if publicIPv6 == "" {
+		n.log.Info("no public IPv6 address — skipping IPv6 NAT rules", "instance_id", instanceID)
+		return nil
+	}
+
+	// PREROUTING DNAT: incoming IPv6 traffic to publicIPv6 → privateIPv6
+	dnatArgs := []string{
+		"-t", "nat", "-A", "PREROUTING",
+		"-d", publicIPv6,
+		"-j", "DNAT", "--to-destination", privateIPv6,
+		"-m", "comment", "--comment", "cpvm6-" + instanceID,
+	}
+	if err := n.ip6tablesIdempotent(ctx, dnatArgs); err != nil {
+		return fmt.Errorf("ProgramNATv6: DNAT: %w", err)
+	}
+
+	// POSTROUTING SNAT: outgoing IPv6 traffic from privateIPv6 → publicIPv6
+	snatArgs := []string{
+		"-t", "nat", "-A", "POSTROUTING",
+		"-s", privateIPv6,
+		"-j", "SNAT", "--to-source", publicIPv6,
+		"-m", "comment", "--comment", "cpvm6-" + instanceID,
+	}
+	if err := n.ip6tablesIdempotent(ctx, snatArgs); err != nil {
+		return fmt.Errorf("ProgramNATv6: SNAT: %w", err)
+	}
+
+	n.log.Info("IPv6 NAT rules programmed",
+		"instance_id", instanceID,
+		"private_ipv6", privateIPv6,
+		"public_ipv6", publicIPv6,
+	)
+	return nil
+}
+
+// RemoveNATv6 deletes ip6tables DNAT and SNAT rules for the instance.
+// Idempotent: if the rules are absent, returns nil.
+// publicIPv6 may be empty — in that case, returns nil immediately.
+//
+// Source: vm-14-03__blueprint__ §future_phases "IPv6 Integration".
+func (n *NetworkManager) RemoveNATv6(ctx context.Context, instanceID, privateIPv6, publicIPv6 string) error {
+	if n.dryRun {
+		n.log.Warn("NETWORK_DRY_RUN=true: skipping IPv6 NAT removal",
+			"instance_id", instanceID,
+			"private_ipv6", privateIPv6,
+			"public_ipv6", publicIPv6,
+		)
+		return nil
+	}
+	if publicIPv6 == "" {
+		return nil
+	}
+
+	// Delete DNAT rule.
+	dnatArgs := []string{
+		"-t", "nat", "-D", "PREROUTING",
+		"-d", publicIPv6,
+		"-j", "DNAT", "--to-destination", privateIPv6,
+		"-m", "comment", "--comment", "cpvm6-" + instanceID,
+	}
+	if err := n.ip6tablesDeleteIdempotent(ctx, dnatArgs); err != nil {
+		return fmt.Errorf("RemoveNATv6: DNAT: %w", err)
+	}
+
+	// Delete SNAT rule.
+	snatArgs := []string{
+		"-t", "nat", "-D", "POSTROUTING",
+		"-s", privateIPv6,
+		"-j", "SNAT", "--to-source", publicIPv6,
+		"-m", "comment", "--comment", "cpvm6-" + instanceID,
+	}
+	if err := n.ip6tablesDeleteIdempotent(ctx, snatArgs); err != nil {
+		return fmt.Errorf("RemoveNATv6: SNAT: %w", err)
+	}
+
+	n.log.Info("IPv6 NAT rules removed",
+		"instance_id", instanceID,
+		"private_ipv6", privateIPv6,
+		"public_ipv6", publicIPv6,
+	)
+	return nil
+}
+
+// ProgramDualStackNAT programs both IPv4 and IPv6 NAT rules for a dual-stack instance.
+// Either IP version may be empty — only the non-empty ones are programmed.
+// This is a convenience wrapper; callers may also call ProgramNAT and ProgramNATv6 directly.
+//
+// Source: vm-14-01__blueprint__ §core_contracts "Dual-Stack Mandate".
+func (n *NetworkManager) ProgramDualStackNAT(
+	ctx context.Context,
+	instanceID, privateIP, publicIP, privateIPv6, publicIPv6 string,
+) error {
+	if err := n.ProgramNAT(ctx, instanceID, privateIP, publicIP); err != nil {
+		return fmt.Errorf("ProgramDualStackNAT: ipv4: %w", err)
+	}
+	if err := n.ProgramNATv6(ctx, instanceID, privateIPv6, publicIPv6); err != nil {
+		return fmt.Errorf("ProgramDualStackNAT: ipv6: %w", err)
+	}
+	return nil
+}
+
+// RemoveDualStackNAT removes both IPv4 and IPv6 NAT rules for a dual-stack instance.
+// Either IP version may be empty — only the non-empty ones are removed.
+// Idempotent: safe to call on stop and delete paths.
+//
+// Source: vm-14-01__blueprint__ §core_contracts "Dual-Stack Mandate".
+func (n *NetworkManager) RemoveDualStackNAT(
+	ctx context.Context,
+	instanceID, privateIP, publicIP, privateIPv6, publicIPv6 string,
+) error {
+	if err := n.RemoveNAT(ctx, instanceID, privateIP, publicIP); err != nil {
+		return fmt.Errorf("RemoveDualStackNAT: ipv4: %w", err)
+	}
+	if err := n.RemoveNATv6(ctx, instanceID, privateIPv6, publicIPv6); err != nil {
+		return fmt.Errorf("RemoveDualStackNAT: ipv6: %w", err)
+	}
+	return nil
+}
+
+// ── iptables helpers (IPv4) ───────────────────────────────────────────────────
+
 // iptablesIdempotent checks if an iptables rule exists before appending it.
 // checkArgs must be the -A version; internally converts to -C for the check.
 func (n *NetworkManager) iptablesIdempotent(ctx context.Context, appendArgs []string) error {
@@ -282,6 +439,47 @@ func (n *NetworkManager) iptablesDeleteIdempotent(ctx context.Context, deleteArg
 	return n.run(ctx, "iptables", deleteArgs...)
 }
 
+// ── ip6tables helpers (IPv6) — VM-P3A Job 1 ──────────────────────────────────
+//
+// Exact mirrors of the iptables helpers, using ip6tables instead.
+// The -C / -A / -D flag logic is identical.
+
+// ip6tablesIdempotent checks if an ip6tables rule exists before appending it.
+func (n *NetworkManager) ip6tablesIdempotent(ctx context.Context, appendArgs []string) error {
+	checkArgs := make([]string, len(appendArgs))
+	copy(checkArgs, appendArgs)
+	for i, a := range checkArgs {
+		if a == "-A" {
+			checkArgs[i] = "-C"
+			break
+		}
+	}
+	checkCmd := exec.CommandContext(ctx, "ip6tables", checkArgs...)
+	if err := checkCmd.Run(); err == nil {
+		// Rule already exists.
+		return nil
+	}
+	return n.run(ctx, "ip6tables", appendArgs...)
+}
+
+// ip6tablesDeleteIdempotent deletes an ip6tables rule; returns nil if already absent.
+func (n *NetworkManager) ip6tablesDeleteIdempotent(ctx context.Context, deleteArgs []string) error {
+	checkArgs := make([]string, len(deleteArgs))
+	copy(checkArgs, deleteArgs)
+	for i, a := range checkArgs {
+		if a == "-D" {
+			checkArgs[i] = "-C"
+			break
+		}
+	}
+	checkCmd := exec.CommandContext(ctx, "ip6tables", checkArgs...)
+	if err := checkCmd.Run(); err != nil {
+		// Rule does not exist — idempotent no-op.
+		return nil
+	}
+	return n.run(ctx, "ip6tables", deleteArgs...)
+}
+
 // run executes a shell command and returns an error with combined output on failure.
 func (n *NetworkManager) run(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -305,8 +503,8 @@ func (n *NetworkManager) run(ctx context.Context, name string, args ...string) e
 // The seam is established now so ownership is explicit and future work can replace
 // these stubs without touching other layers.
 //
-// Source: vm-14-02 skill §instructions ("Deploy a Host Enforcement Agent on each
-// hypervisor to subscribe to policy updates, translate them into vSwitch rules").
+// Source: vm-14-02 skill §instructions (\"Deploy a Host Enforcement Agent on each
+// hypervisor to subscribe to policy updates, translate them into vSwitch rules\").
 
 // SGRule represents a single security group rule passed to the host-agent enforcement seam.
 // Mirrors the API/DB rule shape; defined here to avoid cross-package import from host-agent into db.
