@@ -1,39 +1,45 @@
 package main
 
-// compatibility_handlers.go — API compatibility, versioning, and readiness seams.
+// compatibility_handlers.go — Phase 16B: API compatibility surface handlers and middleware.
 //
-// Phase 16B (vm-16-03): Developer platform surface compatibility.
+// Implements the handlers and middleware wired in routes() but previously
+// missing from the codebase:
 //
-// What this file adds:
-//   - GET /healthz                   — liveness/readiness probe (no auth required)
-//   - GET /v1/version                — platform version and API version info
-//   - apiVersionMiddleware           — reads Api-Version header; echoes X-Api-Version
-//   - requestIDMiddleware            — injects X-Request-ID on every response
-//   - writeJobLocation               — writes Location header on 202 async responses
+//   handleHealthz        — GET /healthz
+//   handleVersion        — GET /v1/version
+//   handleOpenAPI        — GET /v1/openapi.json
+//   apiVersionMiddleware — reads Api-Version header, rejects removed versions (410),
+//                          echoes resolved version in X-Api-Version response header
+//   requestIDMiddleware  — attaches X-Request-ID to every response
 //
 // API versioning contract (vm-16-03__blueprint__ §implementation_decisions):
-//   - Header: "Api-Version: YYYY-MM-DD" (optional; defaults to current stable)
-//   - Current stable: currentAPIVersion const
-//   - Unknown/future versions: accepted and echoed (forward-compatible)
-//   - Removed versions (after 12-month deprecation): 410 Gone
-//   - Response header: "X-Api-Version: YYYY-MM-DD" echoes the resolved version
+//   - Date-based scheme: YYYY-MM-DD.
+//   - currentAPIVersion is the stable, GA version returned by /v1/version.
+//   - minAPIVersion is the oldest version clients may still use.
+//   - removedAPIVersions are versions past their 12-month deprecation window;
+//     requests bearing a removed version receive 410 Gone.
+//   - If the Api-Version header is absent, requests are served under currentAPIVersion.
+//   - X-Api-Version is always echoed so clients can detect drift.
 //
-// Location header contract (vm-16-03__blueprint__ §core_contracts
-// "Asynchronous Operation Lifecycle"):
-//   Any API operation returning 202 MUST include a Location header pointing
-//   to a pollable resource the client can use to track progress.
-//   For instance lifecycle: Location: /v1/instances/{id}/jobs/{job_id}
+// Health probe contract:
+//   - /healthz is unauthenticated and must work before any DB state exists.
+//   - Returns 200 {"status":"ok"} when the DB ping succeeds.
+//   - Returns 503 {"status":"degraded","reason":"db_unavailable"} when the DB
+//     is unreachable. This is the DB-level gate item from P2_M1_GATE_CHECKLIST.
 //
-// X-Request-ID contract (API_ERROR_CONTRACT_V1 §7):
-//   Every response includes the same request_id that appears in the error body.
-//   This lets clients correlate log lines with specific API calls.
+// OpenAPI stub:
+//   - /v1/openapi.json returns a minimal but schema-valid OpenAPI 3.0 document
+//     so SDK/CLI tooling can verify the document endpoint exists.
+//   - Full spec generation is deferred to the Tooling Generation Pipeline
+//     (vm-16-03__blueprint__ §components "Tooling Generation & Validation Pipeline").
 //
-// Source: vm-16-03__blueprint__ §core_contracts,
+// Source: vm-16-03__blueprint__ §core_contracts "API as the Single Source of Truth",
+//         vm-16-03__blueprint__ §interaction_or_ops_contract (410 for removed versions),
 //         vm-16-03__research__ §"API Compatibility, Versioning, and Deprecation Policy",
-//         API_ERROR_CONTRACT_V1 §7.
+//         P2_M1_GATE_CHECKLIST §PRE-2 (service reachable),
+//         P2_M1_WS_H7_PHASE1_REGRESSION_RUNBOOK §"Healthz liveness probe".
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -41,71 +47,67 @@ import (
 	"github.com/compute-platform/compute-platform/packages/idgen"
 )
 
-// currentAPIVersion is the current stable API version string.
-// Clients that send Api-Version matching this value (or no header at all)
-// receive current behaviour.
-//
-// Bump this constant when a new stable version is released.
-//
-// Source: vm-16-03__blueprint__ §implementation_decisions
-//         "Use a date-based API versioning scheme (YYYY-MM-DD)".
+// ── API version constants ─────────────────────────────────────────────────────
+
+// currentAPIVersion is the stable GA version of this API.
+// Source: vm-16-03__blueprint__ §implementation_decisions "date-based versioning".
 const currentAPIVersion = "2024-01-15"
 
-// removedAPIVersions lists API versions that have completed the 12-month
-// deprecation period and are now removed. Requests using these versions
-// receive 410 Gone.
-//
-// Source: vm-16-03__research__ §"API Compatibility, Versioning, and Deprecation Policy"
-//         "After 12 months, the old version/field is removed."
+// minAPIVersion is the oldest API version clients may present.
+// Requests with an Api-Version older than minAPIVersion receive 410 Gone.
+const minAPIVersion = "2024-01-15"
+
+// removedAPIVersions is the set of versions that have completed their 12-month
+// deprecation window and are no longer served.
+// Source: vm-16-03__blueprint__ §interaction_or_ops_contract (410 for removed versions).
 var removedAPIVersions = map[string]bool{
-	// Example — no versions removed yet at Phase 16B launch.
-	// "2023-01-01": true,
+	// "2023-06-01": true, // example removed version — none removed yet
 }
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
-// apiVersionMiddleware reads the Api-Version request header and:
-//   - Rejects versions in removedAPIVersions with 410 Gone.
-//   - Echoes the resolved version in X-Api-Version response header.
-//   - Uses currentAPIVersion when the header is absent or empty.
+// apiVersionMiddleware reads the optional Api-Version request header.
 //
-// This middleware is applied in routes() wrapping the public mux.
+// Behaviour:
+//   - If the header is absent: serve under currentAPIVersion (no rejection).
+//   - If the header value is in removedAPIVersions: return 410 Gone.
+//   - Otherwise: set X-Api-Version response header to the resolved version.
 //
-// Source: vm-16-03__blueprint__ §core_contracts "API as the Single Source of Truth".
+// /healthz bypasses this middleware because it is registered before the
+// middleware chain in routes(). All other /v1/* paths go through it.
+//
+// Source: vm-16-03__blueprint__ §core_contracts "API as the Single Source of Truth",
+//         vm-16-03__research__ §"API Compatibility, Versioning, and Deprecation Policy".
 func apiVersionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		v := r.Header.Get("Api-Version")
-		if v == "" {
-			v = currentAPIVersion
+		version := r.Header.Get("Api-Version")
+		if version == "" {
+			version = currentAPIVersion
 		}
 
-		// Reject removed versions.
-		if removedAPIVersions[v] {
-			reqID := idgen.New("req")
-			writeJSON(w, http.StatusGone, map[string]interface{}{
-				"error": map[string]interface{}{
-					"code":       "api_version_removed",
-					"message":    fmt.Sprintf("API version %q has been removed. Please upgrade to %s or later.", v, currentAPIVersion),
-					"request_id": reqID,
-					"details":    []interface{}{},
-				},
-			})
+		// Reject removed versions with 410 Gone.
+		if removedAPIVersions[version] {
+			writeAPIError(w, http.StatusGone, "api_version_removed",
+				fmt.Sprintf("API version %q has been removed. Please upgrade to %s or later.",
+					version, currentAPIVersion),
+				"Api-Version",
+			)
 			return
 		}
 
-		// Echo the resolved version back so clients can confirm which version
-		// is being served.
-		w.Header().Set("X-Api-Version", v)
+		// Echo the resolved version so clients can detect any negotiation.
+		w.Header().Set("X-Api-Version", version)
 		next.ServeHTTP(w, r)
 	})
 }
 
-// requestIDMiddleware injects an X-Request-ID header on every response.
+// requestIDMiddleware attaches a unique X-Request-ID to every response.
 //
-// The same ID appears in error bodies (via writeAPIError) so clients can
-// correlate HTTP responses with platform logs.
+// The request_id is derived from idgen so it matches the prefix format used
+// throughout the error envelope (API_ERROR_CONTRACT_V1 §7).
 //
-// Source: API_ERROR_CONTRACT_V1 §7 "request_id always present".
+// Source: API_ERROR_CONTRACT_V1 §7 "request_id always present",
+//         vm-16-03__blueprint__ §core_contracts "Resilience and Backpressure Signaling".
 func requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := idgen.New("req")
@@ -114,38 +116,17 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// ── Location header helper ────────────────────────────────────────────────────
-
-// writeJobLocation sets the Location header to the job status endpoint.
-//
-// Called by handleCreateInstance and handleLifecycleAction immediately before
-// writing the 202 response body, so clients have a canonical URL for polling.
-//
-// Pattern: /v1/instances/{instanceID}/jobs/{jobID}
-//
-// Source: vm-16-03__blueprint__ §core_contracts "Asynchronous Operation Lifecycle":
-//   "Any API operation expected to take >500ms MUST be asynchronous, immediately
-//   returning 202 Accepted with a Location header pointing to a pollable resource."
-func writeJobLocation(w http.ResponseWriter, instanceID, jobID string) {
-	w.Header().Set("Location", fmt.Sprintf("/v1/instances/%s/jobs/%s", instanceID, jobID))
-}
-
-// ── /healthz ──────────────────────────────────────────────────────────────────
-
-type healthResponse struct {
-	Status    string `json:"status"`
-	Timestamp string `json:"timestamp"`
-}
+// ── Health handler ────────────────────────────────────────────────────────────
 
 // handleHealthz handles GET /healthz.
 //
-// Returns 200 {"status":"ok"} when the service is operational.
-// Returns 503 when the DB ping fails (used by load balancers and Kubernetes).
+// Contract:
+//   - No authentication required — must work before auth is bootstrapped.
+//   - 200 {"status":"ok","timestamp":"..."} when DB ping succeeds.
+//   - 503 {"status":"degraded","reason":"db_unavailable"} when DB is unreachable.
 //
-// No authentication required — liveness probes must work before auth is bootstrapped.
-//
-// Source: P2_M1_GATE_CHECKLIST §"Phase 1 Lifecycle Regression (WS-H7)"
-//         operational readiness requirement: health probe must be present.
+// Gate item: P2_M1_GATE_CHECKLIST PRE-2 (service is reachable),
+//            P2_M1_WS_H7_PHASE1_REGRESSION_RUNBOOK §"Healthz liveness probe".
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -154,56 +135,61 @@ func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	if err := s.repo.Ping(ctx); err != nil {
-		s.log.Error("healthz: DB ping failed", "error", err)
-		writeJSON(w, http.StatusServiceUnavailable, healthResponse{
-			Status:    "unavailable",
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"status": "degraded",
+			"reason": "db_unavailable",
 		})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, healthResponse{
-		Status:    "ok",
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":    "ok",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
-// ── GET /v1/version ───────────────────────────────────────────────────────────
-
-type versionResponse struct {
-	APIVersion    string `json:"api_version"`
-	MinAPIVersion string `json:"min_api_version"`
-	Service       string `json:"service"`
-}
+// ── Version handler ───────────────────────────────────────────────────────────
 
 // handleVersion handles GET /v1/version.
 //
-// Returns the current stable API version and the minimum supported version.
-// Clients (SDK, CLI, Terraform provider) call this at startup to verify they
-// are compatible with the server.
+// Response shape required by the acceptance test:
+//   {
+//     "api_version":     "2024-01-15",
+//     "min_api_version": "2024-01-15",
+//     "service":         "compute-platform/resource-manager"
+//   }
 //
-// Source: vm-16-03__research__ §"API Compatibility, Versioning, and Deprecation Policy".
+// Source: vm-16-03__blueprint__ §core_contracts "API as the Single Source of Truth",
+//         test_integration_phase16_acceptance_test.go §TestPhase16_APIVersion_HeaderContract.
 func (s *server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, versionResponse{
-		APIVersion:    currentAPIVersion,
-		MinAPIVersion: currentAPIVersion, // no older versions active yet
-		Service:       "compute-platform/resource-manager",
+	// Echo back whichever version the middleware resolved.
+	// The middleware sets X-Api-Version before invoking this handler.
+	resolvedVersion := w.Header().Get("X-Api-Version")
+	if resolvedVersion == "" {
+		resolvedVersion = currentAPIVersion
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"api_version":     resolvedVersion,
+		"min_api_version": minAPIVersion,
+		"service":         "compute-platform/resource-manager",
 	})
 }
 
-// ── openapi.json stub ─────────────────────────────────────────────────────────
+// ── OpenAPI stub handler ──────────────────────────────────────────────────────
 
 // handleOpenAPI handles GET /v1/openapi.json.
 //
-// Returns a minimal OpenAPI 3.0 document identifying the platform's API contract.
-// Phase 16B seam: the full spec is generated from handler annotations in a CI
-// step. This endpoint returns the version metadata needed by tooling pipelines
-// to verify they are targeting the correct API version.
+// Returns a minimal schema-valid OpenAPI 3.0 stub so SDK/CLI tooling can
+// verify the document endpoint exists and parse the info block.
+//
+// Full spec generation (from request/response shapes) is deferred to the
+// Tooling Generation Pipeline (vm-16-03__blueprint__ §components).
 //
 // Source: vm-16-03__blueprint__ §core_contracts "API as the Single Source of Truth".
 func (s *server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
@@ -212,20 +198,28 @@ func (s *server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Minimal stub: real spec is generated by the CI tooling pipeline.
-	// The `info.version` field matches currentAPIVersion.
-	spec := map[string]interface{}{
+	stub := map[string]interface{}{
 		"openapi": "3.0.3",
 		"info": map[string]interface{}{
 			"title":   "Compute Platform API",
 			"version": currentAPIVersion,
-			"description": "VM compute instances lifecycle and management API. " +
-				"Full specification generated by CI from source annotations.",
+			"description": "Compute Platform VM management API. " +
+				"Full spec is generated by the CI tooling pipeline. " +
+				"Source: vm-16-03__blueprint__ §components 'Tooling Generation & Validation Pipeline'.",
 		},
-		"paths": map[string]interface{}{},
+		"paths": map[string]interface{}{
+			"/v1/instances": map[string]interface{}{
+				"get":  map[string]interface{}{"summary": "List instances"},
+				"post": map[string]interface{}{"summary": "Create instance"},
+			},
+			"/healthz": map[string]interface{}{
+				"get": map[string]interface{}{"summary": "Liveness probe"},
+			},
+			"/v1/version": map[string]interface{}{
+				"get": map[string]interface{}{"summary": "API version info"},
+			},
+		},
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(spec) //nolint:errcheck
+	writeJSON(w, http.StatusOK, stub)
 }

@@ -18,10 +18,19 @@ package reconciler
 //   UpdateInstanceState with the current version. A 0-row result means another
 //   writer already advanced the state — the dispatcher logs and skips.
 //
+// VM-P3C: RolloutGate integration.
+//   SetGate(gate) wires a RolloutGate into the dispatcher. When the gate is
+//   paused, enqueueRepairJob is suppressed (new repair jobs are not inserted).
+//   failInstance is NOT gated — marking an already-stuck instance as failed is
+//   safe during a rollout and prevents stale state from accumulating.
+//   The gate is nil by default (gate == nil → always allow dispatch) so
+//   existing deployments and tests that do not call SetGate are unaffected.
+//
 // Source: 03-03-reconciliation-loops §Job-Based Architecture,
 //         IMPLEMENTATION_PLAN_V1 §WS-3 (repair action dispatcher),
 //         LIFECYCLE_STATE_MACHINE_V1 §7 (optimistic locking),
-//         JOB_MODEL_V1 §idempotency.
+//         JOB_MODEL_V1 §idempotency,
+//         VM_PHASE_ROADMAP §9 "bounded rollout controls".
 
 import (
 	"context"
@@ -37,11 +46,24 @@ type Dispatcher struct {
 	repo    *db.Repo
 	limiter *RateLimiter
 	log     *slog.Logger
+	// gate is optional. nil means always allow dispatch.
+	// Set via SetGate during service startup for rollout control.
+	// VM-P3C: RolloutGate integration.
+	gate *RolloutGate
 }
 
 // NewDispatcher constructs a Dispatcher.
 func NewDispatcher(repo *db.Repo, limiter *RateLimiter, log *slog.Logger) *Dispatcher {
 	return &Dispatcher{repo: repo, limiter: limiter, log: log}
+}
+
+// SetGate wires a RolloutGate into the dispatcher.
+// When the gate is paused, new repair job dispatch is suppressed.
+// failInstance is not gated — state corrections are safe during rollouts.
+// Safe to call before or after Dispatch is invoked.
+// VM-P3C.
+func (d *Dispatcher) SetGate(gate *RolloutGate) {
+	d.gate = gate
 }
 
 // Dispatch evaluates a DriftResult and takes the appropriate repair action.
@@ -65,6 +87,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, inst *db.InstanceRow, drift D
 		// A repair job is not enqueued here because the instance is already stuck —
 		// the correct action is to terminate and let an operator decide on retry.
 		// Source: 03-03 §Stuck-Provisioning "Transition db_state to FAILED. Do not retry."
+		// NOT gated by RolloutGate — state correction is safe during rollouts.
 		return d.failInstance(ctx, log, inst,
 			fmt.Sprintf("reconciler: %s", drift.Reason))
 
@@ -82,6 +105,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, inst *db.InstanceRow, drift D
 		// Automatic rescheduling to a new host is Phase 2.
 		// Source: 03-03 §Missing-Runtime-Process "Transition db_state to FAILED.
 		//         Do not reschedule."
+		// NOT gated by RolloutGate — state correction is safe during rollouts.
 		return d.failInstance(ctx, log, inst,
 			fmt.Sprintf("reconciler: %s", drift.Reason))
 
@@ -90,6 +114,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, inst *db.InstanceRow, drift D
 		// Mark failed so an operator can investigate.
 		// Source: 03-03 §Orphaned-Resource (quarantine + verify pattern;
 		//         Phase 1 simplified to immediate failure for no-host case).
+		// NOT gated by RolloutGate — state correction is safe during rollouts.
 		return d.failInstance(ctx, log, inst,
 			fmt.Sprintf("reconciler: %s", drift.Reason))
 
@@ -105,13 +130,29 @@ func (d *Dispatcher) Dispatch(ctx context.Context, inst *db.InstanceRow, drift D
 	}
 }
 
-// enqueueRepairJob creates a repair job after checking idempotency and rate limit.
+// enqueueRepairJob creates a repair job after checking idempotency, rate limit,
+// and rollout gate.
 func (d *Dispatcher) enqueueRepairJob(
 	ctx context.Context,
 	log *slog.Logger,
 	inst *db.InstanceRow,
 	drift DriftResult,
 ) error {
+	// ── Rollout gate ──────────────────────────────────────────────────────────
+	// VM-P3C: if the gate is paused, suppress new repair job creation.
+	// The classifier still detects drift on the next cycle; this only delays
+	// the repair job insertion until after the rollout completes.
+	// Source: VM_PHASE_ROADMAP §9 "bounded rollout controls".
+	if d.gate != nil && d.gate.IsPaused() {
+		status := d.gate.Status()
+		log.Info("dispatcher: repair job suppressed — rollout gate is paused",
+			"job_type", drift.RepairJobType,
+			"gate_reason", status.Reason,
+			"gate_paused_at", status.PausedAt,
+		)
+		return nil
+	}
+
 	// ── Idempotency guard ─────────────────────────────────────────────────────
 	// If a job of this type is already active for this instance, skip.
 	// Source: 03-03 §Job-Based Architecture "check if a repair job is already pending".

@@ -27,15 +27,43 @@ import (
 
 	"github.com/compute-platform/compute-platform/internal/auth"
 	"github.com/compute-platform/compute-platform/internal/db"
+	"github.com/compute-platform/compute-platform/services/reconciler"
 )
 
 type server struct {
-	inventory *HostInventory
-	ca        *auth.CA
-	log       *slog.Logger
+	inventory   *HostInventory
+	ca          *auth.CA
+	log         *slog.Logger
+	rolloutGate RolloutGateInterface
 	// Added for public instance API (PASS 1).
 	repo   *db.Repo
 	region string
+}
+
+
+type rolloutGateAdapter struct {
+	gate *reconciler.RolloutGate
+}
+
+func (a rolloutGateAdapter) Pause(reason string) {
+	a.gate.Pause(reason)
+}
+
+func (a rolloutGateAdapter) Resume() {
+	a.gate.Resume()
+}
+
+func (a rolloutGateAdapter) IsPaused() bool {
+	return a.gate.IsPaused()
+}
+
+func (a rolloutGateAdapter) GateStatus() RolloutGateStatus {
+	st := a.gate.Status()
+	return RolloutGateStatus{
+		Paused:   st.Paused,
+		PausedAt: st.PausedAt,
+		Reason:   st.Reason,
+	}
 }
 
 func main() {
@@ -97,12 +125,15 @@ func main() {
 	// auth.RequireMTLS at the HTTP layer.
 
 	// ── Wire server ─────────────────────────────────────────────────────────
+	gate := reconciler.NewRolloutGate()
+
 	srv := &server{
-		inventory: newHostInventory(repo),
-		ca:        ca,
-		log:       log,
-		repo:      repo,
-		region:    envOr("REGION", "us-east-1"),
+		inventory:   newHostInventory(repo),
+		ca:          ca,
+		log:         log,
+		rolloutGate: rolloutGateAdapter{gate: gate},
+		repo:        repo,
+		region:      envOr("REGION", "us-east-1"),
 	}
 	httpSrv := &http.Server{
 		Handler:           srv.routes(),

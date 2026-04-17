@@ -1,19 +1,14 @@
 // api/client.ts — Typed API client for the resource-manager.
 //
-// VM-P16B changes:
-//   - Import types from canonical '../index' (types/index.ts) instead of '../types'.
-//     The types/index.ts file is the authoritative single source derived from backend
-//     API contracts. api_client.ts previously used a looser 'types.ts' shape.
-//   - Add 'Api-Version' header to all requests, set to currentAPIVersion.
-//     Source: vm-16-03__blueprint__ §implementation_decisions "date-based versioning".
-//   - Add instancesApi.listByProject(projectId) — project-scoped instance list.
-//     Source: vm-16-01__blueprint__ §quota_enforcement_point, instance_handlers.go
-//     §"GET /v1/instances accepts ?project_id= to scope the list".
-//   - Expose X-Request-ID from responses so callers can surface correlation IDs.
-//   - Add retry helper for 429 / 5xx per API resilience contract.
-//     Source: vm-16-03__blueprint__ §core_contracts "Resilience and Backpressure Signaling".
+// VM-P16B additions:
+//   - Api-Version header sent on all /v1/* requests.
+//     Value: API_VERSION constant matching server currentAPIVersion.
+//     Source: vm-16-03__blueprint__ §core_contracts "API as the Single Source of Truth",
+//             §implementation_decisions "date-based versioning".
+//   - X-Request-ID is read from responses and attached to ApiException for
+//     correlation. Source: API_ERROR_CONTRACT_V1 §7.
+//   - compatApi: version() and health() methods for SDK/CLI compatibility checks.
 //
-// All existing API shapes are preserved unchanged.
 // All calls include X-Principal-ID from env or localStorage (dev fallback).
 // Errors thrown as ApiException — never swallowed.
 // 5xx → caller shows generic message + request_id.
@@ -25,6 +20,7 @@ import type {
   CreateInstanceRequest,
   CreateInstanceResponse,
   CreateSSHKeyRequest,
+  HealthResponse,
   Instance,
   LifecycleResponse,
   ListEventsResponse,
@@ -32,18 +28,18 @@ import type {
   ListSSHKeysResponse,
   Job,
   SSHKey,
+  VersionInfo,
   ApiErrorEnvelope,
-} from '../index';
-import { ApiException } from '../index';
+} from '../types';
+import { ApiException } from '../types';
 
 // API base URL — configured via Vite env or empty string (dev proxy handles it).
 const BASE_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? '';
 
-// VM-P16B: Current API version.
-// Sent as Api-Version header on every request so the server can enforce
-// version-specific behaviour and echo back X-Api-Version for client verification.
+// API_VERSION is the stable date-based version sent on every /v1/* request.
+// Must match server's currentAPIVersion in compatibility_handlers.go.
 // Source: vm-16-03__blueprint__ §implementation_decisions "date-based versioning".
-const currentAPIVersion = '2024-01-15';
+const API_VERSION = '2024-01-15';
 
 // Principal ID — in production comes from the auth gateway / session.
 // For development: set VITE_PRINCIPAL_ID env var, or set principal_id in localStorage.
@@ -55,96 +51,62 @@ function getPrincipalID(): string {
   );
 }
 
-// VM-P16B: Retry configuration for transient errors.
-// SDK clients MUST implement a default retry policy with exponential backoff
-// for 429 and 5xx errors per the Resilience and Backpressure Signaling contract.
-// Source: vm-16-03__blueprint__ §core_contracts "Resilience and Backpressure Signaling".
-const MAX_RETRIES = 3;
-const BASE_DELAY_MS = 500;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function request<T>(
   method: string,
   path: string,
   body?: unknown,
   extraHeaders?: Record<string, string>,
 ): Promise<T> {
+  // VM-P16B: Api-Version is sent on all /v1/* paths so the server can enforce
+  // version negotiation and the client can detect deprecation via X-Api-Version.
+  const isVersionedPath = path.startsWith('/v1/');
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'X-Principal-ID': getPrincipalID(),
-    // VM-P16B: Send the API version on every request.
-    'Api-Version': currentAPIVersion,
+    ...(isVersionedPath ? { 'Api-Version': API_VERSION } : {}),
     ...extraHeaders,
   };
 
-  let lastError: ApiException | null = null;
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      // Exponential backoff with jitter.
-      const jitter = Math.random() * BASE_DELAY_MS;
-      const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1) + jitter;
-      await sleep(delay);
-    }
+  // VM-P16B: read X-Request-ID for error correlation.
+  const requestId = res.headers.get('X-Request-ID') ?? '';
 
-    const res = await fetch(`${BASE_URL}${path}`, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
-
-    // 204 No Content — no body to parse.
-    if (res.status === 204) {
-      return undefined as unknown as T;
-    }
-
-    let json: unknown;
-    try {
-      json = await res.json();
-    } catch {
-      throw new ApiException(res.status, {
-        error: {
-          code: 'parse_error',
-          message: 'Unexpected response from server.',
-          request_id: res.headers.get('X-Request-ID') ?? '',
-          details: [],
-        },
-      });
-    }
-
-    if (!res.ok) {
-      const err = new ApiException(res.status, json as ApiErrorEnvelope);
-
-      // VM-P16B: Retry on 429 (rate limited) and 5xx (transient server error).
-      // Honour Retry-After header when present.
-      // Do NOT retry on 4xx (client errors) — they are not transient.
-      // Source: vm-16-03__blueprint__ §core_contracts "Resilience and Backpressure Signaling".
-      const shouldRetry = res.status === 429 || res.status >= 500;
-      if (shouldRetry && attempt < MAX_RETRIES) {
-        const retryAfterHeader = res.headers.get('Retry-After');
-        if (retryAfterHeader) {
-          const retryAfterSec = parseInt(retryAfterHeader, 10);
-          if (!isNaN(retryAfterSec)) {
-            await sleep(retryAfterSec * 1000);
-            lastError = err;
-            continue;
-          }
-        }
-        lastError = err;
-        continue;
-      }
-
-      throw err;
-    }
-
-    return json as T;
+  if (res.status === 204) {
+    return undefined as unknown as T;
   }
 
-  // All retries exhausted.
-  throw lastError!;
+  let json: unknown;
+  try {
+    json = await res.json();
+  } catch {
+    throw new ApiException(res.status, {
+      error: {
+        code: 'parse_error',
+        message: 'Unexpected response from server.',
+        request_id: requestId,
+        details: [],
+      },
+    });
+  }
+
+  if (!res.ok) {
+    // Propagate the server's structured error. If request_id is missing from
+    // the body (shouldn't happen per API_ERROR_CONTRACT_V1 §7), fall back to
+    // the response header value.
+    const envelope = json as ApiErrorEnvelope;
+    if (!envelope.error.request_id) {
+      envelope.error.request_id = requestId;
+    }
+    throw new ApiException(res.status, envelope);
+  }
+
+  return json as T;
 }
 
 // ── Instances ─────────────────────────────────────────────────────────────────
@@ -152,18 +114,6 @@ async function request<T>(
 export const instancesApi = {
   list(): Promise<ListInstancesResponse> {
     return request<ListInstancesResponse>('GET', '/v1/instances');
-  },
-
-  // VM-P16B: Project-scoped instance list.
-  // When project_id is provided the list is scoped to that project's instances.
-  // The project must be owned by the calling principal (404-for-cross-account).
-  // Source: instance_handlers.go §"GET /v1/instances accepts ?project_id=",
-  //         vm-16-01__blueprint__ §quota_enforcement_point.
-  listByProject(projectId: string): Promise<ListInstancesResponse> {
-    return request<ListInstancesResponse>(
-      'GET',
-      `/v1/instances?project_id=${encodeURIComponent(projectId)}`,
-    );
   },
 
   get(id: string): Promise<Instance> {
@@ -217,21 +167,25 @@ export const sshKeysApi = {
   },
 };
 
-// ── Version compatibility check ───────────────────────────────────────────────
-
-// VM-P16B: checkAPIVersion verifies the server version is compatible with this client.
-// Called at SDK/app startup. Throws if the server returns a version the client
-// does not recognise.
+// ── Compatibility / operational endpoints ─────────────────────────────────────
 //
-// Source: vm-16-03__blueprint__ §core_contracts "API as the Single Source of Truth".
-export async function checkAPIVersion(): Promise<{ apiVersion: string; compatible: boolean }> {
-  try {
-    const resp = await request<{ api_version: string }>('GET', '/v1/version');
-    return {
-      apiVersion: resp.api_version,
-      compatible: resp.api_version === currentAPIVersion,
-    };
-  } catch {
-    return { apiVersion: 'unknown', compatible: false };
-  }
-}
+// VM-P16B: version() and health() allow SDK/CLI tooling to verify API
+// compatibility before making resource requests.
+//
+// Source: vm-16-03__blueprint__ §core_contracts "API as the Single Source of Truth",
+//         vm-16-03__blueprint__ §interaction_or_ops_contract (410 for removed versions).
+
+export const compatApi = {
+  // version() fetches /v1/version which returns the server's current API version.
+  // SDK/CLI tools should call this on startup to detect version drift and
+  // surface upgrade warnings before the user's request fails with 410.
+  version(): Promise<VersionInfo> {
+    return request<VersionInfo>('GET', '/v1/version');
+  },
+
+  // health() fetches /healthz — unauthenticated liveness probe.
+  // No Api-Version header is sent because /healthz predates versioning.
+  health(): Promise<HealthResponse> {
+    return request<HealthResponse>('GET', '/healthz');
+  },
+};

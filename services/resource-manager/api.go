@@ -273,6 +273,11 @@ func (s *server) routes() http.Handler {
 	// VM-P2D: Project management API.
 	s.registerProjectRoutes(mux)
 
+	// VM-P3C: Rollout gate admin endpoints (internal, mTLS-protected).
+	// No-op when server.rolloutGate == nil (backward compatible).
+	// Source: VM_PHASE_ROADMAP §9 "bounded rollout controls".
+	s.registerRolloutRoutes(mux)
+
 	// VM-P16B: Wrap the public mux with API-versioning and request-ID middleware,
 	// then with CORS. Middleware order (innermost first):
 	//   1. apiVersionMiddleware — reads Api-Version, rejects removed versions (410),

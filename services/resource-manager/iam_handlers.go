@@ -94,7 +94,7 @@ type roleBindingResponse struct {
 	CreatedAt    string `json:"created_at"`
 }
 
-func rbToResponse(rb *db.IAMRoleBindingRow) roleBindingResponse {
+func rbToResponse(rb *db.RoleBindingRow) roleBindingResponse {
 	return roleBindingResponse{
 		ID:           rb.ID,
 		ProjectID:    rb.ProjectID,
