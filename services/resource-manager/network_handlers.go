@@ -1,22 +1,9 @@
 package main
 
-// network_handlers.go — Phase 2/P3A VPC networking HTTP handlers.
+// network_handlers.go — Phase 2 VPC networking HTTP handlers.
 //
 // Source: P2_VPC_NETWORK_CONTRACT §10 (API Endpoints Summary).
 // Phase 2 M9: VPC, Subnet, SecurityGroup, SecurityGroupRule endpoints.
-// VM-P3A Job 1: Extended VPC/Subnet with cidr_ipv6; extended RouteEntry with
-//               address_family; added Internet Gateway CRUD handlers; enforced
-//               IGW Exclusivity and NAT Anti-Loop contracts in HandleAddRouteEntry.
-//
-// Route-table contract enforcement:
-//   - IGW Exclusivity: 0.0.0.0/0 or ::/0 routes targeting 'igw' require the IGW
-//     to be attached to the route table's parent VPC. Enforced via repo helper.
-//   - NAT Anti-Loop: 0.0.0.0/0 routes targeting 'nat' require the NAT Gateway to
-//     not be in any subnet associated with this route table. Enforced via repo helper.
-//   - Gateway Default Route Target: 'igw' and 'nat' are only valid targets for
-//     default routes (0.0.0.0/0 or ::/0). Enforced inline.
-//
-// Source: vm-14-03__blueprint__ §core_contracts.
 
 import (
 	"context"
@@ -33,43 +20,35 @@ import (
 // ── Request/Response Types ───────────────────────────────────────────────────
 
 // VPCCreateRequest is the request body for POST /v1/vpcs.
-// VM-P3A Job 1: Added CIDRIPv6 (optional; when present, creates a dual-stack VPC).
 type VPCCreateRequest struct {
-	Name     string  `json:"name"`
-	CIDR     string  `json:"cidr"`
-	CIDRIPv6 *string `json:"cidr_ipv6,omitempty"`
+	Name string `json:"name"`
+	CIDR string `json:"cidr"`
 }
 
 // VPCResponse is the API response shape for a VPC resource.
-// VM-P3A Job 1: Added CIDRIPv6.
 type VPCResponse struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
 	Owner     string    `json:"owner"`
 	CIDR      string    `json:"cidr"`
-	CIDRIPv6  *string   `json:"cidr_ipv6,omitempty"`
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 // SubnetCreateRequest is the request body for POST /v1/vpcs/{vpc_id}/subnets.
-// VM-P3A Job 1: Added CIDRIPv6 (optional; when present, creates a dual-stack subnet).
 type SubnetCreateRequest struct {
-	Name             string  `json:"name"`
-	CIDR             string  `json:"cidr"`
-	CIDRIPv6         *string `json:"cidr_ipv6,omitempty"`
-	AvailabilityZone string  `json:"availability_zone"`
+	Name             string `json:"name"`
+	CIDR             string `json:"cidr"`
+	AvailabilityZone string `json:"availability_zone"`
 }
 
 // SubnetResponse is the API response shape for a Subnet resource.
-// VM-P3A Job 1: Added CIDRIPv6.
 type SubnetResponse struct {
 	ID               string    `json:"id"`
 	VPCID            string    `json:"vpc_id"`
 	Name             string    `json:"name"`
 	Owner            string    `json:"owner"`
 	CIDR             string    `json:"cidr"`
-	CIDRIPv6         *string   `json:"cidr_ipv6,omitempty"`
 	AvailabilityZone string    `json:"availability_zone"`
 	Status           string    `json:"status"`
 	CreatedAt        time.Time `json:"created_at"`
@@ -132,44 +111,20 @@ type RouteTableResponse struct {
 }
 
 // RouteEntryCreateRequest is the request body for POST /v1/route_tables/{rtb_id}/routes.
-// VM-P3A Job 1: Added AddressFamily (optional; defaults to 'ipv4').
-// For igw-targeted routes, NATGatewaySubnetID is required to enable loop detection
-// when target_type is 'nat'.
 type RouteEntryCreateRequest struct {
-	DestinationCIDR    string  `json:"destination_cidr"`
-	TargetType         string  `json:"target_type"` // "local", "igw", "nat", "peering"
-	TargetID           *string `json:"target_id,omitempty"`
-	AddressFamily      string  `json:"address_family,omitempty"` // "ipv4" | "ipv6" | "dual"
-	NATGatewaySubnetID *string `json:"nat_gateway_subnet_id,omitempty"` // required for nat routes
+	DestinationCIDR string  `json:"destination_cidr"`
+	TargetType      string  `json:"target_type"` // "local", "igw", "nat", "peering"
+	TargetID        *string `json:"target_id,omitempty"`
 }
 
 // RouteEntryResponse is the API response shape for a route entry.
-// VM-P3A Job 1: Added AddressFamily.
 type RouteEntryResponse struct {
 	ID              string  `json:"id"`
 	DestinationCIDR string  `json:"destination_cidr"`
 	TargetType      string  `json:"target_type"`
 	TargetID        *string `json:"target_id,omitempty"`
-	AddressFamily   string  `json:"address_family"`
 	Priority        int     `json:"priority"`
 	Status          string  `json:"status"`
-}
-
-// InternetGatewayCreateRequest is the request body for POST /v1/vpcs/{vpc_id}/internet_gateways.
-// VM-P3A Job 1: New resource type.
-type InternetGatewayCreateRequest struct {
-	// No body fields needed beyond the vpc_id path parameter.
-	// The IGW is tied to the VPC at creation time.
-}
-
-// InternetGatewayResponse is the API response shape for an InternetGateway resource.
-// VM-P3A Job 1: New resource type.
-type InternetGatewayResponse struct {
-	ID        string    `json:"id"`
-	VPCID     string    `json:"vpc_id"`
-	Owner     string    `json:"owner"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
 }
 
 // NetworkAPIError is the standard error response shape per API_ERROR_CONTRACT_V1.
@@ -227,17 +182,6 @@ type NetworkRepo interface {
 	CreateRouteEntry(ctx context.Context, row *db.RouteEntryRow) error
 	ListRouteEntriesByRouteTable(ctx context.Context, routeTableID string) ([]*db.RouteEntryRow, error)
 	DeleteRouteEntry(ctx context.Context, id string) error
-
-	// Route validation helpers — VM-P3A Job 1
-	ValidateIGWExclusivity(ctx context.Context, routeTableID, igwID string) error
-	ValidateRouteLoopFree(ctx context.Context, routeTableID, natGatewaySubnetID string) error
-
-	// InternetGateway methods — VM-P3A Job 1
-	CreateInternetGateway(ctx context.Context, row *db.InternetGatewayRow) error
-	GetInternetGatewayByID(ctx context.Context, id string) (*db.InternetGatewayRow, error)
-	GetInternetGatewayByVPC(ctx context.Context, vpcID string) (*db.InternetGatewayRow, error)
-	ListInternetGatewaysByOwner(ctx context.Context, ownerPrincipalID string) ([]*db.InternetGatewayRow, error)
-	SoftDeleteInternetGateway(ctx context.Context, id string) error
 }
 
 // NewNetworkHandlers creates a new NetworkHandlers instance.
@@ -254,32 +198,6 @@ func generateID(prefix string) string {
 		panic(err)
 	}
 	return prefix + hex.EncodeToString(b)
-}
-
-// ── IPv6 CIDR validation ─────────────────────────────────────────────────────
-
-// isValidIPv6CIDR does a lightweight format check for an IPv6 CIDR string.
-// PostgreSQL will do the authoritative check on INSERT, but we want to return
-// a clean 400 before hitting the DB.
-func isValidIPv6CIDR(cidr string) bool {
-	if cidr == "" {
-		return false
-	}
-	// Must contain a colon (IPv6) and a slash (CIDR notation).
-	return strings.Contains(cidr, ":") && strings.Contains(cidr, "/")
-}
-
-// isDefaultRoute returns true when the destination CIDR represents the default
-// IPv4 or IPv6 route.
-func isDefaultRoute(cidr string) bool {
-	return cidr == "0.0.0.0/0" || cidr == "::/0"
-}
-
-// validAddressFamilies is the set of accepted address_family values.
-var validAddressFamilies = map[string]bool{
-	"ipv4": true,
-	"ipv6": true,
-	"dual": true,
 }
 
 // ── VPC Handlers ─────────────────────────────────────────────────────────────
@@ -309,12 +227,6 @@ func (h *NetworkHandlers) HandleCreateVPC(w http.ResponseWriter, r *http.Request
 		writeNetworkError(w, http.StatusBadRequest, "missing_field", "Field 'cidr' is required", "cidr", requestID)
 		return
 	}
-	// VM-P3A Job 1: validate optional IPv6 CIDR.
-	// Source: vm-14-01__blueprint__ §core_contracts "Dual-Stack Mandate" (/56 per VPC).
-	if req.CIDRIPv6 != nil && !isValidIPv6CIDR(*req.CIDRIPv6) {
-		writeNetworkError(w, http.StatusBadRequest, "invalid_value", "Field 'cidr_ipv6' must be a valid IPv6 CIDR (e.g. 2001:db8::/56)", "cidr_ipv6", requestID)
-		return
-	}
 
 	vpcID := generateID("vpc_")
 	now := time.Now().UTC()
@@ -323,7 +235,6 @@ func (h *NetworkHandlers) HandleCreateVPC(w http.ResponseWriter, r *http.Request
 		OwnerPrincipalID: principalID,
 		Name:             req.Name,
 		CIDRIPv4:         req.CIDR,
-		CIDRIPv6:         req.CIDRIPv6,
 		Status:           "active",
 		CreatedAt:        now,
 		UpdatedAt:        now,
@@ -339,7 +250,6 @@ func (h *NetworkHandlers) HandleCreateVPC(w http.ResponseWriter, r *http.Request
 		Name:      row.Name,
 		Owner:     row.OwnerPrincipalID,
 		CIDR:      row.CIDRIPv4,
-		CIDRIPv6:  row.CIDRIPv6,
 		Status:    row.Status,
 		CreatedAt: row.CreatedAt,
 	}
@@ -376,7 +286,6 @@ func (h *NetworkHandlers) HandleGetVPC(w http.ResponseWriter, r *http.Request, v
 		Name:      row.Name,
 		Owner:     row.OwnerPrincipalID,
 		CIDR:      row.CIDRIPv4,
-		CIDRIPv6:  row.CIDRIPv6,
 		Status:    row.Status,
 		CreatedAt: row.CreatedAt,
 	}
@@ -404,7 +313,6 @@ func (h *NetworkHandlers) HandleListVPCs(w http.ResponseWriter, r *http.Request)
 			Name:      row.Name,
 			Owner:     row.OwnerPrincipalID,
 			CIDR:      row.CIDRIPv4,
-			CIDRIPv6:  row.CIDRIPv6,
 			Status:    row.Status,
 			CreatedAt: row.CreatedAt,
 		})
@@ -487,12 +395,6 @@ func (h *NetworkHandlers) HandleCreateSubnet(w http.ResponseWriter, r *http.Requ
 		writeNetworkError(w, http.StatusBadRequest, "missing_field", "Field 'availability_zone' is required", "availability_zone", requestID)
 		return
 	}
-	// VM-P3A Job 1: validate optional IPv6 CIDR.
-	// Source: vm-14-01__blueprint__ §core_contracts "Dual-Stack Mandate" (/64 per Subnet).
-	if req.CIDRIPv6 != nil && !isValidIPv6CIDR(*req.CIDRIPv6) {
-		writeNetworkError(w, http.StatusBadRequest, "invalid_value", "Field 'cidr_ipv6' must be a valid IPv6 CIDR (e.g. 2001:db8:0:1::/64)", "cidr_ipv6", requestID)
-		return
-	}
 
 	subnetID := generateID("subnet_")
 	now := time.Now().UTC()
@@ -501,7 +403,6 @@ func (h *NetworkHandlers) HandleCreateSubnet(w http.ResponseWriter, r *http.Requ
 		VPCID:            vpcID,
 		Name:             req.Name,
 		CIDRIPv4:         req.CIDR,
-		CIDRIPv6:         req.CIDRIPv6,
 		AvailabilityZone: req.AvailabilityZone,
 		Status:           "active",
 		CreatedAt:        now,
@@ -519,7 +420,6 @@ func (h *NetworkHandlers) HandleCreateSubnet(w http.ResponseWriter, r *http.Requ
 		Name:             row.Name,
 		Owner:            principalID,
 		CIDR:             row.CIDRIPv4,
-		CIDRIPv6:         row.CIDRIPv6,
 		AvailabilityZone: row.AvailabilityZone,
 		Status:           row.Status,
 		CreatedAt:        row.CreatedAt,
@@ -563,7 +463,6 @@ func (h *NetworkHandlers) HandleGetSubnet(w http.ResponseWriter, r *http.Request
 		Name:             row.Name,
 		Owner:            principalID,
 		CIDR:             row.CIDRIPv4,
-		CIDRIPv6:         row.CIDRIPv6,
 		AvailabilityZone: row.AvailabilityZone,
 		Status:           row.Status,
 		CreatedAt:        row.CreatedAt,
@@ -604,7 +503,6 @@ func (h *NetworkHandlers) HandleListSubnets(w http.ResponseWriter, r *http.Reque
 			Name:             row.Name,
 			Owner:            principalID,
 			CIDR:             row.CIDRIPv4,
-			CIDRIPv6:         row.CIDRIPv6,
 			AvailabilityZone: row.AvailabilityZone,
 			Status:           row.Status,
 			CreatedAt:        row.CreatedAt,
@@ -869,6 +767,15 @@ func (h *NetworkHandlers) HandleAddSecurityGroupRule(w http.ResponseWriter, r *h
 	}
 
 	// VM-P2A-S3: Port range and protocol-port compatibility validation.
+	//
+	// Ownership: resource-manager owns API admission validation.
+	// The actual enforcement model (host-agent SG policy application) is a
+	// separate seam defined in services/host-agent/runtime/network.go.
+	//
+	// Rules:
+	//   SG-I-4a: port_from and port_to must be in [0, 65535] when set.
+	//   SG-I-4b: port_from must be <= port_to when both are set.
+	//   SG-I-4c: protocol 'icmp' and 'all' must not carry port fields.
 	if req.Protocol == "tcp" || req.Protocol == "udp" {
 		if req.PortFrom != nil {
 			if *req.PortFrom < 0 || *req.PortFrom > 65535 {
@@ -900,6 +807,8 @@ func (h *NetworkHandlers) HandleAddSecurityGroupRule(w http.ResponseWriter, r *h
 	}
 
 	// SG-I-2: Max 50 rules per security group.
+	// Checked at admission time to keep the rule set bounded.
+	// Source: vm-14-02 skill §enforcement model.
 	existingRules, err := h.repo.ListSecurityGroupRulesBySecurityGroup(ctx, sgID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to check rule count", "", requestID)
@@ -1078,7 +987,6 @@ func (h *NetworkHandlers) HandleGetRouteTable(w http.ResponseWriter, r *http.Req
 			DestinationCIDR: route.DestinationCIDR,
 			TargetType:      route.TargetType,
 			TargetID:        route.TargetID,
-			AddressFamily:   route.AddressFamily,
 			Priority:        route.Priority,
 			Status:          route.Status,
 		})
@@ -1129,7 +1037,7 @@ func (h *NetworkHandlers) HandleListRouteTables(w http.ResponseWriter, r *http.R
 			Name:      row.Name,
 			IsDefault: row.IsDefault,
 			Status:    row.Status,
-			Routes:    []RouteEntryResponse{},
+			Routes:    []RouteEntryResponse{}, // Don't include routes in list response
 			CreatedAt: row.CreatedAt,
 		})
 	}
@@ -1181,14 +1089,6 @@ func (h *NetworkHandlers) HandleDeleteRouteTable(w http.ResponseWriter, r *http.
 }
 
 // HandleAddRouteEntry handles POST /v1/route_tables/{rtb_id}/routes.
-//
-// VM-P3A Job 1: enforces:
-//   - Gateway Default Route Target: 'igw' and 'nat' are only valid for default routes.
-//   - IGW Exclusivity: 'igw' target must be attached to the route table's VPC.
-//   - NAT Anti-Loop: 'nat' target subnet must differ from all subnets using this route table.
-//   - Address family validation.
-//
-// Source: vm-14-03__blueprint__ §core_contracts.
 func (h *NetworkHandlers) HandleAddRouteEntry(w http.ResponseWriter, r *http.Request, rtbID string) {
 	ctx := r.Context()
 	requestID := getNetworkRequestID(ctx)
@@ -1222,8 +1122,7 @@ func (h *NetworkHandlers) HandleAddRouteEntry(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// ── Field validation ──────────────────────────────────────────────────────
-
+	// Validation
 	if req.DestinationCIDR == "" {
 		writeNetworkError(w, http.StatusBadRequest, "missing_field", "Field 'destination_cidr' is required", "destination_cidr", requestID)
 		return
@@ -1237,67 +1136,10 @@ func (h *NetworkHandlers) HandleAddRouteEntry(w http.ResponseWriter, r *http.Req
 		writeNetworkError(w, http.StatusBadRequest, "invalid_value", "Field 'target_type' must be 'local', 'igw', 'nat', or 'peering'", "target_type", requestID)
 		return
 	}
-	// 'local' routes don't need a target_id; others do.
+	// 'local' routes don't need a target_id; others do
 	if req.TargetType != "local" && (req.TargetID == nil || *req.TargetID == "") {
 		writeNetworkError(w, http.StatusBadRequest, "missing_field", "Field 'target_id' is required for non-local routes", "target_id", requestID)
 		return
-	}
-
-	// VM-P3A Job 1: address_family validation.
-	// Source: 007 migration, route_entries.address_family CHECK constraint.
-	af := req.AddressFamily
-	if af == "" {
-		af = "ipv4"
-	}
-	if !validAddressFamilies[af] {
-		writeNetworkError(w, http.StatusBadRequest, "invalid_value", "Field 'address_family' must be 'ipv4', 'ipv6', or 'dual'", "address_family", requestID)
-		return
-	}
-
-	// ── Gateway Default Route Target contract ─────────────────────────────────
-	// 'igw' and 'nat' are only valid targets for default routes (0.0.0.0/0 or ::/0).
-	// Source: vm-14-03__blueprint__ §core_contracts "Gateway Default Route Target".
-	if (req.TargetType == "igw" || req.TargetType == "nat") && !isDefaultRoute(req.DestinationCIDR) {
-		writeNetworkError(w, http.StatusUnprocessableEntity, "invalid_route",
-			"Target type '"+req.TargetType+"' is only valid for default routes (0.0.0.0/0 or ::/0)",
-			"target_type", requestID)
-		return
-	}
-
-	// ── IGW Exclusivity contract ──────────────────────────────────────────────
-	// Source: vm-14-03__blueprint__ §core_contracts "Internet Gateway Exclusivity".
-	if req.TargetType == "igw" {
-		if err := h.repo.ValidateIGWExclusivity(ctx, rtbID, *req.TargetID); err != nil {
-			if _, ok := err.(*db.IGWExclusivityError); ok {
-				writeNetworkError(w, http.StatusUnprocessableEntity, "igw_not_attached",
-					"Internet gateway is not attached to the VPC that owns this route table",
-					"target_id", requestID)
-				return
-			}
-			writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to validate internet gateway", "", requestID)
-			return
-		}
-	}
-
-	// ── NAT Anti-Loop contract ────────────────────────────────────────────────
-	// Source: vm-14-03__blueprint__ §core_contracts "NAT Gateway Anti-Loop".
-	if req.TargetType == "nat" {
-		if req.NATGatewaySubnetID == nil || *req.NATGatewaySubnetID == "" {
-			writeNetworkError(w, http.StatusBadRequest, "missing_field",
-				"Field 'nat_gateway_subnet_id' is required for routes targeting a NAT gateway",
-				"nat_gateway_subnet_id", requestID)
-			return
-		}
-		if err := h.repo.ValidateRouteLoopFree(ctx, rtbID, *req.NATGatewaySubnetID); err != nil {
-			if _, ok := err.(*db.NATLoopError); ok {
-				writeNetworkError(w, http.StatusUnprocessableEntity, "routing_loop_detected",
-					"Route would create a NAT routing loop: the NAT gateway is in a subnet that uses this route table",
-					"nat_gateway_subnet_id", requestID)
-				return
-			}
-			writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to validate route loop", "", requestID)
-			return
-		}
 	}
 
 	rteID := generateID("rte_")
@@ -1308,7 +1150,6 @@ func (h *NetworkHandlers) HandleAddRouteEntry(w http.ResponseWriter, r *http.Req
 		DestinationCIDR: req.DestinationCIDR,
 		TargetType:      req.TargetType,
 		TargetID:        req.TargetID,
-		AddressFamily:   af,
 		Priority:        100, // Default priority
 		Status:          "active",
 		CreatedAt:       now,
@@ -1324,7 +1165,6 @@ func (h *NetworkHandlers) HandleAddRouteEntry(w http.ResponseWriter, r *http.Req
 		DestinationCIDR: row.DestinationCIDR,
 		TargetType:      row.TargetType,
 		TargetID:        row.TargetID,
-		AddressFamily:   row.AddressFamily,
 		Priority:        row.Priority,
 		Status:          row.Status,
 	}
@@ -1364,175 +1204,6 @@ func (h *NetworkHandlers) HandleDeleteRouteEntry(w http.ResponseWriter, r *http.
 
 	if err := h.repo.DeleteRouteEntry(ctx, rteID); err != nil {
 		writeNetworkError(w, http.StatusNotFound, "route_not_found", "Route not found", "", requestID)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// ── Internet Gateway Handlers — VM-P3A Job 1 ─────────────────────────────────
-//
-// The Internet Gateway is a first-class resource that must be explicitly attached
-// to a VPC to enable default internet routing. One IGW per VPC enforced by DB index.
-// Source: vm-14-03__blueprint__ §core_contracts "Internet Gateway Exclusivity",
-//         §implementation_decisions "explicit InternetGateway resource".
-
-// HandleCreateInternetGateway handles POST /v1/vpcs/{vpc_id}/internet_gateways.
-func (h *NetworkHandlers) HandleCreateInternetGateway(w http.ResponseWriter, r *http.Request, vpcID string) {
-	ctx := r.Context()
-	requestID := getNetworkRequestID(ctx)
-	principalID := getNetworkPrincipalID(ctx)
-
-	// Verify VPC exists and is owned by principal
-	vpc, err := h.repo.GetVPCByID(ctx, vpcID)
-	if err != nil {
-		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
-		return
-	}
-	if vpc == nil || vpc.OwnerPrincipalID != principalID {
-		writeNetworkError(w, http.StatusNotFound, "vpc_not_found", "VPC not found", "", requestID)
-		return
-	}
-
-	// Check that this VPC does not already have an active IGW.
-	// The DB unique index provides the hard enforcement; this check gives a
-	// friendly 409 before the INSERT reaches the DB.
-	existing, err := h.repo.GetInternetGatewayByVPC(ctx, vpcID)
-	if err != nil {
-		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to check existing internet gateway", "", requestID)
-		return
-	}
-	if existing != nil {
-		writeNetworkError(w, http.StatusConflict, "igw_already_attached",
-			"VPC already has an internet gateway attached; detach or delete it before creating a new one",
-			"", requestID)
-		return
-	}
-
-	igwID := generateID("igw_")
-	now := time.Now().UTC()
-	row := &db.InternetGatewayRow{
-		ID:               igwID,
-		VPCID:            vpcID,
-		OwnerPrincipalID: principalID,
-		Status:           "available",
-		CreatedAt:        now,
-		UpdatedAt:        now,
-	}
-
-	if err := h.repo.CreateInternetGateway(ctx, row); err != nil {
-		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to create internet gateway", "", requestID)
-		return
-	}
-
-	resp := InternetGatewayResponse{
-		ID:        row.ID,
-		VPCID:     row.VPCID,
-		Owner:     row.OwnerPrincipalID,
-		Status:    row.Status,
-		CreatedAt: row.CreatedAt,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(resp)
-}
-
-// HandleGetInternetGateway handles GET /v1/vpcs/{vpc_id}/internet_gateways/{igw_id}.
-func (h *NetworkHandlers) HandleGetInternetGateway(w http.ResponseWriter, r *http.Request, vpcID, igwID string) {
-	ctx := r.Context()
-	requestID := getNetworkRequestID(ctx)
-	principalID := getNetworkPrincipalID(ctx)
-
-	// Verify VPC ownership first
-	vpc, err := h.repo.GetVPCByID(ctx, vpcID)
-	if err != nil {
-		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
-		return
-	}
-	if vpc == nil || vpc.OwnerPrincipalID != principalID {
-		writeNetworkError(w, http.StatusNotFound, "vpc_not_found", "VPC not found", "", requestID)
-		return
-	}
-
-	row, err := h.repo.GetInternetGatewayByID(ctx, igwID)
-	if err != nil {
-		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve internet gateway", "", requestID)
-		return
-	}
-	if row == nil || row.VPCID != vpcID || row.OwnerPrincipalID != principalID {
-		writeNetworkError(w, http.StatusNotFound, "igw_not_found", "Internet gateway not found", "", requestID)
-		return
-	}
-
-	resp := InternetGatewayResponse{
-		ID:        row.ID,
-		VPCID:     row.VPCID,
-		Owner:     row.OwnerPrincipalID,
-		Status:    row.Status,
-		CreatedAt: row.CreatedAt,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-// HandleListInternetGateways handles GET /v1/internet_gateways.
-func (h *NetworkHandlers) HandleListInternetGateways(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	requestID := getNetworkRequestID(ctx)
-	principalID := getNetworkPrincipalID(ctx)
-
-	rows, err := h.repo.ListInternetGatewaysByOwner(ctx, principalID)
-	if err != nil {
-		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to list internet gateways", "", requestID)
-		return
-	}
-
-	igws := make([]InternetGatewayResponse, 0, len(rows))
-	for _, row := range rows {
-		igws = append(igws, InternetGatewayResponse{
-			ID:        row.ID,
-			VPCID:     row.VPCID,
-			Owner:     row.OwnerPrincipalID,
-			Status:    row.Status,
-			CreatedAt: row.CreatedAt,
-		})
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"internet_gateways": igws})
-}
-
-// HandleDeleteInternetGateway handles DELETE /v1/vpcs/{vpc_id}/internet_gateways/{igw_id}.
-func (h *NetworkHandlers) HandleDeleteInternetGateway(w http.ResponseWriter, r *http.Request, vpcID, igwID string) {
-	ctx := r.Context()
-	requestID := getNetworkRequestID(ctx)
-	principalID := getNetworkPrincipalID(ctx)
-
-	// Verify VPC ownership first
-	vpc, err := h.repo.GetVPCByID(ctx, vpcID)
-	if err != nil {
-		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
-		return
-	}
-	if vpc == nil || vpc.OwnerPrincipalID != principalID {
-		writeNetworkError(w, http.StatusNotFound, "vpc_not_found", "VPC not found", "", requestID)
-		return
-	}
-
-	row, err := h.repo.GetInternetGatewayByID(ctx, igwID)
-	if err != nil {
-		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve internet gateway", "", requestID)
-		return
-	}
-	if row == nil || row.VPCID != vpcID || row.OwnerPrincipalID != principalID {
-		writeNetworkError(w, http.StatusNotFound, "igw_not_found", "Internet gateway not found", "", requestID)
-		return
-	}
-
-	if err := h.repo.SoftDeleteInternetGateway(ctx, igwID); err != nil {
-		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to delete internet gateway", "", requestID)
 		return
 	}
 
