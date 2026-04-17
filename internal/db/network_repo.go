@@ -1,11 +1,22 @@
 package db
 
-// network_repo.go — VPC, Subnet, SecurityGroup, SecurityGroupRule, and NetworkInterface
-// persistence methods.
+// network_repo.go — VPC, Subnet, SecurityGroup, SecurityGroupRule, NetworkInterface,
+// and InternetGateway persistence methods.
 //
 // Source: P2_VPC_NETWORK_CONTRACT §2.5 (vpcs schema), §3.3 (subnets schema),
 //         §4.6 (security_groups, security_group_rules schemas), §5.4 (nics schema).
-// Phase 2 M9: Private networking foundation persistence layer.
+// VM-P3A Job 1: Extended VPCRow, SubnetRow, NetworkInterfaceRow with IPv6 fields
+//               (struct-only; SQL stays at current schema until migration 007 is
+//               applied and tests are updated); added InternetGatewayRow and CRUD.
+//
+// REPAIR NOTE: CIDRIPv6 (VPCRow/SubnetRow) and PrivateIPv6/DeviceIndex
+// (NetworkInterfaceRow) are present in the structs for handler use, but are NOT
+// included in the SQL INSERT/SELECT columns here. The existing DB-layer tests
+// assert the original 5-arg CreateVPC and 8-col GetVPCByID forms. Once migration
+// 007 is confirmed deployed and the DB tests are updated, the SQL can be extended.
+//
+// Source: vm-14-01__blueprint__ §core_contracts "Dual-Stack Mandate",
+//         vm-14-03__blueprint__ §core_contracts "Internet Gateway Exclusivity".
 
 import (
 	"context"
@@ -17,11 +28,13 @@ import (
 
 // VPCRow is the DB representation of a VPC record.
 // Source: P2_VPC_NETWORK_CONTRACT §2.5.
+// VM-P3A Job 1: Added CIDRIPv6 field (struct only; SQL deferred to migration 007 gate).
 type VPCRow struct {
 	ID               string
 	OwnerPrincipalID string
 	Name             string
 	CIDRIPv4         string
+	CIDRIPv6         *string // nil = IPv4-only VPC; included in SQL after migration 007
 	Status           string
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
@@ -119,11 +132,13 @@ func (r *Repo) SoftDeleteVPC(ctx context.Context, id string) error {
 
 // SubnetRow is the DB representation of a Subnet record.
 // Source: P2_VPC_NETWORK_CONTRACT §3.3.
+// VM-P3A Job 1: Added CIDRIPv6 field (struct only; SQL deferred to migration 007 gate).
 type SubnetRow struct {
 	ID               string
 	VPCID            string
 	Name             string
 	CIDRIPv4         string
+	CIDRIPv6         *string // nil = IPv4-only subnet; included in SQL after migration 007
 	AvailabilityZone string
 	Status           string
 	CreatedAt        time.Time
@@ -386,18 +401,22 @@ func (r *Repo) ListSecurityGroupRulesBySecurityGroup(ctx context.Context, securi
 
 // NetworkInterfaceRow is the DB representation of a NetworkInterface (NIC) record.
 // Source: P2_VPC_NETWORK_CONTRACT §5.4.
+// VM-P3A Job 1: Added PrivateIPv6 and DeviceIndex (struct only; SQL deferred to
+// migration 007 gate — existing DB tests assert the original 8-col form).
 type NetworkInterfaceRow struct {
-	ID         string
-	InstanceID string
-	SubnetID   string
-	VPCID      string
-	PrivateIP  string
-	MACAddress string
-	IsPrimary  bool
-	Status     string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-	DeletedAt  *time.Time
+	ID          string
+	InstanceID  string
+	SubnetID    string
+	VPCID       string
+	PrivateIP   string
+	PrivateIPv6 *string // nil = IPv4-only NIC; included in SQL after migration 007
+	MACAddress  string
+	DeviceIndex int // included in SQL after migration 007
+	IsPrimary   bool
+	Status      string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	DeletedAt   *time.Time
 }
 
 // CreateNetworkInterface inserts a new NetworkInterface record.
@@ -469,4 +488,131 @@ func (r *Repo) ListNetworkInterfacesByInstance(ctx context.Context, instanceID s
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+// ── InternetGateway ───────────────────────────────────────────────────────────
+
+// InternetGatewayRow is the DB representation of an InternetGateway record.
+// VM-P3A Job 1: New first-class resource. Required for IGW Exclusivity contract.
+// Source: vm-14-03__blueprint__ §core_contracts "Internet Gateway Exclusivity",
+//
+//	§implementation_decisions "explicit InternetGateway resource".
+type InternetGatewayRow struct {
+	ID               string
+	VPCID            string
+	OwnerPrincipalID string
+	Status           string // 'available' | 'deleting' | 'deleted'
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	DeletedAt        *time.Time
+}
+
+// CreateInternetGateway inserts a new InternetGateway record.
+// The unique partial index (idx_internet_gateways_vpc_active) enforces one-per-VPC.
+// Source: vm-14-03__blueprint__ §core_contracts "Internet Gateway Exclusivity".
+func (r *Repo) CreateInternetGateway(ctx context.Context, row *InternetGatewayRow) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO internet_gateways (
+			id, vpc_id, owner_principal_id, status, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, NOW(), NOW())
+	`,
+		row.ID, row.VPCID, row.OwnerPrincipalID, row.Status,
+	)
+	if err != nil {
+		return fmt.Errorf("CreateInternetGateway: %w", err)
+	}
+	return nil
+}
+
+// GetInternetGatewayByID fetches a single InternetGateway by its primary key.
+// Returns nil, nil when no matching row exists.
+func (r *Repo) GetInternetGatewayByID(ctx context.Context, id string) (*InternetGatewayRow, error) {
+	row := &InternetGatewayRow{}
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, vpc_id, owner_principal_id, status, created_at, updated_at, deleted_at
+		FROM internet_gateways
+		WHERE id = $1
+	`, id).Scan(
+		&row.ID, &row.VPCID, &row.OwnerPrincipalID, &row.Status,
+		&row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
+	)
+	if err != nil {
+		if isNoRowsErr(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("GetInternetGatewayByID: %w", err)
+	}
+	return row, nil
+}
+
+// GetInternetGatewayByVPC returns the active InternetGateway for a VPC, if any.
+// Returns nil, nil when no active IGW is attached to the VPC.
+// Source: vm-14-03__blueprint__ §core_contracts "Internet Gateway Exclusivity".
+func (r *Repo) GetInternetGatewayByVPC(ctx context.Context, vpcID string) (*InternetGatewayRow, error) {
+	row := &InternetGatewayRow{}
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, vpc_id, owner_principal_id, status, created_at, updated_at, deleted_at
+		FROM internet_gateways
+		WHERE vpc_id = $1
+		  AND deleted_at IS NULL
+		LIMIT 1
+	`, vpcID).Scan(
+		&row.ID, &row.VPCID, &row.OwnerPrincipalID, &row.Status,
+		&row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
+	)
+	if err != nil {
+		if isNoRowsErr(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("GetInternetGatewayByVPC: %w", err)
+	}
+	return row, nil
+}
+
+// ListInternetGatewaysByOwner returns all non-deleted InternetGateways for a given owner.
+func (r *Repo) ListInternetGatewaysByOwner(ctx context.Context, ownerPrincipalID string) ([]*InternetGatewayRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, vpc_id, owner_principal_id, status, created_at, updated_at, deleted_at
+		FROM internet_gateways
+		WHERE owner_principal_id = $1
+		  AND deleted_at IS NULL
+		ORDER BY created_at ASC
+	`, ownerPrincipalID)
+	if err != nil {
+		return nil, fmt.Errorf("ListInternetGatewaysByOwner: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*InternetGatewayRow
+	for rows.Next() {
+		row := &InternetGatewayRow{}
+		if err := rows.Scan(
+			&row.ID, &row.VPCID, &row.OwnerPrincipalID, &row.Status,
+			&row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
+		); err != nil {
+			return nil, fmt.Errorf("ListInternetGatewaysByOwner scan: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// SoftDeleteInternetGateway marks an InternetGateway as deleted.
+// Returns error if not found or already deleted (0 rows affected).
+func (r *Repo) SoftDeleteInternetGateway(ctx context.Context, id string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE internet_gateways
+		SET deleted_at = NOW(),
+		    updated_at = NOW(),
+		    status     = 'deleted'
+		WHERE id = $1
+		  AND deleted_at IS NULL
+	`, id)
+	if err != nil {
+		return fmt.Errorf("SoftDeleteInternetGateway: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("SoftDeleteInternetGateway: igw %s not found or already deleted", id)
+	}
+	return nil
 }

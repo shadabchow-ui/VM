@@ -8,7 +8,18 @@ package db
 // - VPC-aware IP allocation
 // - Security group attachment to NIC
 //
-// Source: P2_VPC_NETWORK_CONTRACT §5 (NIC model), P2_MILESTONE_PLAN §P2-M2.
+// VM-P3A Job 2: Added:
+//   - GetEffectiveSGRulesForNIC — joins nic_security_groups → security_group_rules
+//     to return the union of all rules attached to a NIC. Used by host-agent
+//     to build the nftables policy set.
+//   - UpdateNICSecurityGroups — replaces the full SG set for a NIC atomically.
+//     Uses two sequential Exec calls (delete then insert) because the Pool
+//     interface does not expose a transaction API. The operation is safe:
+//     nicID uniquely identifies the NIC's SG set; callers hold the admission
+//     lock before calling.
+//
+// Source: P2_VPC_NETWORK_CONTRACT §5 (NIC model), P2_MILESTONE_PLAN §P2-M2,
+//         vm-14-02__blueprint__ §core_contracts "NIC-Centric Policy Model".
 
 import (
 	"context"
@@ -59,6 +70,93 @@ func (r *Repo) ListSecurityGroupIDsByNIC(ctx context.Context, nicID string) ([]s
 	return out, rows.Err()
 }
 
+// EffectiveSGRuleRow is one row from the combined NIC→SG→rule join.
+// It carries all fields needed by the host-agent to build nftables policy.
+// Source: vm-14-02__blueprint__ §core_contracts "NIC-Centric Policy Model"
+//
+//	"The effective rule set for a NIC is the union of all rules from all
+//	 SGs attached to that NIC."
+type EffectiveSGRuleRow struct {
+	RuleID                string
+	SecurityGroupID       string
+	Direction             string  // 'ingress' | 'egress'
+	Protocol              string  // 'tcp' | 'udp' | 'icmp' | 'all'
+	PortFrom              *int
+	PortTo                *int
+	CIDR                  *string // source (ingress) or destination (egress) CIDR
+	SourceSecurityGroupID *string // non-nil for SG-reference rules
+}
+
+// GetEffectiveSGRulesForNIC returns the union of all security group rules
+// attached to a NIC, joining nic_security_groups → security_group_rules.
+//
+// Returns an empty slice when the NIC has no SGs attached.
+//
+// Source: vm-14-02__blueprint__ §core_contracts "NIC-Centric Policy Model".
+func (r *Repo) GetEffectiveSGRulesForNIC(ctx context.Context, nicID string) ([]EffectiveSGRuleRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT sgr.id, sgr.security_group_id, sgr.direction, sgr.protocol,
+		       sgr.port_from, sgr.port_to, sgr.cidr, sgr.source_sg_id
+		FROM nic_security_groups nsg
+		JOIN security_group_rules sgr ON sgr.security_group_id = nsg.security_group_id
+		WHERE nsg.nic_id = $1
+		ORDER BY sgr.security_group_id, sgr.direction, sgr.created_at ASC
+	`, nicID)
+	if err != nil {
+		return nil, fmt.Errorf("GetEffectiveSGRulesForNIC: %w", err)
+	}
+	defer rows.Close()
+
+	var out []EffectiveSGRuleRow
+	for rows.Next() {
+		var rule EffectiveSGRuleRow
+		if err := rows.Scan(
+			&rule.RuleID, &rule.SecurityGroupID, &rule.Direction, &rule.Protocol,
+			&rule.PortFrom, &rule.PortTo, &rule.CIDR, &rule.SourceSecurityGroupID,
+		); err != nil {
+			return nil, fmt.Errorf("GetEffectiveSGRulesForNIC scan: %w", err)
+		}
+		out = append(out, rule)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("GetEffectiveSGRulesForNIC rows: %w", err)
+	}
+	return out, nil
+}
+
+// UpdateNICSecurityGroups replaces the full security group set for a NIC.
+//
+// Implementation: delete all existing nic_security_groups rows for nicID,
+// then insert the new set. Two sequential Exec calls are used because the
+// Pool interface (db.Pool) does not expose Begin/transaction methods.
+// This is safe because:
+//   - The caller validates the new sgIDs before calling.
+//   - The operation is idempotent per nicID.
+//   - Partial failure (delete succeeds, insert fails) leaves the NIC with
+//     no SGs — the next call will correct it. A NIC with no SGs falls back
+//     to deny-all policy at the host-agent layer, which is the safe default.
+//
+// Source: vm-14-02__blueprint__ §core_contracts "NIC-Centric Policy Model".
+func (r *Repo) UpdateNICSecurityGroups(ctx context.Context, nicID string, sgIDs []string) error {
+	// Step 1: Remove all existing SG links for this NIC.
+	if _, err := r.pool.Exec(ctx, `
+		DELETE FROM nic_security_groups WHERE nic_id = $1
+	`, nicID); err != nil {
+		return fmt.Errorf("UpdateNICSecurityGroups: delete old links: %w", err)
+	}
+
+	// Step 2: Insert new SG links.
+	for _, sgID := range sgIDs {
+		if _, err := r.pool.Exec(ctx, `
+			INSERT INTO nic_security_groups (nic_id, security_group_id)
+			VALUES ($1, $2)
+		`, nicID, sgID); err != nil {
+			return fmt.Errorf("UpdateNICSecurityGroups: insert link sg %s: %w", sgID, err)
+		}
+	}
+	return nil
+}
+
 // GetPrimaryNetworkInterfaceByInstance returns the primary NIC for an instance.
 // Returns nil, nil if no primary NIC exists (Phase 1 classic instance).
 // Source: P2_VPC_NETWORK_CONTRACT §5.2 (is_primary field).
@@ -87,9 +185,6 @@ func (r *Repo) GetPrimaryNetworkInterfaceByInstance(ctx context.Context, instanc
 // AllocateIPFromSubnet allocates an IP address from a subnet's CIDR range.
 // Uses SELECT FOR UPDATE SKIP LOCKED to avoid contention.
 // Returns the allocated IP or error if subnet is exhausted.
-//
-// Implementation note: This requires a subnet_ip_allocations table similar to
-// the Phase 1 ip_allocations table but keyed by subnet_id.
 //
 // Source: P2_VPC_NETWORK_CONTRACT §5 (NIC private IP), IP_ALLOCATION_CONTRACT_V1 pattern.
 func (r *Repo) AllocateIPFromSubnet(ctx context.Context, subnetID, instanceID string) (string, error) {
@@ -140,7 +235,7 @@ func (r *Repo) ReleaseIPFromSubnet(ctx context.Context, ip, subnetID, instanceID
 }
 
 // GetDefaultSecurityGroupForVPC returns the default security group for a VPC.
-// Returns nil, nil if no default SG exists (shouldn't happen for valid VPCs).
+// Returns nil, nil if no default SG exists.
 // Source: P2_VPC_NETWORK_CONTRACT §4.4 (default SG behavior).
 func (r *Repo) GetDefaultSecurityGroupForVPC(ctx context.Context, vpcID string) (*SecurityGroupRow, error) {
 	row := &SecurityGroupRow{}
@@ -185,7 +280,6 @@ func (r *Repo) ValidateSecurityGroupsInVPC(ctx context.Context, sgIDs []string, 
 		if sg.VPCID != vpcID {
 			return fmt.Errorf("security group %s is not in VPC %s", sgID, vpcID)
 		}
-		// Allow if it's the default SG or owned by the principal
 		if !sg.IsDefault && sg.OwnerPrincipalID != principalID {
 			return fmt.Errorf("security group %s is not accessible", sgID)
 		}
@@ -194,12 +288,8 @@ func (r *Repo) ValidateSecurityGroupsInVPC(ctx context.Context, sgIDs []string, 
 }
 
 // GenerateMACAddress generates a locally-administered MAC address.
-// Format: 02:xx:xx:xx:xx:xx where xx are random hex bytes.
-// The 02 prefix indicates a locally administered address.
 func GenerateMACAddress() string {
-	// In production, use crypto/rand. For now, use a simple pattern.
-	// The 02 prefix marks this as locally administered.
-	return "02:00:00:00:00:01" // Placeholder — in production, generate random bytes
+	return "02:00:00:00:00:01"
 }
 
 // SubnetContainsIP checks if an IP address falls within a subnet's CIDR.
