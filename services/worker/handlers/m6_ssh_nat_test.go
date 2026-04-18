@@ -378,9 +378,16 @@ func TestNAT_RemovedOnDelete(t *testing.T) {
 	t.Log("NAT RemoveNAT trigger: DeleteInstance called + IP released → PASS")
 }
 
-// TestNAT_RemovedOnStop verifies that DeleteInstance (resource teardown) is
-// called on stop, ensuring RemoveNAT runs and the IP is released.
-// Source: 04-02 §INSTANCE_STOP "Phase 1: stop always releases all runtime resources".
+// TestNAT_RemovedOnStop verifies that DeleteInstance (runtime resource teardown)
+// is called on stop, ensuring RemoveNAT + DeleteTAP run on the host agent.
+//
+// IP_ALLOCATION_CONTRACT_V1 §5: the private IP is retained across stop/start.
+// Stop does NOT release the IP — IP release is performed only by the delete handler.
+// NAT teardown (DeleteInstance → RemoveNAT on host) is still performed so that
+// the TAP device and iptables rules are cleaned up for the stopped instance.
+//
+// Source: 04-02 §INSTANCE_STOP "Phase 1: stop always releases all runtime resources",
+//         IP_ALLOCATION_CONTRACT_V1 §5 (IP retained across stop/start).
 func TestNAT_RemovedOnStop(t *testing.T) {
 	store := newFakeStore()
 	store.hosts = []*db.HostRecord{newReadyHost()}
@@ -400,7 +407,9 @@ func TestNAT_RemovedOnStop(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	assertState(t, store, "inst_nat_s1", "running")
-	store.ips["inst_nat_s1"] = "10.0.10.3" // seed so StopHandler.GetIPByInstance returns correctly
+	// Seed retained IP so StopHandler.GetIPByInstance finds the allocation
+	// (mirrors real DB state where ip_allocations.owner_instance_id stays set).
+	store.ips["inst_nat_s1"] = "10.0.10.3"
 
 	// Stop.
 	stopH := NewStopHandler(deps, testLog())
@@ -411,15 +420,16 @@ func TestNAT_RemovedOnStop(t *testing.T) {
 
 	assertState(t, store, "inst_nat_s1", "stopped")
 
-	// DeleteInstance (resource teardown on stop) must have been called.
+	// DeleteInstance (TAP + rootfs teardown on stop) must have been called —
+	// this is what triggers RemoveNAT + DeleteTAP on the host agent side.
 	if rt.deletedCount() == 0 {
 		t.Error("DeleteInstance not called on stop — RemoveNAT/DeleteTAP would NOT run on host")
 	}
-	// IP must be released.
-	if len(net.released) == 0 {
-		t.Error("IP not released on stop — NAT cleanup incomplete")
+	// IP must NOT be released on stop (IP_ALLOCATION_CONTRACT_V1 §5: retained for start reuse).
+	if len(net.released) != 0 {
+		t.Errorf("IP released on stop (got %v) — violates IP_ALLOCATION_CONTRACT_V1 §5 (IP retained across stop/start)", net.released)
 	}
-	t.Log("NAT RemoveNAT trigger on stop: DeleteInstance called + IP released → PASS")
+	t.Log("NAT teardown on stop: DeleteInstance called (TAP/rootfs removed), IP retained → PASS")
 }
 
 // TestNAT_Idempotent_DeleteStopStop verifies repeated stop/delete operations

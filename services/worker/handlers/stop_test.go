@@ -44,16 +44,6 @@ func (r *fakeStopRuntime) DeleteInstance(_ context.Context, req *runtimeclient.D
 	return &runtimeclient.DeleteInstanceResponse{InstanceID: req.InstanceID, State: "DELETED"}, nil
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-func newRunningInstance(id string) *db.InstanceRow {
-	inst := newRequestedInstance(id)
-	hostID := "host-001"
-	inst.VMState = "running"
-	inst.HostID = &hostID
-	inst.Version = 2
-	return inst
-}
 
 func newTestStopHandler(store *fakeStore, net *fakeNetwork, rt RuntimeClient) *StopHandler {
 	deps := &Deps{
@@ -89,7 +79,11 @@ func TestStopHandler_HappyPath_TransitionsToStopped(t *testing.T) {
 	}
 }
 
-func TestStopHandler_IPReleased(t *testing.T) {
+func TestStopHandler_IPRetained(t *testing.T) {
+	// IP_ALLOCATION_CONTRACT_V1 §5: private IP is stable across stop/start.
+	// Stop does NOT release the IP; the ip_allocations row is kept so the
+	// same IP can be reused when the instance is started again.
+	// Only the delete handler releases the IP.
 	store := newFakeStore()
 	net := &fakeNetwork{}
 	rt := &fakeStopRuntime{}
@@ -101,11 +95,13 @@ func TestStopHandler_IPReleased(t *testing.T) {
 	h := newTestStopHandler(store, net, rt)
 	_ = h.Execute(context.Background(), testJob(id, "INSTANCE_STOP"))
 
-	if len(net.released) == 0 {
-		t.Fatal("IP not released after stop")
+	// IP must NOT be released on stop — retained per IP_ALLOCATION_CONTRACT_V1 §5.
+	if len(net.released) != 0 {
+		t.Errorf("IP released on stop (got %v) — violates IP_ALLOCATION_CONTRACT_V1 §5 (private IP retained across stop/start)", net.released)
 	}
-	if net.released[0] != "10.0.0.20" {
-		t.Errorf("released IP = %q, want 10.0.0.20", net.released[0])
+	// IP record must still be present in the store.
+	if store.ips[id] == "" {
+		t.Error("IP cleared from store on stop — must be retained for start reuse")
 	}
 }
 

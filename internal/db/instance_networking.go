@@ -194,6 +194,46 @@ func (r *Repo) GetPrimaryNetworkInterfaceByInstance(ctx context.Context, instanc
 	return row, nil
 }
 
+
+// UpdateNetworkInterfaceStatus sets the status field of a network_interfaces row.
+// Used by worker lifecycle handlers to advance NIC state through:
+//   pending → attached (create/start)
+//   attached → detached (stop)
+// Silently succeeds when the row does not exist (already cleaned up).
+// Source: P2_VPC_NETWORK_CONTRACT §5 (NIC model), VM-P2A-S2 audit finding R3.
+func (r *Repo) UpdateNetworkInterfaceStatus(ctx context.Context, nicID, status string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE network_interfaces
+		SET status     = $2,
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND deleted_at IS NULL
+	`, nicID, status)
+	if err != nil {
+		return fmt.Errorf("UpdateNetworkInterfaceStatus: %w", err)
+	}
+	return nil
+}
+
+// SoftDeleteNetworkInterface marks a network_interfaces row as deleted.
+// Sets status = 'deleted' and deleted_at = NOW(). Idempotent: safe to call
+// when the NIC has already been soft-deleted (0 rows affected is not an error).
+// Source: P2_VPC_NETWORK_CONTRACT §5 (NIC lifecycle), VM-P2A-S2 audit finding R3.
+func (r *Repo) SoftDeleteNetworkInterface(ctx context.Context, nicID string) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE network_interfaces
+		SET status     = 'deleted',
+		    deleted_at = NOW(),
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND deleted_at IS NULL
+	`, nicID)
+	if err != nil {
+		return fmt.Errorf("SoftDeleteNetworkInterface: %w", err)
+	}
+	return nil
+}
+
 // AllocateIPFromSubnet allocates an IP address from a subnet's CIDR range.
 // Uses SELECT FOR UPDATE SKIP LOCKED to avoid contention.
 // Returns the allocated IP or error if subnet is exhausted.
