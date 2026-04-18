@@ -367,21 +367,24 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	// InsertInstance (so we never write a DB row for an unusable image).
 	//
 	// When the family alias path was taken above, req.ImageID is already the
-	// resolved concrete ID — GetImageForAdmission runs the same ownership and
-	// lifecycle checks as for a directly specified image_id. No bypass.
+	// resolved concrete ID — GetImageForAdmissionWithGrants runs the same ownership,
+	// grant, and lifecycle checks as for a directly specified image_id. No bypass.
 	//
-	// GetImageForAdmission returns nil when:
+	// GetImageForAdmissionWithGrants returns nil when:
 	//   - The image does not exist.
-	//   - The image is PRIVATE and the caller does not own it (→ 404-for-cross-account).
+	//   - The image is PRIVATE, the caller does not own it, and no share grant exists.
 	// ImageIsLaunchable returns false for OBSOLETE, FAILED, PENDING_VALIDATION.
 	// DEPRECATED images remain launchable (warning-level state, not blocked).
 	//
+	// VM-P3B Job 1: grantees may launch from shared PRIVATE images. The launched
+	// instance is owned by the caller (grantee), not the image owner.
 	// Source: vm-13-01__blueprint__ §core_contracts "Image Lifecycle State Enforcement",
 	//         P2_IMAGE_SNAPSHOT_MODEL.md §3.8,
-	//         AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account on non-visible images).
-	img, err := s.repo.GetImageForAdmission(r.Context(), req.ImageID, principal)
+	//         AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account on non-visible images),
+	//         VM-P3B Job 1 §6, §7.
+	img, err := s.repo.GetImageForAdmissionWithGrants(r.Context(), req.ImageID, principal)
 	if err != nil {
-		s.log.Error("GetImageForAdmission failed", "image_id", req.ImageID, "error", err)
+		s.log.Error("GetImageForAdmissionWithGrants failed", "image_id", req.ImageID, "error", err)
 		writeDBError(w, err)
 		return
 	}

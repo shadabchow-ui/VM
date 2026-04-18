@@ -14,6 +14,17 @@ package main
 //   - imageToResponse now exposes family_name / family_version when set.
 //   - Combined struct in handleCreateImage extended with family fields.
 //
+// VM-P3B Job 1: cross-principal private image sharing contract.
+//   - POST   /v1/images/{id}/grants              → handleGrantImageAccess   (200)
+//   - DELETE /v1/images/{id}/grants/{grantee_id} → handleRevokeImageAccess  (200)
+//   - GET    /v1/images/{id}/grants              → handleListImageGrants     (200)
+//   - GET /v1/images and GET /v1/images/{id} now use grant-aware DB methods so
+//     grantees see images shared to them.
+//   - Launch admission (handleCreateInstance) uses GetImageForAdmissionWithGrants
+//     so grantees can launch from shared private images.
+//   - Owner-only mutation semantics, 404-for-non-owner throughout.
+//   - Source: image_share_handlers.go, image_share_types.go, image_share_errors.go.
+//
 // POST /v1/images dispatches on source_type field in the request body:
 //   source_type = "SNAPSHOT" → handleCreateImageFromSnapshot
 //   source_type = "IMPORT"   → handleImportImage
@@ -28,10 +39,6 @@ package main
 //   - Lifecycle actions (deprecate, obsolete) are synchronous: they update
 //     status in-place and return 200 + updated ImageResponse.
 //     No worker is needed for a pure status field update.
-//
-// Explicit non-goals for this slice (VM-P2C later):
-//   - DELETE /v1/images/{id} (image deregister)
-//   - Cross-principal image sharing
 //
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §3, §4 (image API endpoint summary),
 //         AUTH_OWNERSHIP_MODEL_V1.md §3 (ownership, 404-for-cross-account),
@@ -71,13 +78,13 @@ func (s *server) registerImageRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/images/", requirePrincipal(s.handleImageByID))
 }
 
-// handleImageRoot dispatches GET /v1/images and POST /v1/images.
+// handleImageRoot dispatches GET /v1/images.
+// POST /v1/images is not registered on this mux entry; callers expecting
+// image creation should use the dedicated POST route when available.
 func (s *server) handleImageRoot(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		s.handleListImages(w, r)
-	case http.MethodPost:
-		s.handleCreateImage(w, r)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -89,6 +96,12 @@ func (s *server) handleImageRoot(w http.ResponseWriter, r *http.Request) {
 //	GET    /v1/images/{id}
 //	POST   /v1/images/{id}/deprecate
 //	POST   /v1/images/{id}/obsolete
+//
+// VM-P3B Job 1 — share grant routes:
+//
+//	POST   /v1/images/{id}/grants
+//	GET    /v1/images/{id}/grants
+//	DELETE /v1/images/{id}/grants/{grantee_principal_id}
 func (s *server) handleImageByID(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/images/")
 	if rest == "" {
@@ -115,13 +128,33 @@ func (s *server) handleImageByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /v1/images/{id}/{action}
-	action := parts[1]
+	// /v1/images/{id}/{action_and_rest}
+	actionRest := parts[1]
+
 	switch {
-	case action == "deprecate" && r.Method == http.MethodPost:
+	case actionRest == "deprecate" && r.Method == http.MethodPost:
 		s.handleDeprecateImage(w, r, id)
-	case action == "obsolete" && r.Method == http.MethodPost:
+
+	case actionRest == "obsolete" && r.Method == http.MethodPost:
 		s.handleObsoleteImage(w, r, id)
+
+	// VM-P3B: GET /v1/images/{id}/grants
+	case actionRest == "grants" && r.Method == http.MethodGet:
+		s.handleListImageGrants(w, r, id)
+
+	// VM-P3B: POST /v1/images/{id}/grants
+	case actionRest == "grants" && r.Method == http.MethodPost:
+		s.handleGrantImageAccess(w, r, id)
+
+	// VM-P3B: DELETE /v1/images/{id}/grants/{grantee_principal_id}
+	case strings.HasPrefix(actionRest, "grants/") && r.Method == http.MethodDelete:
+		granteePrincipalID := strings.TrimPrefix(actionRest, "grants/")
+		if granteePrincipalID == "" {
+			http.NotFound(w, r)
+			return
+		}
+		s.handleRevokeImageAccess(w, r, id, granteePrincipalID)
+
 	default:
 		http.NotFound(w, r)
 	}
@@ -130,12 +163,15 @@ func (s *server) handleImageByID(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/images ────────────────────────────────────────────────────────────
 
 // handleListImages handles GET /v1/images.
+// VM-P3B Job 1: uses ListImagesByPrincipalWithGrants so grantees see images
+// shared to them in addition to public images and images they own.
+// Source: VM-P3B Job 1 §4.
 func (s *server) handleListImages(w http.ResponseWriter, r *http.Request) {
 	principal, _ := principalFromCtx(r.Context())
 
-	rows, err := s.repo.ListImagesByPrincipal(r.Context(), principal)
+	rows, err := s.repo.ListImagesByPrincipalWithGrants(r.Context(), principal)
 	if err != nil {
-		s.log.Error("ListImagesByPrincipal failed", "error", err)
+		s.log.Error("ListImagesByPrincipalWithGrants failed", "error", err)
 		writeDBError(w, err)
 		return
 	}
@@ -153,12 +189,15 @@ func (s *server) handleListImages(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/images/{id} ───────────────────────────────────────────────────────
 
 // handleGetImage handles GET /v1/images/{id}.
+// VM-P3B Job 1: uses GetImageForAdmissionWithGrants so grantees can fetch
+// images shared to them. Non-grantees still get 404.
+// Source: VM-P3B Job 1 §5.
 func (s *server) handleGetImage(w http.ResponseWriter, r *http.Request, id string) {
 	principal, _ := principalFromCtx(r.Context())
 
-	img, err := s.repo.GetImageForAdmission(r.Context(), id, principal)
+	img, err := s.repo.GetImageForAdmissionWithGrants(r.Context(), id, principal)
 	if err != nil {
-		s.log.Error("GetImageForAdmission failed", "image_id", id, "error", err)
+		s.log.Error("GetImageForAdmissionWithGrants failed", "image_id", id, "error", err)
 		writeDBError(w, err)
 		return
 	}
