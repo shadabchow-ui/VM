@@ -97,6 +97,28 @@ func seedSnapshotWithSource(mem *memPool, id, owner, status, sourceVolID string,
 	mem.snapshots[id].SourceVolumeID = &sourceVolID
 }
 
+
+// seedVolume seeds a VolumeRow directly into memPool.
+// Matches the signature expected by snapshot tests that need a volume as a
+// snapshot source. All non-required fields default to sensible values.
+// Source: snapshot_handlers_test.go call sites (lines 112, 143, 157, 215, 229).
+func seedVolume(mem *memPool, id, owner, az, status string, sizeGB int) {
+	now := time.Now()
+	mem.volumes[id] = &db.VolumeRow{
+		ID:               id,
+		OwnerPrincipalID: owner,
+		DisplayName:      "vol-" + id,
+		Region:           "us-east-1",
+		AvailabilityZone: az,
+		SizeGB:           sizeGB,
+		Status:           status,
+		Origin:           "blank",
+		Version:          1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+}
+
 // progressFor returns the canonical progress_percent for a status.
 func progressFor(status string) int {
 	if status == db.SnapshotStatusAvailable {

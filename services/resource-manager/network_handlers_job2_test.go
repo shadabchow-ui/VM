@@ -5,13 +5,11 @@ package main
 // Covers EIP CRUD, NAT Gateway CRUD, and NIC SG update handlers.
 // Uses the same test style as network_handlers_test.go (same package, same helpers).
 //
-// REPAIR:
-//   - mockPublicConnectivityRepo now embeds mockNetworkRepoP3A (not mockNetworkRepo)
-//     so it satisfies PublicConnectivityRepo, which embeds IGWNetworkRepo.
-//     mockNetworkRepoP3A already provides all IGW and route-validation stubs.
-//   - strPtr() removed — snapshot_handlers_test.go already defines it in package main.
-//   - Struct initializers updated: mockNetworkRepo field → mockNetworkRepoP3A field
-//     with inner mockNetworkRepo populated.
+// Test conventions:
+//   - One test per handler path/branch.
+//   - Mock implements PublicConnectivityRepo.
+//   - Ownership-hiding (404 not 403) is tested on all get/delete handlers.
+//   - Error codes are asserted precisely.
 //
 // Source: vm-14-03__blueprint__ §core_contracts, vm-14-02__blueprint__ §core_contracts,
 //         11-02-phase-1-test-strategy-and-lifecycle-test-matrix.md §Unit.
@@ -31,33 +29,31 @@ import (
 // ── Mock ─────────────────────────────────────────────────────────────────────
 
 // mockPublicConnectivityRepo implements PublicConnectivityRepo for tests.
-// Embeds mockNetworkRepoP3A (which satisfies IGWNetworkRepo) so that all
-// IGW and route-validation methods are available via the embedded type.
-// EIP, NAT GW, and NIC-SG fields are added directly on this struct.
+// It embeds mockNetworkRepo (for the NetworkRepo portion) and adds EIP + NAT GW fields.
 type mockPublicConnectivityRepo struct {
-	mockNetworkRepoP3A
+	mockNetworkRepo
 
 	// ElasticIP
-	createEIPErr             error
-	getEIPByIDRow            *db.ElasticIPRow
-	getEIPByIDErr            error
-	listEIPsRows             []*db.ElasticIPRow
-	listEIPsErr              error
-	associateEIPErr          error
-	disassociateEIPErr       error
-	softDeleteEIPErr         error
-	getEIPByAssocResourceRow *db.ElasticIPRow
-	getEIPByAssocResourceErr error
+	createEIPErr              error
+	getEIPByIDRow             *db.ElasticIPRow
+	getEIPByIDErr             error
+	listEIPsRows              []*db.ElasticIPRow
+	listEIPsErr               error
+	associateEIPErr           error
+	disassociateEIPErr        error
+	softDeleteEIPErr          error
+	getEIPByAssocResourceRow  *db.ElasticIPRow
+	getEIPByAssocResourceErr  error
 
 	// NATGateway
-	createNATGWErr      error
-	getNATGWByIDRow     *db.NATGatewayRow
-	getNATGWByIDErr     error
-	getNATGWBySubnetRow *db.NATGatewayRow
-	getNATGWBySubnetErr error
-	listNATGWsRows      []*db.NATGatewayRow
-	listNATGWsErr       error
-	softDeleteNATGWErr  error
+	createNATGWErr         error
+	getNATGWByIDRow        *db.NATGatewayRow
+	getNATGWByIDErr        error
+	getNATGWBySubnetRow    *db.NATGatewayRow
+	getNATGWBySubnetErr    error
+	listNATGWsRows         []*db.NATGatewayRow
+	listNATGWsErr          error
+	softDeleteNATGWErr     error
 
 	// NIC
 	getNICByIDRow  *db.NetworkInterfaceRow
@@ -125,7 +121,7 @@ func (m *mockPublicConnectivityRepo) ValidateSecurityGroupsInVPC(_ context.Conte
 	return m.validateSGsErr
 }
 
-// newPCHandlers creates a PublicConnectivityHandlers with the mock.
+// newPCHandlers is a test helper that creates a PublicConnectivityHandlers with the mock.
 func newPCHandlers(m *mockPublicConnectivityRepo) *PublicConnectivityHandlers {
 	return NewPublicConnectivityHandlers(m)
 }
@@ -180,12 +176,12 @@ func TestJob2_HandleGetElasticIP_Success(t *testing.T) {
 	now := time.Now()
 	repo := &mockPublicConnectivityRepo{
 		getEIPByIDRow: &db.ElasticIPRow{
-			ID:               "eip_001",
+			ID:              "eip_001",
 			OwnerPrincipalID: "princ_001",
-			PublicIP:         "203.0.113.1",
-			AssociationType:  "none",
-			Status:           "available",
-			CreatedAt:        now,
+			PublicIP:        "203.0.113.1",
+			AssociationType: "none",
+			Status:          "available",
+			CreatedAt:       now,
 		},
 	}
 	h := newPCHandlers(repo)
@@ -296,15 +292,13 @@ func TestJob2_HandleAssociateElasticIP_NIC_Success(t *testing.T) {
 			Status:     "attached",
 			CreatedAt:  now,
 		},
-		mockNetworkRepoP3A: mockNetworkRepoP3A{
-			mockNetworkRepo: mockNetworkRepo{
-				getVPCByIDRow: &db.VPCRow{
-					ID:               "vpc_001",
-					OwnerPrincipalID: "princ_001",
-					CIDRIPv4:         "10.0.0.0/16",
-					Status:           "active",
-					CreatedAt:        now,
-				},
+		mockNetworkRepo: mockNetworkRepo{
+			getVPCByIDRow: &db.VPCRow{
+				ID:               "vpc_001",
+				OwnerPrincipalID: "princ_001",
+				CIDRIPv4:         "10.0.0.0/16",
+				Status:           "active",
+				CreatedAt:        now,
 			},
 		},
 	}
@@ -405,11 +399,9 @@ func TestJob2_HandleAssociateElasticIP_AlreadyAssociated_Conflict(t *testing.T) 
 		getNICByIDRow: &db.NetworkInterfaceRow{
 			ID: "nic_new", VPCID: "vpc_001", Status: "attached", CreatedAt: time.Now(),
 		},
-		mockNetworkRepoP3A: mockNetworkRepoP3A{
-			mockNetworkRepo: mockNetworkRepo{
-				getVPCByIDRow: &db.VPCRow{
-					ID: "vpc_001", OwnerPrincipalID: "princ_001", Status: "active", CreatedAt: time.Now(),
-				},
+		mockNetworkRepo: mockNetworkRepo{
+			getVPCByIDRow: &db.VPCRow{
+				ID: "vpc_001", OwnerPrincipalID: "princ_001", Status: "active", CreatedAt: time.Now(),
 			},
 		},
 		associateEIPErr: &db.EIPAlreadyAssociatedError{EIPID: "eip_001", ExistingAssociation: "nic_other"},
@@ -519,17 +511,15 @@ func TestJob2_HandleReleaseElasticIP_StillAssociated_Conflict(t *testing.T) {
 func testNATGWRepo() *mockPublicConnectivityRepo {
 	now := time.Now()
 	return &mockPublicConnectivityRepo{
-		mockNetworkRepoP3A: mockNetworkRepoP3A{
-			mockNetworkRepo: mockNetworkRepo{
-				getVPCByIDRow: &db.VPCRow{
-					ID: "vpc_001", OwnerPrincipalID: "princ_001",
-					CIDRIPv4: "10.0.0.0/16", Status: "active", CreatedAt: now,
-				},
-				getSubnetByIDRow: &db.SubnetRow{
-					ID: "subnet_001", VPCID: "vpc_001",
-					CIDRIPv4: "10.0.1.0/24", AvailabilityZone: "us-east-1a",
-					Status: "active", CreatedAt: now,
-				},
+		mockNetworkRepo: mockNetworkRepo{
+			getVPCByIDRow: &db.VPCRow{
+				ID: "vpc_001", OwnerPrincipalID: "princ_001",
+				CIDRIPv4: "10.0.0.0/16", Status: "active", CreatedAt: now,
+			},
+			getSubnetByIDRow: &db.SubnetRow{
+				ID: "subnet_001", VPCID: "vpc_001",
+				CIDRIPv4: "10.0.1.0/24", AvailabilityZone: "us-east-1a",
+				Status: "active", CreatedAt: now,
 			},
 		},
 		getEIPByIDRow: &db.ElasticIPRow{
@@ -540,7 +530,7 @@ func testNATGWRepo() *mockPublicConnectivityRepo {
 			Status:           "available",
 			CreatedAt:        now,
 		},
-		getNATGWBySubnetRow: nil,
+		getNATGWBySubnetRow: nil, // no existing NAT GW
 	}
 }
 
@@ -627,7 +617,7 @@ func TestJob2_HandleCreateNATGateway_MissingSubnetID(t *testing.T) {
 	repo := testNATGWRepo()
 	h := newPCHandlers(repo)
 
-	body, _ := json.Marshal(NATGatewayCreateRequest{ElasticIPID: "eip_001"})
+	body, _ := json.Marshal(NATGatewayCreateRequest{ElasticIPID: "eip_001"}) // no subnet_id
 	req := testNetworkRequest("POST", "/v1/vpcs/vpc_001/nat_gateways", body, "princ_001")
 	w := httptest.NewRecorder()
 
@@ -647,9 +637,7 @@ func TestJob2_HandleCreateNATGateway_MissingSubnetID(t *testing.T) {
 
 func TestJob2_HandleCreateNATGateway_VPCNotFound(t *testing.T) {
 	repo := &mockPublicConnectivityRepo{
-		mockNetworkRepoP3A: mockNetworkRepoP3A{
-			mockNetworkRepo: mockNetworkRepo{getVPCByIDRow: nil},
-		},
+		mockNetworkRepo: mockNetworkRepo{getVPCByIDRow: nil},
 	}
 	h := newPCHandlers(repo)
 
@@ -667,11 +655,9 @@ func TestJob2_HandleCreateNATGateway_VPCNotFound(t *testing.T) {
 func TestJob2_HandleGetNATGateway_Success(t *testing.T) {
 	now := time.Now()
 	repo := &mockPublicConnectivityRepo{
-		mockNetworkRepoP3A: mockNetworkRepoP3A{
-			mockNetworkRepo: mockNetworkRepo{
-				getVPCByIDRow: &db.VPCRow{
-					ID: "vpc_001", OwnerPrincipalID: "princ_001", Status: "active", CreatedAt: now,
-				},
+		mockNetworkRepo: mockNetworkRepo{
+			getVPCByIDRow: &db.VPCRow{
+				ID: "vpc_001", OwnerPrincipalID: "princ_001", Status: "active", CreatedAt: now,
 			},
 		},
 		getNATGWByIDRow: &db.NATGatewayRow{
@@ -710,16 +696,14 @@ func TestJob2_HandleGetNATGateway_Success(t *testing.T) {
 func TestJob2_HandleGetNATGateway_WrongVPC_Returns404(t *testing.T) {
 	now := time.Now()
 	repo := &mockPublicConnectivityRepo{
-		mockNetworkRepoP3A: mockNetworkRepoP3A{
-			mockNetworkRepo: mockNetworkRepo{
-				getVPCByIDRow: &db.VPCRow{
-					ID: "vpc_001", OwnerPrincipalID: "princ_001", Status: "active", CreatedAt: now,
-				},
+		mockNetworkRepo: mockNetworkRepo{
+			getVPCByIDRow: &db.VPCRow{
+				ID: "vpc_001", OwnerPrincipalID: "princ_001", Status: "active", CreatedAt: now,
 			},
 		},
 		getNATGWByIDRow: &db.NATGatewayRow{
 			ID: "natgw_001", OwnerPrincipalID: "princ_001",
-			VPCID:  "vpc_other",
+			VPCID: "vpc_other", // different VPC
 			Status: "available", CreatedAt: now,
 		},
 	}
@@ -738,10 +722,8 @@ func TestJob2_HandleGetNATGateway_WrongVPC_Returns404(t *testing.T) {
 func TestJob2_HandleListNATGateways_Success(t *testing.T) {
 	now := time.Now()
 	repo := &mockPublicConnectivityRepo{
-		mockNetworkRepoP3A: mockNetworkRepoP3A{
-			mockNetworkRepo: mockNetworkRepo{
-				getVPCByIDRow: &db.VPCRow{ID: "vpc_001", OwnerPrincipalID: "princ_001", Status: "active", CreatedAt: now},
-			},
+		mockNetworkRepo: mockNetworkRepo{
+			getVPCByIDRow: &db.VPCRow{ID: "vpc_001", OwnerPrincipalID: "princ_001", Status: "active", CreatedAt: now},
 		},
 		listNATGWsRows: []*db.NATGatewayRow{
 			{ID: "natgw_001", OwnerPrincipalID: "princ_001", VPCID: "vpc_001", SubnetID: "subnet_001", ElasticIPID: "eip_001", Status: "available", CreatedAt: now},
@@ -772,10 +754,8 @@ func TestJob2_HandleListNATGateways_Success(t *testing.T) {
 func TestJob2_HandleDeleteNATGateway_Success(t *testing.T) {
 	now := time.Now()
 	repo := &mockPublicConnectivityRepo{
-		mockNetworkRepoP3A: mockNetworkRepoP3A{
-			mockNetworkRepo: mockNetworkRepo{
-				getVPCByIDRow: &db.VPCRow{ID: "vpc_001", OwnerPrincipalID: "princ_001", Status: "active", CreatedAt: now},
-			},
+		mockNetworkRepo: mockNetworkRepo{
+			getVPCByIDRow: &db.VPCRow{ID: "vpc_001", OwnerPrincipalID: "princ_001", Status: "active", CreatedAt: now},
 		},
 		getNATGWByIDRow: &db.NATGatewayRow{
 			ID: "natgw_001", OwnerPrincipalID: "princ_001",
@@ -807,12 +787,10 @@ func testNICSGRepo() *mockPublicConnectivityRepo {
 			PrivateIP: "10.0.0.5", MACAddress: "02:ab:cd:ef:01:02",
 			IsPrimary: true, Status: "attached", CreatedAt: now,
 		},
-		mockNetworkRepoP3A: mockNetworkRepoP3A{
-			mockNetworkRepo: mockNetworkRepo{
-				getVPCByIDRow: &db.VPCRow{
-					ID: "vpc_001", OwnerPrincipalID: "princ_001",
-					CIDRIPv4: "10.0.0.0/16", Status: "active", CreatedAt: now,
-				},
+		mockNetworkRepo: mockNetworkRepo{
+			getVPCByIDRow: &db.VPCRow{
+				ID: "vpc_001", OwnerPrincipalID: "princ_001",
+				CIDRIPv4: "10.0.0.0/16", Status: "active", CreatedAt: now,
 			},
 		},
 	}
@@ -871,6 +849,7 @@ func TestJob2_HandleUpdateNICSecurityGroups_TooMany_422(t *testing.T) {
 	repo := testNICSGRepo()
 	h := newPCHandlers(repo)
 
+	// 6 SGs — exceeds SG-I-3 limit of 5.
 	body, _ := json.Marshal(NICSecurityGroupsUpdateRequest{
 		SecurityGroupIDs: []string{"sg_1", "sg_2", "sg_3", "sg_4", "sg_5", "sg_6"},
 	})
@@ -907,8 +886,9 @@ func TestJob2_HandleUpdateNICSecurityGroups_NICNotFound(t *testing.T) {
 }
 
 func TestJob2_HandleUpdateNICSecurityGroups_CrossOwnerVPC_Returns404(t *testing.T) {
+	// Auth: VPC owned by someone else → NIC shows as 404.
 	repo := testNICSGRepo()
-	repo.mockNetworkRepoP3A.mockNetworkRepo.getVPCByIDRow.OwnerPrincipalID = "princ_other"
+	repo.mockNetworkRepo.getVPCByIDRow.OwnerPrincipalID = "princ_other"
 	h := newPCHandlers(repo)
 
 	body, _ := json.Marshal(NICSecurityGroupsUpdateRequest{SecurityGroupIDs: []string{"sg_001"}})

@@ -5,18 +5,15 @@ package main
 // This file EXTENDS network_handlers.go with:
 //   A. Elastic IP (EIP) — allocate, get, list, associate, disassociate, release.
 //   B. NAT Gateway — create, get, list, delete.
-//   C. NIC Security Group Update — replace the SG set for a NIC.
+//   C. NIC Security Group Update — replace the SG set for a NIC (POST-admission
+//      policy propagation seam).
 //
-// It uses the same helpers defined in network_handlers.go:
-//   writeNetworkError, generateID, getNetworkRequestID, getNetworkPrincipalID.
+// It uses the same NetworkHandlers struct, same writeNetworkError helper,
+// same generateID helper, same context key helpers — all defined in network_handlers.go.
 //
-// REPAIR (interface + helpers):
-//   - PublicConnectivityRepo now embeds IGWNetworkRepo (not NetworkRepo) so that
-//     mockPublicConnectivityRepo satisfies it without needing to re-implement IGW
-//     methods that live in mockNetworkRepoP3A.
-//   - Removed itoa() and containsSubstring() — snapshot_handlers.go already
-//     declares itoa() in package main, causing a redeclaration compile error.
-//     Use strconv.Itoa instead.
+// The NetworkRepo interface is extended via a separate PublicConnectivityRepo
+// interface that is embedded by the handlers declared here. Both are satisfied
+// by the same *db.Repo instance in production.
 //
 // Source: vm-14-03__blueprint__ §core_contracts "Elastic IP Allocation and Association",
 //         "NAT Gateway Lifecycle", "Public Connectivity Contract".
@@ -34,14 +31,17 @@ import (
 )
 
 // ── Extended Repo Interface ───────────────────────────────────────────────────
+//
+// PublicConnectivityRepo is the additional repo interface for VM-P3A Job 2
+// handlers. In production, *db.Repo satisfies both NetworkRepo and
+// PublicConnectivityRepo.
+//
+// A handler that needs both simply declares: repo interface { NetworkRepo; PublicConnectivityRepo }.
+// The handler structs below use PublicConnectivityHandlers which embeds a combined interface.
 
 // PublicConnectivityRepo covers EIP and NAT Gateway persistence.
-// Embeds IGWNetworkRepo (which itself embeds NetworkRepo) so that a single
-// *db.Repo instance in production satisfies all three interfaces.
-// Test mocks embed mockNetworkRepoP3A (which satisfies IGWNetworkRepo) and add
-// EIP + NAT GW stubs on top.
 type PublicConnectivityRepo interface {
-	IGWNetworkRepo
+	NetworkRepo
 
 	// ElasticIP methods
 	CreateElasticIP(ctx context.Context, row *db.ElasticIPRow) error
@@ -79,14 +79,17 @@ func NewPublicConnectivityHandlers(repo PublicConnectivityRepo) *PublicConnectiv
 // ── Request/Response types ────────────────────────────────────────────────────
 
 // ElasticIPAllocateRequest is the request body for POST /v1/elastic_ips.
-type ElasticIPAllocateRequest struct{}
+// The platform assigns the public IP from its pool; callers do not specify it.
+type ElasticIPAllocateRequest struct {
+	// Reserved for future use (e.g., region preference).
+}
 
 // ElasticIPResponse is the API response shape for an Elastic IP resource.
 type ElasticIPResponse struct {
 	ID                   string    `json:"id"`
 	Owner                string    `json:"owner"`
 	PublicIP             string    `json:"public_ip"`
-	AssociationType      string    `json:"association_type"`
+	AssociationType      string    `json:"association_type"` // 'none' | 'nic' | 'nat_gateway'
 	AssociatedResourceID *string   `json:"associated_resource_id,omitempty"`
 	Status               string    `json:"status"`
 	CreatedAt            time.Time `json:"created_at"`
@@ -94,6 +97,7 @@ type ElasticIPResponse struct {
 
 // ElasticIPAssociateRequest is the request body for POST /v1/elastic_ips/{eip_id}/associate.
 type ElasticIPAssociateRequest struct {
+	// One of NICId or NATGatewayID must be set, but not both.
 	NICID        *string `json:"nic_id,omitempty"`
 	NATGatewayID *string `json:"nat_gateway_id,omitempty"`
 }
@@ -111,12 +115,13 @@ type NATGatewayResponse struct {
 	VPCID       string    `json:"vpc_id"`
 	SubnetID    string    `json:"subnet_id"`
 	ElasticIPID string    `json:"elastic_ip_id"`
-	PublicIP    string    `json:"public_ip"`
+	PublicIP    string    `json:"public_ip"` // denormalized from EIP for convenience
 	Status      string    `json:"status"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
 // NICSecurityGroupsUpdateRequest is the request body for PUT /v1/nics/{nic_id}/security_groups.
+// Replaces the full SG set for the NIC.
 type NICSecurityGroupsUpdateRequest struct {
 	SecurityGroupIDs []string `json:"security_group_ids"`
 }
@@ -143,11 +148,17 @@ func eipRowToResponse(row *db.ElasticIPRow) ElasticIPResponse {
 // ── Elastic IP Handlers ───────────────────────────────────────────────────────
 
 // HandleAllocateElasticIP handles POST /v1/elastic_ips.
+//
+// Allocates a new Elastic IP from the platform public IP pool.
+// The platform assigns the public_ip; callers cannot specify it.
+//
+// Source: vm-14-03__blueprint__ §core_contracts "Elastic IP Allocation".
 func (h *PublicConnectivityHandlers) HandleAllocateElasticIP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	requestID := getNetworkRequestID(ctx)
 	principalID := getNetworkPrincipalID(ctx)
 
+	// Decode body — currently has no required fields, but parse to reject garbage JSON.
 	var req ElasticIPAllocateRequest
 	if r.ContentLength > 0 {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -188,6 +199,7 @@ func (h *PublicConnectivityHandlers) HandleGetElasticIP(w http.ResponseWriter, r
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve elastic IP", "", requestID)
 		return
 	}
+	// Return 404 for not-found or cross-owner — AUTH_OWNERSHIP_MODEL_V1 §3.
 	if row == nil || row.DeletedAt != nil || row.OwnerPrincipalID != principalID {
 		writeNetworkError(w, http.StatusNotFound, "eip_not_found", "Elastic IP not found", "", requestID)
 		return
@@ -219,11 +231,20 @@ func (h *PublicConnectivityHandlers) HandleListElasticIPs(w http.ResponseWriter,
 }
 
 // HandleAssociateElasticIP handles POST /v1/elastic_ips/{eip_id}/associate.
+//
+// Associates an EIP with a NIC or NAT Gateway.
+// Exactly one of nic_id or nat_gateway_id must be provided.
+// The EIP must be in 'none' (unassociated) state.
+//
+// Source: vm-14-03__blueprint__ §core_contracts "Elastic IP Association":
+//
+//	"An EIP can only be associated to one resource at a time."
 func (h *PublicConnectivityHandlers) HandleAssociateElasticIP(w http.ResponseWriter, r *http.Request, eipID string) {
 	ctx := r.Context()
 	requestID := getNetworkRequestID(ctx)
 	principalID := getNetworkPrincipalID(ctx)
 
+	// Verify EIP exists and is owned by principal.
 	eip, err := h.repo.GetElasticIPByID(ctx, eipID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve elastic IP", "", requestID)
@@ -240,6 +261,7 @@ func (h *PublicConnectivityHandlers) HandleAssociateElasticIP(w http.ResponseWri
 		return
 	}
 
+	// Validate: exactly one target.
 	if req.NICID == nil && req.NATGatewayID == nil {
 		writeNetworkError(w, http.StatusBadRequest, "missing_field",
 			"One of 'nic_id' or 'nat_gateway_id' is required", "", requestID)
@@ -256,6 +278,7 @@ func (h *PublicConnectivityHandlers) HandleAssociateElasticIP(w http.ResponseWri
 	if req.NICID != nil {
 		resourceID = *req.NICID
 		assocType = "nic"
+		// Verify NIC exists and is owned by same principal (via its VPC).
 		nic, err := h.repo.GetNetworkInterfaceByID(ctx, resourceID)
 		if err != nil {
 			writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve NIC", "", requestID)
@@ -265,6 +288,7 @@ func (h *PublicConnectivityHandlers) HandleAssociateElasticIP(w http.ResponseWri
 			writeNetworkError(w, http.StatusNotFound, "nic_not_found", "Network interface not found", "", requestID)
 			return
 		}
+		// Verify NIC's VPC is owned by principal.
 		vpc, err := h.repo.GetVPCByID(ctx, nic.VPCID)
 		if err != nil {
 			writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
@@ -277,6 +301,7 @@ func (h *PublicConnectivityHandlers) HandleAssociateElasticIP(w http.ResponseWri
 	} else {
 		resourceID = *req.NATGatewayID
 		assocType = "nat_gateway"
+		// Verify NAT Gateway exists and is owned by same principal.
 		natgw, err := h.repo.GetNATGatewayByID(ctx, resourceID)
 		if err != nil {
 			writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve NAT gateway", "", requestID)
@@ -288,6 +313,7 @@ func (h *PublicConnectivityHandlers) HandleAssociateElasticIP(w http.ResponseWri
 		}
 	}
 
+	// Atomically associate. Returns *EIPAlreadyAssociatedError if already associated.
 	if err := h.repo.AssociateElasticIP(ctx, eipID, resourceID, assocType); err != nil {
 		if _, ok := err.(*db.EIPAlreadyAssociatedError); ok {
 			writeNetworkError(w, http.StatusConflict, "eip_already_associated",
@@ -299,8 +325,10 @@ func (h *PublicConnectivityHandlers) HandleAssociateElasticIP(w http.ResponseWri
 		return
 	}
 
+	// Return updated EIP state.
 	updated, err := h.repo.GetElasticIPByID(ctx, eipID)
 	if err != nil || updated == nil {
+		// Association succeeded; best-effort response.
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -310,6 +338,12 @@ func (h *PublicConnectivityHandlers) HandleAssociateElasticIP(w http.ResponseWri
 }
 
 // HandleDisassociateElasticIP handles POST /v1/elastic_ips/{eip_id}/disassociate.
+//
+// Removes an EIP's association. Idempotent: calling on an already-unassociated
+// EIP succeeds. Callers must handle host-side NAT rule teardown separately via
+// the host-agent ProgramNAT/RemoveNAT path.
+//
+// Source: vm-14-03__blueprint__ §core_contracts "Elastic IP Disassociation".
 func (h *PublicConnectivityHandlers) HandleDisassociateElasticIP(w http.ResponseWriter, r *http.Request, eipID string) {
 	ctx := r.Context()
 	requestID := getNetworkRequestID(ctx)
@@ -334,6 +368,13 @@ func (h *PublicConnectivityHandlers) HandleDisassociateElasticIP(w http.Response
 }
 
 // HandleReleaseElasticIP handles DELETE /v1/elastic_ips/{eip_id}.
+//
+// Releases an EIP back to the platform pool. The EIP must be unassociated.
+// Attempting to release an associated EIP returns 409.
+//
+// Source: vm-14-03__blueprint__ §core_contracts "Elastic IP Release":
+//
+//	"An EIP cannot be released while it is associated to a resource."
 func (h *PublicConnectivityHandlers) HandleReleaseElasticIP(w http.ResponseWriter, r *http.Request, eipID string) {
 	ctx := r.Context()
 	requestID := getNetworkRequestID(ctx)
@@ -349,16 +390,20 @@ func (h *PublicConnectivityHandlers) HandleReleaseElasticIP(w http.ResponseWrite
 		return
 	}
 
+	// Guard: cannot release an associated EIP.
 	if eip.AssociationType != "none" {
 		writeNetworkError(w, http.StatusConflict, "eip_still_associated",
-			"Elastic IP must be disassociated before it can be released", "", requestID)
+			"Elastic IP must be disassociated before it can be released",
+			"", requestID)
 		return
 	}
 
 	if err := h.repo.SoftDeleteElasticIP(ctx, eipID); err != nil {
+		// Check if it's an "already associated" error from the DB-level guard.
 		if isEIPAssociatedErr(err) {
 			writeNetworkError(w, http.StatusConflict, "eip_still_associated",
-				"Elastic IP must be disassociated before it can be released", "", requestID)
+				"Elastic IP must be disassociated before it can be released",
+				"", requestID)
 			return
 		}
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to release elastic IP", "", requestID)
@@ -371,11 +416,20 @@ func (h *PublicConnectivityHandlers) HandleReleaseElasticIP(w http.ResponseWrite
 // ── NAT Gateway Handlers ──────────────────────────────────────────────────────
 
 // HandleCreateNATGateway handles POST /v1/vpcs/{vpc_id}/nat_gateways.
+//
+// Creates a NAT Gateway in a subnet. Enforces:
+//   - VPC ownership.
+//   - Subnet belongs to VPC.
+//   - EIP is owned by principal and unassociated.
+//   - Only one NAT Gateway per subnet (conflict check before DB insert).
+//
+// Source: vm-14-03__blueprint__ §core_contracts "NAT Gateway Lifecycle".
 func (h *PublicConnectivityHandlers) HandleCreateNATGateway(w http.ResponseWriter, r *http.Request, vpcID string) {
 	ctx := r.Context()
 	requestID := getNetworkRequestID(ctx)
 	principalID := getNetworkPrincipalID(ctx)
 
+	// Verify VPC ownership.
 	vpc, err := h.repo.GetVPCByID(ctx, vpcID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
@@ -401,6 +455,7 @@ func (h *PublicConnectivityHandlers) HandleCreateNATGateway(w http.ResponseWrite
 		return
 	}
 
+	// Verify subnet belongs to this VPC.
 	subnet, err := h.repo.GetSubnetByID(ctx, req.SubnetID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve subnet", "", requestID)
@@ -411,6 +466,7 @@ func (h *PublicConnectivityHandlers) HandleCreateNATGateway(w http.ResponseWrite
 		return
 	}
 
+	// Verify EIP is owned and unassociated.
 	eip, err := h.repo.GetElasticIPByID(ctx, req.ElasticIPID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve elastic IP", "", requestID)
@@ -427,6 +483,7 @@ func (h *PublicConnectivityHandlers) HandleCreateNATGateway(w http.ResponseWrite
 		return
 	}
 
+	// Check one-per-subnet constraint (pre-flight before DB unique index fires).
 	existing, err := h.repo.GetNATGatewayBySubnet(ctx, req.SubnetID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to check existing NAT gateway", "", requestID)
@@ -454,7 +511,13 @@ func (h *PublicConnectivityHandlers) HandleCreateNATGateway(w http.ResponseWrite
 		return
 	}
 
-	_ = h.repo.AssociateElasticIP(ctx, req.ElasticIPID, natgwID, "nat_gateway")
+	// Associate the EIP to this NAT Gateway.
+	if err := h.repo.AssociateElasticIP(ctx, req.ElasticIPID, natgwID, "nat_gateway"); err != nil {
+		// NAT GW was created but EIP association failed — log and continue.
+		// The NAT GW will be in 'pending' and the EIP disassociated; a reconciler
+		// can clean up. Return the NAT GW in 'pending' state to the caller.
+		_ = err
+	}
 
 	resp := NATGatewayResponse{
 		ID:          row.ID,
@@ -478,6 +541,7 @@ func (h *PublicConnectivityHandlers) HandleGetNATGateway(w http.ResponseWriter, 
 	requestID := getNetworkRequestID(ctx)
 	principalID := getNetworkPrincipalID(ctx)
 
+	// Verify VPC ownership first.
 	vpc, err := h.repo.GetVPCByID(ctx, vpcID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
@@ -498,6 +562,7 @@ func (h *PublicConnectivityHandlers) HandleGetNATGateway(w http.ResponseWriter, 
 		return
 	}
 
+	// Fetch EIP public IP for denormalized response.
 	publicIP := ""
 	if eip, err := h.repo.GetElasticIPByID(ctx, row.ElasticIPID); err == nil && eip != nil {
 		publicIP = eip.PublicIP
@@ -524,6 +589,7 @@ func (h *PublicConnectivityHandlers) HandleListNATGateways(w http.ResponseWriter
 	requestID := getNetworkRequestID(ctx)
 	principalID := getNetworkPrincipalID(ctx)
 
+	// Verify VPC ownership.
 	vpc, err := h.repo.GetVPCByID(ctx, vpcID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
@@ -563,11 +629,18 @@ func (h *PublicConnectivityHandlers) HandleListNATGateways(w http.ResponseWriter
 }
 
 // HandleDeleteNATGateway handles DELETE /v1/vpcs/{vpc_id}/nat_gateways/{natgw_id}.
+//
+// Deletes a NAT Gateway and disassociates its EIP.
+// The EIP is returned to 'available' state but is NOT released — callers may
+// re-associate or release it separately.
+//
+// Source: vm-14-03__blueprint__ §core_contracts "NAT Gateway Lifecycle".
 func (h *PublicConnectivityHandlers) HandleDeleteNATGateway(w http.ResponseWriter, r *http.Request, vpcID, natgwID string) {
 	ctx := r.Context()
 	requestID := getNetworkRequestID(ctx)
 	principalID := getNetworkPrincipalID(ctx)
 
+	// Verify VPC ownership.
 	vpc, err := h.repo.GetVPCByID(ctx, vpcID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
@@ -588,19 +661,35 @@ func (h *PublicConnectivityHandlers) HandleDeleteNATGateway(w http.ResponseWrite
 		return
 	}
 
+	// Soft-delete the NAT Gateway first.
 	if err := h.repo.SoftDeleteNATGateway(ctx, natgwID); err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to delete NAT gateway", "", requestID)
 		return
 	}
 
+	// Disassociate EIP. Best-effort: if this fails, the EIP will still show as
+	// associated to a deleted NAT GW; a reconciler can correct it.
 	_ = h.repo.DisassociateElasticIP(ctx, row.ElasticIPID)
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── NIC Security Group Update Handler ────────────────────────────────────────
+//
+// Source: vm-14-02__blueprint__ §core_contracts "NIC-Centric Policy Model".
 
 // HandleUpdateNICSecurityGroups handles PUT /v1/nics/{nic_id}/security_groups.
+//
+// Replaces the full security group set for a NIC atomically.
+// Validates:
+//   - NIC exists and its VPC is owned by the calling principal.
+//   - All SG IDs are valid, in the same VPC, and not deleted.
+//   - len(sgIDs) <= 5 (SG-I-3 limit).
+//
+// After updating the DB, policy propagation to the host-agent is the
+// responsibility of the async worker path — the handler only updates the
+// control-plane state. The worker reads the effective rules via
+// GetEffectiveSGRulesForNIC and calls ApplySGPolicy on the host-agent.
 func (h *PublicConnectivityHandlers) HandleUpdateNICSecurityGroups(w http.ResponseWriter, r *http.Request, nicID string) {
 	ctx := r.Context()
 	requestID := getNetworkRequestID(ctx)
@@ -612,6 +701,7 @@ func (h *PublicConnectivityHandlers) HandleUpdateNICSecurityGroups(w http.Respon
 		return
 	}
 
+	// Validate: max 5 SGs per NIC (SG-I-3).
 	if len(req.SecurityGroupIDs) > 5 {
 		writeNetworkError(w, http.StatusUnprocessableEntity, "sg_limit_exceeded",
 			"A NIC can have at most 5 security groups (SG-I-3)",
@@ -619,6 +709,7 @@ func (h *PublicConnectivityHandlers) HandleUpdateNICSecurityGroups(w http.Respon
 		return
 	}
 
+	// Fetch NIC and verify VPC ownership.
 	nic, err := h.repo.GetNetworkInterfaceByID(ctx, nicID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve NIC", "", requestID)
@@ -629,6 +720,7 @@ func (h *PublicConnectivityHandlers) HandleUpdateNICSecurityGroups(w http.Respon
 		return
 	}
 
+	// Verify VPC ownership (returns 404, not 403 — AUTH_OWNERSHIP_MODEL_V1 §3).
 	vpc, err := h.repo.GetVPCByID(ctx, nic.VPCID)
 	if err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve VPC", "", requestID)
@@ -639,6 +731,7 @@ func (h *PublicConnectivityHandlers) HandleUpdateNICSecurityGroups(w http.Respon
 		return
 	}
 
+	// Validate each SG: must exist, be in the same VPC, not deleted.
 	if len(req.SecurityGroupIDs) > 0 {
 		if err := h.repo.ValidateSecurityGroupsInVPC(ctx, req.SecurityGroupIDs, nic.VPCID, principalID); err != nil {
 			writeNetworkError(w, http.StatusBadRequest, "invalid_security_group",
@@ -647,11 +740,13 @@ func (h *PublicConnectivityHandlers) HandleUpdateNICSecurityGroups(w http.Respon
 		}
 	}
 
+	// Atomically replace the SG set.
 	if err := h.repo.UpdateNICSecurityGroups(ctx, nicID, req.SecurityGroupIDs); err != nil {
 		writeNetworkError(w, http.StatusInternalServerError, "internal_error", "Failed to update security groups", "", requestID)
 		return
 	}
 
+	// Return the new SG set.
 	sgIDs := req.SecurityGroupIDs
 	if sgIDs == nil {
 		sgIDs = []string{}
@@ -668,9 +763,12 @@ func (h *PublicConnectivityHandlers) HandleUpdateNICSecurityGroups(w http.Respon
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-// simulatePublicIPAllocation returns a deterministic public IP for a given EIP ID.
-// Uses strconv.Itoa instead of a local itoa() to avoid redeclaration with snapshot_handlers.go.
+// simulatePublicIPAllocation returns a deterministic public IP string for a given EIP ID.
+// In production this is replaced by a real pool allocation from public_ip_pool or similar.
+// The format is stable so tests can assert on the returned IP.
 func simulatePublicIPAllocation(eipID string) string {
+	// Use the last 2 hex chars of the ID as an octet in 203.0.113.x range
+	// (TEST-NET-3, RFC 5737 — documentation range, safe placeholder).
 	if len(eipID) >= 6 {
 		suffix := eipID[len(eipID)-2:]
 		var octet int

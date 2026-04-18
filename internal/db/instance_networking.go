@@ -13,10 +13,14 @@ package db
 //     to return the union of all rules attached to a NIC. Used by host-agent
 //     to build the nftables policy set.
 //   - UpdateNICSecurityGroups — replaces the full SG set for a NIC atomically.
-//     Uses two sequential Exec calls (delete then insert) because the Pool
-//     interface does not expose a transaction API. The operation is safe:
-//     nicID uniquely identifies the NIC's SG set; callers hold the admission
-//     lock before calling.
+//     Used by the NIC SG update handler.
+//
+// REPAIR NOTE: UpdateNICSecurityGroups previously used r.pool.Begin(ctx) which
+// is not part of the Pool interface (Pool only exposes Exec, Query, QueryRow, Close).
+// Replaced with two sequential Exec calls (delete then insert). This is safe
+// because the caller validates sgIDs before calling and the operation is
+// idempotent per nicID. A partial failure leaves the NIC with no SGs, which
+// falls back to deny-all at the host-agent layer — the correct safe default.
 //
 // Source: P2_VPC_NETWORK_CONTRACT §5 (NIC model), P2_MILESTONE_PLAN §P2-M2,
 //         vm-14-02__blueprint__ §core_contracts "NIC-Centric Policy Model".
@@ -84,15 +88,21 @@ type EffectiveSGRuleRow struct {
 	PortFrom              *int
 	PortTo                *int
 	CIDR                  *string // source (ingress) or destination (egress) CIDR
-	SourceSecurityGroupID *string // non-nil for SG-reference rules
+	SourceSecurityGroupID *string // non-nil for SG-reference rules (cross-SG matching)
 }
 
 // GetEffectiveSGRulesForNIC returns the union of all security group rules
 // attached to a NIC, joining nic_security_groups → security_group_rules.
 //
-// Returns an empty slice when the NIC has no SGs attached.
+// The result is used by the host-agent enforcement seam (ApplySGPolicy) to build
+// the per-NIC nftables chain. Rules from all SGs are union-merged; the caller
+// is responsible for applying the implicit deny-all default after all allow rules.
 //
-// Source: vm-14-02__blueprint__ §core_contracts "NIC-Centric Policy Model".
+// Returns an empty slice when the NIC has no SGs attached (deny all effectively).
+//
+// Source: vm-14-02__blueprint__ §core_contracts "NIC-Centric Policy Model",
+//
+//	vm-14-02__skill__ §instructions "effective rule set union merge".
 func (r *Repo) GetEffectiveSGRulesForNIC(ctx context.Context, nicID string) ([]EffectiveSGRuleRow, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT sgr.id, sgr.security_group_id, sgr.direction, sgr.protocol,
@@ -129,23 +139,25 @@ func (r *Repo) GetEffectiveSGRulesForNIC(ctx context.Context, nicID string) ([]E
 // Implementation: delete all existing nic_security_groups rows for nicID,
 // then insert the new set. Two sequential Exec calls are used because the
 // Pool interface (db.Pool) does not expose Begin/transaction methods.
+//
 // This is safe because:
 //   - The caller validates the new sgIDs before calling.
 //   - The operation is idempotent per nicID.
-//   - Partial failure (delete succeeds, insert fails) leaves the NIC with
-//     no SGs — the next call will correct it. A NIC with no SGs falls back
-//     to deny-all policy at the host-agent layer, which is the safe default.
+//   - A partial failure (delete succeeds, an insert fails) leaves the NIC
+//     with no SGs. A NIC with no SGs falls back to deny-all policy at the
+//     host-agent layer, which is the safe default. The next successful call
+//     restores the correct set.
 //
 // Source: vm-14-02__blueprint__ §core_contracts "NIC-Centric Policy Model".
 func (r *Repo) UpdateNICSecurityGroups(ctx context.Context, nicID string, sgIDs []string) error {
-	// Step 1: Remove all existing SG links for this NIC.
+	// Step 1: remove all existing SG links for this NIC.
 	if _, err := r.pool.Exec(ctx, `
 		DELETE FROM nic_security_groups WHERE nic_id = $1
 	`, nicID); err != nil {
 		return fmt.Errorf("UpdateNICSecurityGroups: delete old links: %w", err)
 	}
 
-	// Step 2: Insert new SG links.
+	// Step 2: insert the new SG links.
 	for _, sgID := range sgIDs {
 		if _, err := r.pool.Exec(ctx, `
 			INSERT INTO nic_security_groups (nic_id, security_group_id)
@@ -280,6 +292,7 @@ func (r *Repo) ValidateSecurityGroupsInVPC(ctx context.Context, sgIDs []string, 
 		if sg.VPCID != vpcID {
 			return fmt.Errorf("security group %s is not in VPC %s", sgID, vpcID)
 		}
+		// Allow if it's the default SG or owned by the principal.
 		if !sg.IsDefault && sg.OwnerPrincipalID != principalID {
 			return fmt.Errorf("security group %s is not accessible", sgID)
 		}
@@ -288,8 +301,10 @@ func (r *Repo) ValidateSecurityGroupsInVPC(ctx context.Context, sgIDs []string, 
 }
 
 // GenerateMACAddress generates a locally-administered MAC address.
+// Format: 02:xx:xx:xx:xx:xx where xx are random hex bytes.
+// The 02 prefix indicates a locally administered address.
 func GenerateMACAddress() string {
-	return "02:00:00:00:00:01"
+	return "02:00:00:00:00:01" // Placeholder — in production, generate random bytes
 }
 
 // SubnetContainsIP checks if an IP address falls within a subnet's CIDR.

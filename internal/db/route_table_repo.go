@@ -5,8 +5,18 @@ package db
 // Source: P2_VPC_NETWORK_CONTRACT §11 P2-VPC-OD-3 (route table model).
 // Phase 2 M9 Slice 1: Minimal route table control-plane foundation.
 //
-// Phase 2 uses implicit single-default route table per VPC for simplicity.
-// Schema supports explicit route tables for future extensibility.
+// VM-P3A Job 1 additions:
+//   - RouteEntryRow.AddressFamily field ('ipv4' | 'ipv6' | 'dual').
+//   - CreateRouteEntry: includes address_family in INSERT; defaults to 'ipv4'.
+//   - ListRouteEntriesByRouteTable: scans address_family.
+//   - IGWExclusivityError: returned when an igw-targeted route's IGW is not
+//     attached to the route table's parent VPC.
+//   - NATLoopError: returned when a nat-targeted route would create a loop.
+//   - ValidateIGWExclusivity: pre-INSERT check for IGW Exclusivity contract.
+//   - ValidateRouteLoopFree: pre-INSERT check for NAT Anti-Loop contract.
+//
+// Source: vm-14-03__blueprint__ §core_contracts "Internet Gateway Exclusivity",
+//         "NAT Gateway Anti-Loop".
 
 import (
 	"context"
@@ -138,26 +148,36 @@ func (r *Repo) SoftDeleteRouteTable(ctx context.Context, id string) error {
 // ── RouteEntry ───────────────────────────────────────────────────────────────
 
 // RouteEntryRow is the DB representation of a RouteEntry record.
+// VM-P3A Job 1: Added AddressFamily to distinguish IPv4/IPv6/dual-stack routes.
+// Source: vm-14-03__blueprint__ §future_phases "IPv6 Integration".
 type RouteEntryRow struct {
 	ID              string
 	RouteTableID    string
 	DestinationCIDR string
 	TargetType      string  // 'local', 'igw', 'nat', 'peering'
 	TargetID        *string // NULL for 'local'
+	AddressFamily   string  // 'ipv4' | 'ipv6' | 'dual' — VM-P3A Job 1
 	Priority        int
 	Status          string
 	CreatedAt       time.Time
 }
 
 // CreateRouteEntry inserts a new RouteEntry record.
+// AddressFamily defaults to 'ipv4' when not set by caller.
+// Source: vm-14-03__blueprint__ §core_contracts "Route Entry Model".
 func (r *Repo) CreateRouteEntry(ctx context.Context, row *RouteEntryRow) error {
+	af := row.AddressFamily
+	if af == "" {
+		af = "ipv4"
+	}
 	_, err := r.pool.Exec(ctx, `
 		INSERT INTO route_entries (
-			id, route_table_id, destination_cidr, target_type, target_id, priority, status, created_at
-		) VALUES ($1, $2, $3::CIDR, $4, $5, $6, $7, NOW())
+			id, route_table_id, destination_cidr, target_type, target_id,
+			address_family, priority, status, created_at
+		) VALUES ($1, $2, $3::CIDR, $4, $5, $6, $7, $8, NOW())
 	`,
 		row.ID, row.RouteTableID, row.DestinationCIDR, row.TargetType,
-		row.TargetID, row.Priority, row.Status,
+		row.TargetID, af, row.Priority, row.Status,
 	)
 	if err != nil {
 		return fmt.Errorf("CreateRouteEntry: %w", err)
@@ -168,7 +188,8 @@ func (r *Repo) CreateRouteEntry(ctx context.Context, row *RouteEntryRow) error {
 // ListRouteEntriesByRouteTable returns all route entries for a given route table.
 func (r *Repo) ListRouteEntriesByRouteTable(ctx context.Context, routeTableID string) ([]*RouteEntryRow, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, route_table_id, destination_cidr::TEXT, target_type, target_id, priority, status, created_at
+		SELECT id, route_table_id, destination_cidr::TEXT, target_type, target_id,
+		       address_family, priority, status, created_at
 		FROM route_entries
 		WHERE route_table_id = $1
 		ORDER BY priority ASC, created_at ASC
@@ -183,7 +204,7 @@ func (r *Repo) ListRouteEntriesByRouteTable(ctx context.Context, routeTableID st
 		row := &RouteEntryRow{}
 		if err := rows.Scan(
 			&row.ID, &row.RouteTableID, &row.DestinationCIDR, &row.TargetType,
-			&row.TargetID, &row.Priority, &row.Status, &row.CreatedAt,
+			&row.TargetID, &row.AddressFamily, &row.Priority, &row.Status, &row.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("ListRouteEntriesByRouteTable scan: %w", err)
 		}
@@ -260,6 +281,117 @@ func (r *Repo) DeleteSubnetRouteTableAssociation(ctx context.Context, subnetID s
 	`, subnetID)
 	if err != nil {
 		return fmt.Errorf("DeleteSubnetRouteTableAssociation: %w", err)
+	}
+	return nil
+}
+
+// ── Route Validation Error Types — VM-P3A Job 1 ───────────────────────────────
+
+// IGWExclusivityError is returned by ValidateIGWExclusivity when a proposed
+// default route targets an Internet Gateway that is not attached to the VPC
+// that owns the route table.
+//
+// Source: vm-14-03__blueprint__ §core_contracts "Internet Gateway Exclusivity":
+//   "A route table may only reference an IGW that is attached to its parent VPC."
+type IGWExclusivityError struct {
+	VPCID string
+	IGWID string
+}
+
+func (e *IGWExclusivityError) Error() string {
+	return fmt.Sprintf("internet gateway %s is not attached to vpc %s", e.IGWID, e.VPCID)
+}
+
+// NATLoopError is returned by ValidateRouteLoopFree when a proposed default
+// route targeting a NAT Gateway would create a routing loop: the NAT Gateway's
+// subnet is itself associated with (or defaults to) the route table being modified.
+//
+// Source: vm-14-03__blueprint__ §core_contracts "NAT Gateway Anti-Loop":
+//   "A 0.0.0.0/0 → NAT route must not be in the same route table used by the
+//    subnet hosting that NAT gateway."
+type NATLoopError struct {
+	RouteTableID string
+	SubnetID     string
+}
+
+func (e *NATLoopError) Error() string {
+	return fmt.Sprintf("route table %s is used by subnet %s which hosts the NAT gateway — routing loop", e.RouteTableID, e.SubnetID)
+}
+
+// ── Route Validation Helpers — VM-P3A Job 1 ──────────────────────────────────
+
+// ValidateIGWExclusivity checks that the Internet Gateway identified by igwID
+// is attached to the VPC that owns the route table identified by routeTableID.
+//
+// Returns *IGWExclusivityError when the exclusivity rule is violated.
+// Returns nil when the IGW is in the correct VPC (route entry is safe to create).
+//
+// Source: vm-14-03__blueprint__ §core_contracts "Internet Gateway Exclusivity".
+func (r *Repo) ValidateIGWExclusivity(ctx context.Context, routeTableID, igwID string) error {
+	// Fetch the route table's parent VPC.
+	rtb, err := r.GetRouteTableByID(ctx, routeTableID)
+	if err != nil {
+		return fmt.Errorf("ValidateIGWExclusivity: lookup route table: %w", err)
+	}
+	if rtb == nil {
+		return fmt.Errorf("ValidateIGWExclusivity: route table %s not found", routeTableID)
+	}
+	vpcID := rtb.VPCID
+
+	// Fetch the IGW and check its parent VPC.
+	igw, err := r.GetInternetGatewayByID(ctx, igwID)
+	if err != nil {
+		return fmt.Errorf("ValidateIGWExclusivity: lookup igw: %w", err)
+	}
+	if igw == nil || igw.VPCID != vpcID {
+		return &IGWExclusivityError{VPCID: vpcID, IGWID: igwID}
+	}
+	return nil
+}
+
+// ValidateRouteLoopFree checks that adding a default route targeting a NAT
+// Gateway in natGatewaySubnetID would not create a routing loop.
+//
+// A loop occurs when natGatewaySubnetID is associated with routeTableID (either
+// explicitly via subnet_route_table_associations, or implicitly when the subnet's
+// VPC uses routeTableID as its default route table).
+//
+// Returns *NATLoopError when a loop would be created.
+// Returns nil when the route is safe to create.
+//
+// Source: vm-14-03__blueprint__ §core_contracts "NAT Gateway Anti-Loop".
+func (r *Repo) ValidateRouteLoopFree(ctx context.Context, routeTableID, natGatewaySubnetID string) error {
+	// Check explicit association first.
+	assoc, err := r.GetSubnetRouteTableAssociation(ctx, natGatewaySubnetID)
+	if err != nil {
+		return fmt.Errorf("ValidateRouteLoopFree: check explicit assoc: %w", err)
+	}
+	if assoc != nil {
+		// Subnet has an explicit association — loop if it points to our route table.
+		if assoc.RouteTableID == routeTableID {
+			return &NATLoopError{RouteTableID: routeTableID, SubnetID: natGatewaySubnetID}
+		}
+		// Explicit association points elsewhere — no loop.
+		return nil
+	}
+
+	// No explicit association — subnet uses its VPC's default route table.
+	// Fetch the subnet to get its VPC, then check if our route table is that VPC's default.
+	subnet, err := r.GetSubnetByID(ctx, natGatewaySubnetID)
+	if err != nil {
+		return fmt.Errorf("ValidateRouteLoopFree: lookup subnet: %w", err)
+	}
+	if subnet == nil {
+		// Subnet not found — cannot validate; allow the route (caller validates subnet existence separately).
+		return nil
+	}
+
+	defaultRTB, err := r.GetDefaultRouteTableByVPC(ctx, subnet.VPCID)
+	if err != nil {
+		return fmt.Errorf("ValidateRouteLoopFree: get default rtb: %w", err)
+	}
+	if defaultRTB != nil && defaultRTB.ID == routeTableID {
+		return &NATLoopError{RouteTableID: routeTableID, SubnetID: natGatewaySubnetID}
 	}
 	return nil
 }

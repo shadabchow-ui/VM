@@ -219,6 +219,19 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 		// The reconciler can repair status drift.
 		log.Error("step7: UpdateRootDiskStatus to ATTACHED failed — non-fatal", "disk_id", diskID, "error", err)
 	}
+	// Update NIC status to "attached" now that the VM is live on the host.
+	// Phase 1 classic instances (no NIC row) hit the nil guard and skip safely.
+	// Source: VM-P2A-S2 audit finding R3; P2_VPC_NETWORK_CONTRACT §5.
+	nic, _ := h.deps.Store.GetPrimaryNetworkInterfaceByInstance(ctx, inst.ID)
+	if nic != nil {
+		if err := h.deps.Store.UpdateNetworkInterfaceStatus(ctx, nic.ID, "attached"); err != nil {
+			// Non-fatal: instance is running. Reconciler can repair NIC status drift.
+			log.Error("step7: UpdateNetworkInterfaceStatus(attached) failed — non-fatal", "nic_id", nic.ID, "error", err)
+		} else {
+			log.Info("step7: NIC attached", "nic_id", nic.ID)
+		}
+	}
+
 	h.writeEvent(ctx, inst.ID, db.EventInstanceProvisioningDone, "Provisioning complete")
 	h.writeEvent(ctx, inst.ID, db.EventUsageStart, "Usage billing started")
 	log.Info("INSTANCE_CREATE: completed — instance running", "ip", allocatedIP, "disk_id", diskID)

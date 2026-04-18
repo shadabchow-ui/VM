@@ -109,14 +109,27 @@ func (h *StartHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	inst.HostID = &selectedHost.ID
 	log.Info("step4: host assigned", "host_id", selectedHost.ID)
 
-	// ── Step 5: Allocate IP ───────────────────────────────────────────────────
-	vpcID := phase1VPCID
-	allocatedIP, err := h.deps.Network.AllocateIP(ctx, vpcID, inst.ID)
+	// ── Step 5: Retrieve retained IP ───────────────────────────────────────────
+	// IP_ALLOCATION_CONTRACT_V1 §5: the private IP is retained across stop/start.
+	// The stop handler does NOT release the IP, so GetIPByInstance returns the
+	// same allocation that was made during INSTANCE_CREATE. No new AllocateIP call
+	// is issued here; the ip_allocations row remains owned by this instance.
+	allocatedIP, err := h.deps.Store.GetIPByInstance(ctx, inst.ID)
 	if err != nil {
-		return h.failInstance(ctx, inst, fmt.Errorf("step5 allocate IP: %w", err))
+		return h.failInstance(ctx, inst, fmt.Errorf("step5 GetIPByInstance: %w", err))
 	}
-	h.writeEvent(ctx, inst.ID, db.EventIPAllocated, "IP allocated: "+allocatedIP)
-	log.Info("step5: IP allocated", "ip", allocatedIP)
+	if allocatedIP == "" {
+		// No retained IP found — fall back to fresh allocation.
+		// This handles instances created before IP retention was enforced,
+		// or any edge-case where the allocation was lost.
+		var allocErr error
+		allocatedIP, allocErr = h.deps.Network.AllocateIP(ctx, phase1VPCID, inst.ID)
+		if allocErr != nil {
+			return h.failInstance(ctx, inst, fmt.Errorf("step5 AllocateIP (fallback): %w", allocErr))
+		}
+		h.writeEvent(ctx, inst.ID, db.EventIPAllocated, "IP allocated (fallback): "+allocatedIP)
+	}
+	log.Info("step5: IP resolved", "ip", allocatedIP, "retained", true)
 
 	// ── Step 6: CreateInstance on Host Agent ──────────────────────────────────
 	hostAddr := selectedHost.ID + ":50051"
@@ -169,6 +182,19 @@ func (h *StartHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	if err := h.deps.Store.UpdateInstanceState(ctx, inst.ID, "provisioning", "running", inst.Version); err != nil {
 		return fmt.Errorf("step8 transition to running: %w", err)
 	}
+	// Update NIC status to "attached" now that the VM is live on the host.
+	// Phase 1 classic instances (no NIC row) hit the nil guard and skip safely.
+	// Source: VM-P2A-S2 audit finding R3; P2_VPC_NETWORK_CONTRACT §5.
+	nic, _ := h.deps.Store.GetPrimaryNetworkInterfaceByInstance(ctx, inst.ID)
+	if nic != nil {
+		if err := h.deps.Store.UpdateNetworkInterfaceStatus(ctx, nic.ID, "attached"); err != nil {
+			// Non-fatal: instance is running. Reconciler can repair NIC status drift.
+			log.Error("step8: UpdateNetworkInterfaceStatus(attached) failed — non-fatal", "nic_id", nic.ID, "error", err)
+		} else {
+			log.Info("step8: NIC re-attached", "nic_id", nic.ID)
+		}
+	}
+
 	h.writeEvent(ctx, inst.ID, db.EventInstanceProvisioningDone, "Re-provisioning complete")
 	h.writeEvent(ctx, inst.ID, db.EventUsageStart, "Usage billing started")
 	log.Info("INSTANCE_START: completed — instance running", "ip", allocatedIP)

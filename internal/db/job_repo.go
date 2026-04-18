@@ -12,6 +12,8 @@ package db
 //         ListStuckInProgressJobs extended with volume job timeout intervals.
 // VM-P2B-S2: Added SnapshotID field to JobRow for snapshot-scoped jobs.
 //         InsertSnapshotJob lives in snapshot_repo.go.
+// VM-P2C: Added ImageID field to JobRow for image-scoped jobs.
+//         InsertImageJob lives in image_repo.go.
 
 import (
 	"context"
@@ -22,14 +24,16 @@ import (
 // JobRow is the DB representation of a job record.
 // VM-P2B: Added VolumeID — nullable FK to volumes.
 // VM-P2B-S2: Added SnapshotID — nullable FK to snapshots.
-// Invariant: exactly one of InstanceID, VolumeID, or SnapshotID is non-null
+// VM-P2C: Added ImageID — nullable FK to images.
+// Invariant: exactly one of InstanceID, VolumeID, SnapshotID, or ImageID is non-null
 // (enforced at the application layer; the DB allows any combination).
 // Source: JOB_MODEL_V1 §1, P2_VOLUME_MODEL.md §4.2, P2_IMAGE_SNAPSHOT_MODEL.md §4.
 type JobRow struct {
 	ID             string
-	InstanceID     string  // empty string when VolumeID or SnapshotID is set
+	InstanceID     string  // empty string when VolumeID, SnapshotID, or ImageID is set
 	VolumeID       *string // non-nil for VOLUME_* job types
 	SnapshotID     *string // non-nil for SNAPSHOT_* job types
+	ImageID        *string // non-nil for IMAGE_* job types
 	JobType        string
 	Status         string
 	IdempotencyKey string
@@ -77,7 +81,7 @@ func (r *Repo) GetJobByID(ctx context.Context, id string) (*JobRow, error) {
 		FROM jobs
 		WHERE id = $1
 	`, id).Scan(
-		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.JobType, &row.Status,
+		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.ImageID, &row.JobType, &row.Status,
 		&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
 		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 	)
@@ -103,7 +107,7 @@ func (r *Repo) GetJobByInstanceAndID(ctx context.Context, instanceID, jobID stri
 		WHERE id          = $1
 		  AND instance_id = $2
 	`, jobID, instanceID).Scan(
-		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.JobType, &row.Status,
+		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.ImageID, &row.JobType, &row.Status,
 		&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
 		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 	)
@@ -127,7 +131,7 @@ func (r *Repo) GetJobByIdempotencyKey(ctx context.Context, key string) (*JobRow,
 		FROM jobs
 		WHERE idempotency_key = $1
 	`, key).Scan(
-		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.JobType, &row.Status,
+		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.ImageID, &row.JobType, &row.Status,
 		&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
 		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 	)
@@ -162,7 +166,7 @@ func (r *Repo) AtomicClaimJob(ctx context.Context) (*JobRow, error) {
 		          idempotency_key, attempt_count, max_attempts,
 		          error_message, created_at, updated_at, claimed_at, completed_at
 	`).Scan(
-		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.JobType, &row.Status,
+		&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.ImageID, &row.JobType, &row.Status,
 		&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
 		&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 	)
@@ -251,7 +255,7 @@ func (r *Repo) ListStuckInProgressJobs(ctx context.Context) ([]*JobRow, error) {
 	for rows.Next() {
 		row := &JobRow{}
 		if err := rows.Scan(
-			&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.JobType, &row.Status,
+			&row.ID, &row.InstanceID, &row.VolumeID, &row.SnapshotID, &row.ImageID, &row.JobType, &row.Status,
 			&row.IdempotencyKey, &row.AttemptCount, &row.MaxAttempts,
 			&row.ErrorMessage, &row.CreatedAt, &row.UpdatedAt, &row.ClaimedAt, &row.CompletedAt,
 		); err != nil {

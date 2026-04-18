@@ -14,7 +14,7 @@ package handlers
 //  4. Host Agent: StopInstance (ACPI graceful, force on timeout).
 //  5. Host Agent: DeleteInstance (releases VM process, TAP, rootfs).
 //     Phase 1: stop always releases all runtime resources; root disk is gone.
-//  6. Network: ReleaseIP (idempotent).
+//  6. IP retained (IP_ALLOCATION_CONTRACT_V1 §5) + NIC status → detached.
 //  7. DB: transition stopping → stopped. Emit usage.end + instance.stopped events.
 //
 // Idempotency: if re-delivered while in stopping, resumes from step 4
@@ -108,14 +108,20 @@ func (h *StopHandler) Execute(ctx context.Context, job *db.JobRow) error {
 		log.Info("step5: VM resources released")
 	}
 
-	// ── Step 6: Release IP ────────────────────────────────────────────────────
-	ip, _ := h.deps.Store.GetIPByInstance(ctx, inst.ID)
-	if ip != "" {
-		if err := h.deps.Network.ReleaseIP(ctx, ip, phase1VPCID, inst.ID); err != nil {
-			log.Error("step6: ReleaseIP failed — IP may be leaked", "ip", ip, "error", err)
+	// ── Step 6: Retain IP + update NIC status to detached ───────────────────
+	// IP_ALLOCATION_CONTRACT_V1 §5: private IP is stable across stop/start.
+	// The ip_allocations row is NOT released here; the same IP will be reused
+	// when the instance is started. Only the delete handler releases the IP.
+	//
+	// For VPC instances (primary NIC present), advance NIC status to "detached"
+	// to reflect that the host-side TAP has been torn down. Phase 1 classic
+	// instances (no NIC row) hit the nil guard and skip this block safely.
+	nic, _ := h.deps.Store.GetPrimaryNetworkInterfaceByInstance(ctx, inst.ID)
+	if nic != nil {
+		if err := h.deps.Store.UpdateNetworkInterfaceStatus(ctx, nic.ID, "detached"); err != nil {
+			log.Error("step6: UpdateNetworkInterfaceStatus(detached) failed — non-fatal", "nic_id", nic.ID, "error", err)
 		} else {
-			log.Info("step6: IP released", "ip", ip)
-			h.writeEvent(ctx, inst.ID, db.EventIPReleased, "IP released: "+ip)
+			log.Info("step6: NIC detached", "nic_id", nic.ID)
 		}
 	}
 

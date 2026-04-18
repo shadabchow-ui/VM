@@ -180,6 +180,25 @@ func (s *fakeStore) DetachRootDisk(_ context.Context, diskID string) error {
 	return nil
 }
 
+// ── NIC lifecycle stubs (VM-P2A-S2) ──────────────────────────────────────────
+// These three methods satisfy the InstanceStore interface extension.
+// fakeStore does not track NIC state — it relies on fakeNICStore (nic_lifecycle_test.go)
+// for NIC-specific assertions. Here the stubs return nil, nil / nil so that
+// Phase 1 classic-instance tests (which have no NIC rows seeded) treat all
+// NIC calls as safe no-ops, matching the "nil → no-op" contract in the handlers.
+
+func (s *fakeStore) GetPrimaryNetworkInterfaceByInstance(_ context.Context, _ string) (*db.NetworkInterfaceRow, error) {
+	return nil, nil // no NIC seeded in plain fakeStore → Phase 1 classic path
+}
+
+func (s *fakeStore) UpdateNetworkInterfaceStatus(_ context.Context, _, _ string) error {
+	return nil // no-op: NIC state tracking is in fakeNICStore
+}
+
+func (s *fakeStore) SoftDeleteNetworkInterface(_ context.Context, _ string) error {
+	return nil // no-op: NIC state tracking is in fakeNICStore
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // eventTypes returns the list of event types written so far (for assertions).

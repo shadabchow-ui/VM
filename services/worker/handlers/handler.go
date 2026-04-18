@@ -47,6 +47,18 @@ type InstanceStore interface {
 	InsertEvent(ctx context.Context, row *db.EventRow) error
 	GetIPByInstance(ctx context.Context, instanceID string) (string, error)
 
+	// NIC lifecycle operations (VM-P2A-S2)
+	// Source: P2_VPC_NETWORK_CONTRACT §5 (NIC model), VM-P2A-S2 audit findings R1, R3.
+	// GetPrimaryNetworkInterfaceByInstance returns the primary NIC for an instance.
+	// Returns (nil, nil) when no NIC exists (Phase 1 classic instance — safe no-op).
+	GetPrimaryNetworkInterfaceByInstance(ctx context.Context, instanceID string) (*db.NetworkInterfaceRow, error)
+	// UpdateNetworkInterfaceStatus sets the status field of a NIC row.
+	// Used to advance NIC through pending→attached (create/start) and attached→detached (stop).
+	UpdateNetworkInterfaceStatus(ctx context.Context, nicID, status string) error
+	// SoftDeleteNetworkInterface marks a NIC as deleted (status=deleted).
+	// Called by the delete handler as the final NIC lifecycle step.
+	SoftDeleteNetworkInterface(ctx context.Context, nicID string) error
+
 	// Root disk operations (M10 Slice 3)
 	// Source: 06-01-root-disk-model-and-persistence-semantics.md,
 	//         P2_VOLUME_MODEL.md §1.

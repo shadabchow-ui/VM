@@ -6,6 +6,9 @@ package main
 // VM-P2B-S3:
 //   - handleDeleteVolume: enforce SNAP-I-3 (reject if active snapshots exist).
 //   - volumeToResponse: include SourceSnapshotID for origin=snapshot volumes.
+// VM-P3A repair:
+//   - handleInstanceVolumeSubroute: dispatcher for /v1/instances/{id}/volumes[/{volume_id}]
+//     called by instance_handlers.go. Previously missing — caused failure 1.
 //
 // Routes registered:
 //   POST   /v1/volumes                              → handleCreateVolume      (202 + Job)
@@ -99,6 +102,58 @@ func (s *server) handleVolumeByID(w http.ResponseWriter, r *http.Request) {
 		s.handleGetVolume(w, r, id)
 	case http.MethodDelete:
 		s.handleDeleteVolume(w, r, id)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// ── /v1/instances/{id}/volumes sub-route dispatcher ──────────────────────────
+
+// handleInstanceVolumeSubroute dispatches requests for the volume sub-routes
+// nested under /v1/instances/{id}/volumes[/{volume_id}].
+//
+// Called by handleInstanceByID in instance_handlers.go when subpath == "volumes".
+// parts is the same SplitN(rest, "/", 3) slice used by handleInstanceByID:
+//
+//	parts[0] = instance ID (already extracted by caller as id)
+//	parts[1] = "volumes"
+//	parts[2] = volume_id (only present for DELETE)
+//
+// Dispatch table:
+//
+//	GET    /v1/instances/{id}/volumes              → handleListInstanceVolumes
+//	POST   /v1/instances/{id}/volumes              → handleAttachVolume
+//	DELETE /v1/instances/{id}/volumes/{volume_id}  → handleDetachVolume
+//
+// Source: P2_VOLUME_MODEL.md §8 (API endpoint summary).
+func (s *server) handleInstanceVolumeSubroute(w http.ResponseWriter, r *http.Request, instanceID string, parts []string) {
+	// parts[2] is the volume_id segment (only present when len(parts) == 3).
+	hasVolumeID := len(parts) >= 3 && parts[2] != ""
+
+	switch r.Method {
+	case http.MethodGet:
+		if hasVolumeID {
+			// GET /v1/instances/{id}/volumes/{volume_id} — not a defined endpoint.
+			http.NotFound(w, r)
+			return
+		}
+		s.handleListInstanceVolumes(w, r, instanceID)
+
+	case http.MethodPost:
+		if hasVolumeID {
+			http.NotFound(w, r)
+			return
+		}
+		s.handleAttachVolume(w, r, instanceID)
+
+	case http.MethodDelete:
+		if !hasVolumeID {
+			// DELETE /v1/instances/{id}/volumes with no volume_id — not allowed.
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleDetachVolume(w, r, instanceID, parts[2])
+
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}

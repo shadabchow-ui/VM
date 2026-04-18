@@ -152,6 +152,20 @@ func (h *DeleteHandler) Execute(ctx context.Context, job *db.JobRow) error {
 		}
 	}
 
+	// ── Step 7b: Soft-delete NIC ─────────────────────────────────────────────
+	// Mark the primary NIC as deleted so the network_interfaces row reflects
+	// the instance is gone. Phase 1 classic instances (no NIC row) skip safely.
+	// Source: VM-P2A-S2 audit finding R3; P2_VPC_NETWORK_CONTRACT §5.
+	nicToDel, _ := h.deps.Store.GetPrimaryNetworkInterfaceByInstance(ctx, inst.ID)
+	if nicToDel != nil {
+		if err := h.deps.Store.SoftDeleteNetworkInterface(ctx, nicToDel.ID); err != nil {
+			// Non-fatal: log and continue. Orphan GC can clean up.
+			log.Error("step7b: SoftDeleteNetworkInterface failed — non-fatal", "nic_id", nicToDel.ID, "error", err)
+		} else {
+			log.Info("step7b: NIC soft-deleted", "nic_id", nicToDel.ID)
+		}
+	}
+
 	// ── Step 8: Soft-delete ───────────────────────────────────────────────────
 	if err := h.deps.Store.SoftDeleteInstance(ctx, inst.ID, inst.Version); err != nil {
 		return fmt.Errorf("step8 soft delete: %w", err)
