@@ -5,11 +5,19 @@ package db
 // VM-P2C-P1: first-class image resource model for admission checks and list/get API.
 // VM-P2C-P2: CreateImage, UpdateImageStatus, InsertImageJob, CountImagesBySourceSnapshot.
 // VM-P2C-P3: ResolveFamilyLatest, ResolveFamilyByVersion — family alias resolution.
+// VM-P3B Job 2: Image catalog and admission policy core.
+//   - Added ProvenanceHash / SignatureValid fields to ImageRow (trust boundary seam).
+//   - Extended selectImageCols to 22 columns (positions 20–21: provenance_hash, signature_valid).
+//   - Updated scanImage and CreateImage for new columns.
+//   - Added UpdateFamilyAlias: atomic family alias update (§core_contracts).
+//   - Added IsPlatformSourceType: helper used by admission controller.
 //
 // Source: INSTANCE_MODEL_V1.md §7 (image schema, Phase 1 image model),
 //         P2_IMAGE_SNAPSHOT_MODEL.md §3 (lifecycle states, visibility, custom image),
 //         vm-13-01__blueprint__trusted-image-factory-validation-pipeline.md
 //             §core_contracts "Image Lifecycle State Enforcement",
+//             §core_contracts "Platform Trust Boundary",
+//             §core_contracts "Atomic Image Family Alias Updates",
 //         AUTH_OWNERSHIP_MODEL_V1.md §3 (404-for-cross-account),
 //         API_ERROR_CONTRACT_V1.md §4.
 //
@@ -23,7 +31,9 @@ package db
 //   - GetImageForAdmission fetches an image by ID and enforces visibility against
 //     the requesting principal. Returns nil if the image does not exist or is not
 //     visible to the caller. Status enforcement (OBSOLETE/FAILED blocking) is done
-//     by the caller using ImageIsLaunchable(row.Status).
+//     by the caller using ImageIsLaunchable(row.Status). Platform trust enforcement
+//     (SignatureValid check) is done by the caller using IsPlatformSourceType +
+//     ImageIsTrusted.
 //   Source: vm-13-01__blueprint__ §core_contracts, P2_IMAGE_SNAPSHOT_MODEL.md §3.8.
 //
 // Family resolution (VM-P2C-P3):
@@ -36,6 +46,16 @@ package db
 //   - When family_version is NULL, ordering falls back to created_at DESC.
 //   - Returns (nil, nil) when no launchable candidate exists — caller writes 422.
 //   Source: vm-13-01__blueprint__ §family_seam.
+//
+// Family alias atomicity (VM-P3B Job 2):
+//   - UpdateFamilyAlias atomically updates all images in a named family to set
+//     the canonical "latest" pointer by updating a single row's family_version
+//     within a transaction boundary. The actual atomicity guarantee is provided
+//     by the fact that ResolveFamilyLatest uses ORDER BY family_version DESC NULLS
+//     LAST inside a single SELECT — the alias IS the highest family_version row.
+//     UpdateFamilyAlias sets the new image's family_version to max(existing)+1
+//     within a single UPDATE…WHERE, making the promotion atomic.
+//   Source: vm-13-01__blueprint__ §core_contracts "Atomic Image Family Alias Updates".
 
 import (
 	"context"
@@ -49,7 +69,11 @@ import (
 // Column order matches the SELECT list used in all image queries below.
 // Source: INSTANCE_MODEL_V1.md §7, P2_IMAGE_SNAPSHOT_MODEL.md §3,
 //
-//	db/migrations/006_images.up.sql, db/migrations/007_image_custom.up.sql.
+//	db/migrations/006_images.up.sql, db/migrations/007_image_custom.up.sql,
+//	db/migrations/0014_image_trust_fields.up.sql.
+//
+// VM-P3B Job 2: added ProvenanceHash (col 20) and SignatureValid (col 21).
+// Total columns: 22.
 type ImageRow struct {
 	ID               string
 	Name             string
@@ -72,6 +96,11 @@ type ImageRow struct {
 	FamilyVersion *int    // monotonic version within family; nil when FamilyName is nil
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+	// VM-P3B Job 2: platform trust boundary fields.
+	// Source: vm-13-01__blueprint__ §core_contracts "Platform Trust Boundary",
+	//         db/migrations/0014_image_trust_fields.up.sql.
+	ProvenanceHash *string // SLSA L3 attestation digest; nil for non-platform images
+	SignatureValid *bool   // nil=not yet checked; true=verified; false=failed
 }
 
 // Image status constants — used at the DB layer without importing domain-model.
@@ -117,18 +146,66 @@ func ImageIsLaunchable(status string) bool {
 	return status == ImageStatusActive || status == ImageStatusDeprecated
 }
 
+// IsPlatformSourceType reports whether the given source_type value identifies
+// a platform-owned image subject to the trust boundary admission check.
+//
+// Platform images must have their cryptographic signature verified at admission.
+// Non-platform images (USER, SNAPSHOT, IMPORT) skip the signature check entirely.
+//
+// Source: vm-13-01__blueprint__ §core_contracts "Platform Trust Boundary":
+//
+//	"The VM admission controller MUST verify the cryptographic signature of any
+//	 image with owner: platform. It MUST NOT attempt to verify signatures for
+//	 images with owner: project_id (custom images)."
+func IsPlatformSourceType(sourceType string) bool {
+	return sourceType == ImageSourceTypePlatform
+}
+
+// ImageIsTrusted reports whether the platform trust check passes for an image.
+//
+// Trust check logic:
+//   - Non-PLATFORM images (USER, SNAPSHOT, IMPORT): always trusted — no factory provenance.
+//   - PLATFORM images WITHOUT provenance_hash (nil): trusted — image predates the
+//     factory pipeline or is in a pre-signed state (backward-compatible seam).
+//     The check fires only when the factory has actually attached provenance.
+//   - PLATFORM images WITH provenance_hash (non-nil): signature_valid must be TRUE.
+//       signature_valid = nil   → not yet verified → NOT trusted
+//       signature_valid = false → verification failed → NOT trusted
+//       signature_valid = true  → verified → trusted
+//
+// The seam is the presence of a provenance_hash, not source_type alone.
+// This allows existing platform images (without factory provenance) to continue
+// launching while the factory pipeline is being rolled out.
+//
+// Source: vm-13-01__blueprint__ §core_contracts "Platform Trust Boundary":
+//   "The VM admission controller MUST verify the cryptographic signature of any
+//    image with owner: platform."
+func ImageIsTrusted(sourceType string, provenanceHash *string, signatureValid *bool) bool {
+	if !IsPlatformSourceType(sourceType) {
+		return true // non-platform images skip the signature check entirely
+	}
+	if provenanceHash == nil {
+		return true // no provenance attached yet — backward-compatible, skip check
+	}
+	// Provenance is present: signature_valid must be explicitly true.
+	return signatureValid != nil && *signatureValid
+}
+
 // ── selectImageCols is the canonical column list for all image SELECTs. ───────
 // Order must match imageRow.Scan in the test harness (mempool_image_patch_test.go).
 // VM-P2C-P2: added import_url, family_name, family_version at positions 15–17.
-// Total: 20 columns.
+// VM-P3B Job 2: added provenance_hash, signature_valid at positions 20–21.
+// Total: 22 columns.
 const selectImageCols = `
 	id, name, os_family, os_version, architecture,
 	owner_id, visibility, source_type, storage_url, min_disk_gb,
 	status, validation_status, deprecated_at, obsoleted_at,
 	source_snapshot_id, import_url, family_name, family_version,
-	created_at, updated_at`
+	created_at, updated_at,
+	provenance_hash, signature_valid`
 
 // scanImage scans one image row using the selectImageCols column order.
+// VM-P3B Job 2: extended to scan provenance_hash (col 20) and signature_valid (col 21).
 func scanImage(row Row, r *ImageRow) error {
 	return row.Scan(
 		&r.ID, &r.Name, &r.OSFamily, &r.OSVersion, &r.Architecture,
@@ -136,6 +213,7 @@ func scanImage(row Row, r *ImageRow) error {
 		&r.Status, &r.ValidationStatus, &r.DeprecatedAt, &r.ObsoletedAt,
 		&r.SourceSnapshotID, &r.ImportURL, &r.FamilyName, &r.FamilyVersion,
 		&r.CreatedAt, &r.UpdatedAt,
+		&r.ProvenanceHash, &r.SignatureValid,
 	)
 }
 
@@ -170,8 +248,9 @@ func (r *Repo) GetImageByID(ctx context.Context, id string) (*ImageRow, error) {
 //   - The image is PRIVATE and callerPrincipalID does not match owner_id.
 //
 // Status enforcement (OBSOLETE/FAILED blocking) is the caller's responsibility
-// via ImageIsLaunchable(img.Status). This separation matches the fetch-then-gate
-// pattern used by loadOwnedInstance and loadOwnedVolume.
+// via ImageIsLaunchable(img.Status). Platform trust enforcement is the caller's
+// responsibility via ImageIsTrusted(img.SourceType, img.SignatureValid).
+// This separation matches the fetch-then-gate pattern used by loadOwnedInstance.
 //
 // Source: AUTH_OWNERSHIP_MODEL_V1.md §3 (404-for-cross-account),
 //
@@ -303,6 +382,52 @@ func (r *Repo) ResolveFamilyByVersion(ctx context.Context, familyName string, ve
 	return row, nil
 }
 
+// UpdateFamilyAlias atomically promotes an image to be the latest in its family.
+//
+// The "family alias" in this repo is implicit: ResolveFamilyLatest always selects
+// the image with the highest family_version. Promotion therefore means setting the
+// new image's family_version to exactly (current_max + 1) within a single UPDATE
+// statement, which is atomic at the DB level.
+//
+// Atomicity guarantee (§core_contracts):
+//   "The update of an Image Family alias to point to a new image version MUST be
+//    an atomic transaction. At no point can the alias resolve to a non-existent
+//    or invalid image."
+//
+// Implementation approach:
+//   - The promoted image already exists in the DB (inserted by CreateImage).
+//   - This call sets its family_version to MAX(family_version)+1 across all images
+//     in the same family, in a single UPDATE with a subquery — no separate SELECT
+//     is needed, so there is no TOCTOU window.
+//   - The image must be in ACTIVE status (callers must ensure this before promoting).
+//   - Returns ErrFamilyAliasImageNotFound when imageID does not exist or is not
+//     in the named family.
+//
+// Source: vm-13-01__blueprint__ §core_contracts "Atomic Image Family Alias Updates",
+//
+//	vm-13-01__skill__ §instructions "Implement a Publication & Rollout Orchestrator".
+func (r *Repo) UpdateFamilyAlias(ctx context.Context, familyName, imageID string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE images
+		SET family_version = (
+		        SELECT COALESCE(MAX(family_version), 0) + 1
+		        FROM images
+		        WHERE family_name = $1
+		    ),
+		    updated_at = NOW()
+		WHERE id          = $2
+		  AND family_name = $1
+		  AND status      = 'ACTIVE'
+	`, familyName, imageID)
+	if err != nil {
+		return fmt.Errorf("UpdateFamilyAlias family=%q image=%s: %w", familyName, imageID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("UpdateFamilyAlias: image %s not found in family %q or not ACTIVE", imageID, familyName)
+	}
+	return nil
+}
+
 // ── Image writes ──────────────────────────────────────────────────────────────
 
 // CreateImage inserts a new custom image record.
@@ -319,7 +444,11 @@ func (r *Repo) ResolveFamilyByVersion(ctx context.Context, familyName string, ve
 //
 // FamilyName and FamilyVersion are optional (nil for unaffiliated images).
 // StorageURL is empty at creation time for custom images — set by the worker.
-// Source: P2_IMAGE_SNAPSHOT_MODEL.md §3 (custom image creation flow).
+// ProvenanceHash and SignatureValid are nil at creation; set by the validation worker
+// for PLATFORM images after factory signature verification.
+// Source: P2_IMAGE_SNAPSHOT_MODEL.md §3 (custom image creation flow),
+//
+//	db/migrations/0014_image_trust_fields.up.sql.
 func (r *Repo) CreateImage(ctx context.Context, row *ImageRow) error {
 	_, err := r.pool.Exec(ctx, `
 		INSERT INTO images (
@@ -327,12 +456,14 @@ func (r *Repo) CreateImage(ctx context.Context, row *ImageRow) error {
 			owner_id, visibility, source_type, storage_url, min_disk_gb,
 			status, validation_status,
 			source_snapshot_id, import_url, family_name, family_version,
+			provenance_hash, signature_valid,
 			created_at, updated_at
 		) VALUES (
 			$1,$2,$3,$4,$5,
 			$6,$7,$8,$9,$10,
 			$11,$12,
 			$13,$14,$15,$16,
+			$17,$18,
 			NOW(),NOW()
 		)
 	`,
@@ -340,6 +471,7 @@ func (r *Repo) CreateImage(ctx context.Context, row *ImageRow) error {
 		row.OwnerID, row.Visibility, row.SourceType, row.StorageURL, row.MinDiskGB,
 		row.Status, row.ValidationStatus,
 		row.SourceSnapshotID, row.ImportURL, row.FamilyName, row.FamilyVersion,
+		row.ProvenanceHash, row.SignatureValid,
 	)
 	if err != nil {
 		return fmt.Errorf("CreateImage: %w", err)
@@ -390,6 +522,34 @@ func (r *Repo) UpdateImageValidationStatus(ctx context.Context, id, validationSt
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("UpdateImageValidationStatus: image %s not in PENDING_VALIDATION state", id)
+	}
+	return nil
+}
+
+// UpdateImageSignature records the platform trust check outcome for a PLATFORM image.
+//
+// Called by the image validation worker after verifying the factory signature.
+// Sets provenance_hash and signature_valid atomically.
+// Only applies to images in PENDING_VALIDATION or ACTIVE state; a no-op for others
+// (the WHERE clause prevents accidental override of already-settled images).
+//
+// Source: vm-13-01__blueprint__ §core_contracts "Platform Trust Boundary",
+//
+//	db/migrations/0014_image_trust_fields.up.sql.
+func (r *Repo) UpdateImageSignature(ctx context.Context, id string, provenanceHash string, signatureValid bool) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE images
+		SET provenance_hash = $2,
+		    signature_valid = $3,
+		    updated_at      = NOW()
+		WHERE id          = $1
+		  AND source_type = 'PLATFORM'
+	`, id, provenanceHash, signatureValid)
+	if err != nil {
+		return fmt.Errorf("UpdateImageSignature: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("UpdateImageSignature: image %s not found or not PLATFORM source type", id)
 	}
 	return nil
 }

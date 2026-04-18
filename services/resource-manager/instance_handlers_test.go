@@ -256,21 +256,13 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 			return &fakeTag{0}, nil
 		}
 		img.Status = args[1].(string)
-		if len(args) > 2 {
-			if args[2] == nil {
-				img.DeprecatedAt = nil
-			} else {
-				v := args[2].(*time.Time)
-				img.DeprecatedAt = v
-			}
+		if len(args) > 2 && args[2] != nil {
+			v := args[2].(*time.Time)
+			img.DeprecatedAt = v
 		}
-		if len(args) > 3 {
-			if args[3] == nil {
-				img.ObsoletedAt = nil
-			} else {
-				v := args[3].(*time.Time)
-				img.ObsoletedAt = v
-			}
+		if len(args) > 3 && args[3] != nil {
+			v := args[3].(*time.Time)
+			img.ObsoletedAt = v
 		}
 		now := time.Now()
 		img.UpdatedAt = now

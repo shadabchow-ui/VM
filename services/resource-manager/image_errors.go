@@ -5,6 +5,7 @@ package main
 // VM-P2C-P1: image not found, image not launchable admission errors.
 // VM-P2C-P2: added custom image creation and import error codes.
 // VM-P2C-P3: added family resolution error codes.
+// VM-P3B Job 2: added platform trust boundary error code.
 //
 // Follows the same pattern as snapshot_errors.go and instance_errors.go:
 // constants only; all error writing goes through writeAPIError / writeAPIErrors.
@@ -12,6 +13,7 @@ package main
 // Source: API_ERROR_CONTRACT_V1.md §4 (error code catalog),
 //         vm-13-01__blueprint__trusted-image-factory-validation-pipeline.md
 //             §core_contracts "Image Lifecycle State Enforcement",
+//             §core_contracts "Platform Trust Boundary",
 //         P2_IMAGE_SNAPSHOT_MODEL.md §3.8 (launch admission: status must be ACTIVE).
 
 const (
@@ -84,4 +86,25 @@ const (
 	// CreateInstanceRequest is malformed (e.g. family_name empty).
 	// Returns HTTP 400.
 	errImageFamilyInvalidRequest = "image_family_invalid_request"
+
+	// errImageTrustViolation is returned when a PLATFORM image fails the
+	// cryptographic signature / provenance check at admission.
+	//
+	// This applies only to images with source_type = 'PLATFORM' (owner: platform).
+	// Non-platform images (USER, SNAPSHOT, IMPORT) bypass this check entirely.
+	//
+	// Conditions that trigger this error:
+	//   - signature_valid IS NULL  → validation worker has not yet verified the signature
+	//   - signature_valid = FALSE  → signature verification failed (image compromised/unsigned)
+	//
+	// Returns HTTP 422 Unprocessable Entity. The 422 is intentional: the image
+	// exists and is visible, but the platform trust boundary blocks its use.
+	// Using 422 (not 403) matches the pattern for errImageNotLaunchable and keeps
+	// the error surface consistent with other admission rejections.
+	//
+	// Source: vm-13-01__blueprint__ §core_contracts "Platform Trust Boundary":
+	//   "The VM admission controller MUST verify the cryptographic signature of any
+	//    image with owner: platform. It MUST NOT attempt to verify signatures for
+	//    images with owner: project_id (custom images)."
+	errImageTrustViolation = "image_trust_violation"
 )

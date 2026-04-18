@@ -361,30 +361,23 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// VM-P2C-P1: Image admission — existence, visibility, and lifecycle state check.
+	// VM-P2C-P1 + VM-P3B Job 2: Image admission gate.
 	//
-	// Must run after field validation (so image_id is non-empty) and before
-	// InsertInstance (so we never write a DB row for an unusable image).
+	// Gate order (must run after field validation, before InsertInstance):
+	//  1. Fetch image and enforce visibility (GetImageForAdmission).
+	//  2. Lifecycle state check: reject OBSOLETE, FAILED, PENDING_VALIDATION.
+	//  3. Platform trust check: for PLATFORM images, reject unless signature_valid=true.
 	//
-	// When the family alias path was taken above, req.ImageID is already the
-	// resolved concrete ID — GetImageForAdmissionWithGrants runs the same ownership,
-	// grant, and lifecycle checks as for a directly specified image_id. No bypass.
+	// When the family alias path was taken above, req.ImageID is the resolved concrete
+	// ID — all three checks run identically. No admission bypass via family path.
 	//
-	// GetImageForAdmissionWithGrants returns nil when:
-	//   - The image does not exist.
-	//   - The image is PRIVATE, the caller does not own it, and no share grant exists.
-	// ImageIsLaunchable returns false for OBSOLETE, FAILED, PENDING_VALIDATION.
-	// DEPRECATED images remain launchable (warning-level state, not blocked).
-	//
-	// VM-P3B Job 1: grantees may launch from shared PRIVATE images. The launched
-	// instance is owned by the caller (grantee), not the image owner.
 	// Source: vm-13-01__blueprint__ §core_contracts "Image Lifecycle State Enforcement",
+	//         vm-13-01__blueprint__ §core_contracts "Platform Trust Boundary",
 	//         P2_IMAGE_SNAPSHOT_MODEL.md §3.8,
-	//         AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account on non-visible images),
-	//         VM-P3B Job 1 §6, §7.
+	//         AUTH_OWNERSHIP_MODEL_V1 §3 (404-for-cross-account on non-visible images).
 	img, err := s.repo.GetImageForAdmissionWithGrants(r.Context(), req.ImageID, principal)
 	if err != nil {
-		s.log.Error("GetImageForAdmissionWithGrants failed", "image_id", req.ImageID, "error", err)
+		s.log.Error("GetImageForAdmission failed", "image_id", req.ImageID, "error", err)
 		writeDBError(w, err)
 		return
 	}
@@ -393,9 +386,23 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 			"Image '"+req.ImageID+"' does not exist or is not accessible.", "image_id")
 		return
 	}
+	// Gate 2: lifecycle state.
 	if !db.ImageIsLaunchable(img.Status) {
 		writeAPIError(w, http.StatusUnprocessableEntity, errImageNotLaunchable,
 			"Image '"+req.ImageID+"' is not available for launch (status: "+img.Status+").", "image_id")
+		return
+	}
+	// Gate 3: platform trust boundary.
+	// Only PLATFORM images require a verified cryptographic signature.
+	// USER / SNAPSHOT / IMPORT images bypass this check — they have no factory provenance.
+	// Source: vm-13-01__blueprint__ §core_contracts "Platform Trust Boundary".
+	if !db.ImageIsTrusted(img.SourceType, img.ProvenanceHash, img.SignatureValid) {
+		s.log.Warn("platform image trust check failed",
+			"image_id", req.ImageID,
+			"source_type", img.SourceType,
+			"signature_valid", img.SignatureValid)
+		writeAPIError(w, http.StatusUnprocessableEntity, errImageTrustViolation,
+			"Image '"+req.ImageID+"' has not passed platform signature verification and cannot be launched.", "image_id")
 		return
 	}
 

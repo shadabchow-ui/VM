@@ -8,6 +8,8 @@ import "time"
 //         P2_IMAGE_SNAPSHOT_MODEL.md §3 (custom image lifecycle),
 //         vm-13-01__blueprint__trusted-image-factory-validation-pipeline.md (state machine),
 //         vm-13-01__skill__trusted-image-factory-validation-pipeline.md.
+//
+// VM-P3B Job 2: added IsPlatformOwned() for the platform trust boundary seam.
 
 // ImageStatus is the canonical image lifecycle state enum.
 // Source: vm-13-01__blueprint__ §Image Catalog and Lifecycle Manager (state machine),
@@ -30,12 +32,7 @@ const (
 
 // IsLaunchable reports whether an image in this status can be used to launch
 // a new VM instance.
-// Source: vm-13-01__blueprint__ §core_contracts "Image Lifecycle State Enforcement":
-//
-//	"The VM creation API's admission controller MUST reject any request to create
-//	a VM from an image whose state is OBSOLETE or FAILED."
-//
-// P2_IMAGE_SNAPSHOT_MODEL.md §3.8: "status = ACTIVE" required; DEPRECATED is still launchable.
+// Source: vm-13-01__blueprint__ §core_contracts "Image Lifecycle State Enforcement".
 func (s ImageStatus) IsLaunchable() bool {
 	return s == ImageStatusActive || s == ImageStatusDeprecated
 }
@@ -59,6 +56,18 @@ const (
 	ImageSourceTypeSnapshot ImageSourceType = "SNAPSHOT"
 )
 
+// IsPlatformOwned reports whether this source type identifies a platform-provided
+// image produced by the trusted image factory.
+//
+// Platform-owned images are subject to the trust boundary admission rule:
+// the VM admission controller MUST verify their cryptographic signature before
+// allowing launch. Non-platform images (USER, SNAPSHOT, IMPORT) bypass this check.
+//
+// Source: vm-13-01__blueprint__ §core_contracts "Platform Trust Boundary".
+func (t ImageSourceType) IsPlatformOwned() bool {
+	return t == ImageSourceTypePlatform
+}
+
 // Image is the canonical image domain object.
 // Source: INSTANCE_MODEL_V1.md §7, P2_IMAGE_SNAPSHOT_MODEL.md §3.
 type Image struct {
@@ -81,4 +90,9 @@ type Image struct {
 	SourceSnapshotID *string   `db:"source_snapshot_id"`
 	CreatedAt        time.Time `db:"created_at"`
 	UpdatedAt        time.Time `db:"updated_at"`
+	// VM-P3B Job 2: platform trust boundary fields.
+	// Non-nil only for PLATFORM images produced by the trusted image factory.
+	// Source: vm-13-01__blueprint__ §core_contracts "Platform Trust Boundary".
+	ProvenanceHash *string `db:"provenance_hash"` // SLSA L3 attestation digest; nil for non-platform
+	SignatureValid *bool   `db:"signature_valid"`  // nil=not yet checked; true=verified; false=failed
 }

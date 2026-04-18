@@ -530,13 +530,12 @@ func (s *server) handleObsoleteImage(w http.ResponseWriter, r *http.Request, id 
 		return
 	}
 
-	updated, err := s.repo.GetImageByID(r.Context(), id)
-	if err != nil {
-		s.log.Error("GetImageByID after obsolete failed", "image_id", id, "error", err)
-		writeDBError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, ObsoleteImageResponse{Image: imageToResponse(updated)})
+	// Build response from the already-loaded img — preserves DeprecatedAt (and all
+	// other existing fields) without a second DB round-trip. The synchronous update
+	// changed only Status and ObsoletedAt; reflect those in-place.
+	img.Status = db.ImageStatusObsolete
+	img.ObsoletedAt = &now
+	writeJSON(w, http.StatusOK, ObsoleteImageResponse{Image: imageToResponse(img)})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
