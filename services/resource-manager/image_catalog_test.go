@@ -523,7 +523,7 @@ func TestPlatformTrust_FamilyResolvedPlatformImageTrusted(t *testing.T) {
 	seedCatalogImage(s.mem, img)
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		familyLaunchBody("trusted-family", nil), authHdr(alice))
+		familyLaunchBodyP3C("trusted-family", nil), authHdr(alice))
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("want 202 for family-resolved trusted PLATFORM image, got %d", resp.StatusCode)
 	}
@@ -541,7 +541,7 @@ func TestPlatformTrust_FamilyResolvedPlatformImageUntrusted(t *testing.T) {
 	seedCatalogImage(s.mem, img)
 
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
-		familyLaunchBody("untrusted-family", nil), authHdr(alice))
+		familyLaunchBodyP3C("untrusted-family", nil), authHdr(alice))
 	if resp.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("want 422 for family-resolved untrusted PLATFORM image, got %d", resp.StatusCode)
 	}
@@ -887,6 +887,24 @@ func TestDispatch_SignatureSQL_IsDistinct(t *testing.T) {
 	}
 	if isUpdateImageSignatureSQL(statusSQL) {
 		t.Error("want isUpdateImageSignatureSQL=false for UpdateImageStatus SQL")
+	}
+}
+
+// ── Helper: family-alias launch body ─────────────────────────────────────────
+
+// familyLaunchBodyP3C returns a CreateInstanceRequest using an image_family alias
+// instead of a direct image_id. version may be nil (resolves latest).
+// Source: vm-13-01__blueprint__ §family_seam.
+func familyLaunchBodyP3C(familyName string, version *int) CreateInstanceRequest {
+	return CreateInstanceRequest{
+		Name:             "test-inst-family",
+		InstanceType:     "c1.small",
+		AvailabilityZone: "us-east-1a",
+		SSHKeyName:       "my-key",
+		ImageFamily: &ImageFamilyRef{
+			FamilyName:    familyName,
+			FamilyVersion: version,
+		},
 	}
 }
 
