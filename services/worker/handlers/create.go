@@ -255,13 +255,16 @@ func (h *CreateHandler) rollbackCreate(ctx context.Context, log *slog.Logger, rt
 	log.Warn("rollback: complete")
 }
 
-// failInstance transitions an instance to failed, writes an event, returns the cause.
+// failInstance transitions an instance to failed, writes an event with explicit
+// failure reason, returns the cause. VM Job 5: ensures every failure path writes
+// a machine-readable reason so operators can diagnose failed boots.
 func (h *CreateHandler) failInstance(ctx context.Context, inst *db.InstanceRow, cause error) error {
+	failReason := cause.Error()
 	if err := h.deps.Store.UpdateInstanceState(ctx, inst.ID, inst.VMState, "failed", inst.Version); err != nil {
 		h.log.Error("failInstance: could not set failed", "instance_id", inst.ID, "error", err)
 	}
 	inst.VMState = "failed"
-	h.writeEvent(ctx, inst.ID, db.EventInstanceFailure, cause.Error())
+	h.writeEvent(ctx, inst.ID, db.EventInstanceFailure, "boot_failure: "+failReason)
 	return cause
 }
 

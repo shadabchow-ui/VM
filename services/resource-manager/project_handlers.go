@@ -100,8 +100,9 @@ func (s *server) handleProjects(w http.ResponseWriter, r *http.Request) {
 //
 // VM-P16A: IAM sub-paths are now routed to handleIAMSubpath instead of 404ing.
 // Recognised sub-paths:
-//   service-accounts[/...]  — service account CRUD
-//   iam/bindings[/...]      — role binding CRUD
+//
+//	service-accounts[/...]  — service account CRUD
+//	iam/bindings[/...]      — role binding CRUD
 //
 // All other sub-paths (e.g. /v1/projects/{id}/members) still return 404.
 // Member management remains deferred per VM-P2D scope.

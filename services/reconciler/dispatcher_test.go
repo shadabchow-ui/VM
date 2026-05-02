@@ -430,7 +430,8 @@ func TestDispatcher_StuckProvisioning_FailsInstance(t *testing.T) {
 // UpdateInstanceState returns 0 rows (stale version), the dispatcher does not
 // return an error — it logs and continues.
 // Source: LIFECYCLE_STATE_MACHINE_V1 §7 (optimistic locking),
-//         03-03 §"any write operations must use optimistic locking".
+//
+//	03-03 §"any write operations must use optimistic locking".
 func TestDispatcher_StaleOptimisticLock_SkippedSilently(t *testing.T) {
 	pool := newDispatchTestPool()
 	pool.execRowsAffected = 0 // simulate stale version: 0 rows affected
@@ -538,10 +539,123 @@ func TestJobMaxAttempts_AllTypesHaveValues(t *testing.T) {
 		"INSTANCE_START",
 		"INSTANCE_STOP",
 		"INSTANCE_REBOOT",
+		"VOLUME_DELETE",
+		"VOLUME_DETACH",
 	}
 	for _, jt := range jobTypes {
 		if n := jobMaxAttempts(jt); n <= 0 {
 			t.Errorf("jobMaxAttempts(%q) = %d, want > 0", jt, n)
 		}
+	}
+}
+
+// ── VM Job 5: New dispatch tests ──────────────────────────────────────────────
+
+// TestDispatcher_HostUnhealthyWithLiveInstance_NoAutoRepair ensures that
+// instances on unhealthy hosts are NOT auto-repaired — only an event is written.
+// VM Job 5 — Case 2: DB says running but host unhealthy.
+func TestDispatcher_HostUnhealthyWithLiveInstance_NoAutoRepair(t *testing.T) {
+	pool := newDispatchTestPool()
+	inst := makeDispatchInstance("inst-j5-001", "running")
+	pool.addInstance(inst)
+
+	d := makeDispatcher(pool)
+	drift := DriftResult{
+		Class:  DriftHostUnhealthyWithLiveInstance,
+		Reason: "host degraded",
+	}
+
+	err := d.Dispatch(dispCtx(), inst, drift)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	// No repair job and no state transition — only an event.
+	if len(pool.insertJobCalls) != 0 {
+		t.Errorf("HostUnhealthyWithLiveInstance: expected 0 job inserts (no auto-repair), got %d", len(pool.insertJobCalls))
+	}
+	if len(pool.updateStateCalls) != 0 {
+		t.Errorf("HostUnhealthyWithLiveInstance: expected 0 state updates, got %d", len(pool.updateStateCalls))
+	}
+}
+
+// TestDispatcher_VolumeOrphanArtifact_CreatesVolumeDeleteRepair ensures that
+// orphan storage detection enqueues a VOLUME_DELETE repair job.
+// VM Job 5 — Case 6: Volume artifact exists but DB says deleted.
+func TestDispatcher_VolumeOrphanArtifact_CreatesVolumeDeleteRepair(t *testing.T) {
+	pool := newDispatchTestPool()
+	inst := makeDispatchInstance("inst-j5-002", "running")
+	pool.addInstance(inst)
+
+	d := makeDispatcher(pool)
+	drift := DriftResult{
+		Class:         DriftVolumeOrphanArtifact,
+		RepairJobType: "VOLUME_DELETE",
+		Reason:        "orphan storage path",
+	}
+
+	err := d.Dispatch(dispCtx(), inst, drift)
+	// The volume job type may not be handled by the instance-scoped InsertJob
+	// in the fake pool — but the dispatch should not error.
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(pool.insertJobCalls) == 0 {
+		t.Error("VolumeOrphanArtifact: expected repair job insert")
+	}
+}
+
+// TestDispatcher_NetworkStaleForDeleted_CreatesInstanceDeleteRepair ensures
+// that stale NIC detection enqueues an INSTANCE_DELETE repair job.
+// VM Job 5 — Case 5: Stale TAP/NAT/firewall state.
+func TestDispatcher_NetworkStaleForDeleted_CreatesInstanceDeleteRepair(t *testing.T) {
+	pool := newDispatchTestPool()
+	inst := makeDispatchInstance("inst-j5-003", "running")
+	pool.addInstance(inst)
+
+	d := makeDispatcher(pool)
+	drift := DriftResult{
+		Class:         DriftNetworkStaleForDeleted,
+		RepairJobType: "INSTANCE_DELETE",
+		Reason:        "stale NIC for deleted instance",
+	}
+
+	err := d.Dispatch(dispCtx(), inst, drift)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(pool.insertJobCalls) == 0 {
+		t.Error("NetworkStaleForDeleted: expected repair job insert")
+	}
+}
+
+// TestDispatcher_AttachmentMissingRuntime_CreatesVolumeDetachRepair ensures
+// that stale attachment detection enqueues a VOLUME_DETACH repair job.
+// VM Job 5 — Case 7: DB attachment intent exists but runtime disk missing.
+func TestDispatcher_AttachmentMissingRuntime_CreatesVolumeDetachRepair(t *testing.T) {
+	pool := newDispatchTestPool()
+	inst := makeDispatchInstance("inst-j5-004", "running")
+	pool.addInstance(inst)
+
+	d := makeDispatcher(pool)
+	drift := DriftResult{
+		Class:         DriftAttachmentMissingRuntime,
+		RepairJobType: "VOLUME_DETACH",
+		Reason:        "instance deleted but attachment active",
+	}
+
+	err := d.Dispatch(dispCtx(), inst, drift)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(pool.insertJobCalls) == 0 {
+		t.Error("AttachmentMissingRuntime: expected repair job insert")
 	}
 }

@@ -77,7 +77,8 @@ var removedAPIVersions = map[string]bool{
 // middleware chain in routes(). All other /v1/* paths go through it.
 //
 // Source: vm-16-03__blueprint__ §core_contracts "API as the Single Source of Truth",
-//         vm-16-03__research__ §"API Compatibility, Versioning, and Deprecation Policy".
+//
+//	vm-16-03__research__ §"API Compatibility, Versioning, and Deprecation Policy".
 func apiVersionMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		version := r.Header.Get("Api-Version")
@@ -107,7 +108,8 @@ func apiVersionMiddleware(next http.Handler) http.Handler {
 // throughout the error envelope (API_ERROR_CONTRACT_V1 §7).
 //
 // Source: API_ERROR_CONTRACT_V1 §7 "request_id always present",
-//         vm-16-03__blueprint__ §core_contracts "Resilience and Backpressure Signaling".
+//
+//	vm-16-03__blueprint__ §core_contracts "Resilience and Backpressure Signaling".
 func requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := idgen.New("req")
@@ -126,7 +128,8 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 //   - 503 {"status":"degraded","reason":"db_unavailable"} when DB is unreachable.
 //
 // Gate item: P2_M1_GATE_CHECKLIST PRE-2 (service is reachable),
-//            P2_M1_WS_H7_PHASE1_REGRESSION_RUNBOOK §"Healthz liveness probe".
+//
+//	P2_M1_WS_H7_PHASE1_REGRESSION_RUNBOOK §"Healthz liveness probe".
 func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -153,14 +156,16 @@ func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // handleVersion handles GET /v1/version.
 //
 // Response shape required by the acceptance test:
-//   {
-//     "api_version":     "2024-01-15",
-//     "min_api_version": "2024-01-15",
-//     "service":         "compute-platform/resource-manager"
-//   }
+//
+//	{
+//	  "api_version":     "2024-01-15",
+//	  "min_api_version": "2024-01-15",
+//	  "service":         "compute-platform/resource-manager"
+//	}
 //
 // Source: vm-16-03__blueprint__ §core_contracts "API as the Single Source of Truth",
-//         test_integration_phase16_acceptance_test.go §TestPhase16_APIVersion_HeaderContract.
+//
+//	test_integration_phase16_acceptance_test.go §TestPhase16_APIVersion_HeaderContract.
 func (s *server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

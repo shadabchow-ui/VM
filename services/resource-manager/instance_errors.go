@@ -96,6 +96,24 @@ const (
 	// errServiceUnavailable (connectivity failure).
 	// Source: vm-16-02__blueprint__ §core_contracts "Non-Destructive Budget Enforcement".
 	errBudgetExceeded = "budget_exceeded"
+
+	// VM Job 1: Platform capacity / runtime failure error code.
+	// insufficient_capacity is returned when the scheduler or host cannot satisfy a
+	// placement request because no ready host has sufficient CPU, memory, or disk.
+	// Maps to HTTP 503 (platform capacity is a temporary service condition, not a
+	// client-correctable error like quota).
+	//
+	// Must be machine-distinguishable from:
+	//   - errQuotaExceeded (422) — count-based admission: client can fix by deleting instances
+	//   - errServiceUnavailable (503) — DB primary failover: no request_id context difference
+	//   - errInternalError (500) — unclassified failure: should never mask capacity shortage
+	//
+	// Used by the scheduler when SelectHost returns no viable placement target.
+	// The API handler maps this to 503 so clients retry with backoff.
+	// Source: API_ERROR_CONTRACT_V1 §2 (503 mapping), §4 (error code catalog),
+	//         vm-13-02__blueprint__ §core_contracts "Error Code Separation",
+	//         AUTH_OWNERSHIP_MODEL_V1 §3.
+	errInsufficientCapacity = "insufficient_capacity"
 )
 
 // apiError is the structured error envelope sent in every error response.

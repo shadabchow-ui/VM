@@ -40,7 +40,6 @@ type server struct {
 	region string
 }
 
-
 type rolloutGateAdapter struct {
 	gate *reconciler.RolloutGate
 }

@@ -124,6 +124,49 @@ func (d *Dispatcher) Dispatch(ctx context.Context, inst *db.InstanceRow, drift D
 		log.Warn("dispatcher: DriftJobTimeout — janitor handles this; no additional action")
 		return nil
 
+	// ── VM Job 5: reconciliation hardening ──────────────────────────────────
+	case DriftHostUnhealthyWithLiveInstance:
+		// Instance is running on an unhealthy host. Do NOT auto-repair —
+		// the host may be fenced. Write an event for operator visibility.
+		log.Warn("dispatcher: DriftHostUnhealthyWithLiveInstance — writing event, no auto repair",
+			"reason", drift.Reason,
+		)
+		_ = d.repo.InsertEvent(ctx, &db.EventRow{
+			ID:         idgen.New(idgen.PrefixEvent),
+			InstanceID: inst.ID,
+			EventType:  db.EventInstanceFailure,
+			Message:    "host_unhealthy: " + drift.Reason,
+			Actor:      "reconciler",
+		})
+		return nil
+
+	case DriftVolumeOrphanArtifact:
+		// Volume has storage_path but is deleted. Enqueue a VOLUME_DELETE
+		// repair job to clean up the orphan storage artifact.
+		return d.enqueueRepairJob(ctx, log, inst, DriftResult{
+			Class:         DriftVolumeOrphanArtifact,
+			RepairJobType: "VOLUME_DELETE",
+			Reason:        drift.Reason,
+		})
+
+	case DriftNetworkStaleForDeleted:
+		// NIC for deleted instance. Enqueue a NIC_CLEANUP repair job so the
+		// worker releases the IP and soft-deletes the NIC.
+		return d.enqueueRepairJob(ctx, log, inst, DriftResult{
+			Class:         DriftNetworkStaleForDeleted,
+			RepairJobType: "INSTANCE_DELETE",
+			Reason:        drift.Reason,
+		})
+
+	case DriftAttachmentMissingRuntime:
+		// Volume attachment exists for a deleted/failed instance or volume.
+		// Enqueue a VOLUME_DETACH repair job to cleanly disconnect.
+		return d.enqueueRepairJob(ctx, log, inst, DriftResult{
+			Class:         DriftAttachmentMissingRuntime,
+			RepairJobType: "VOLUME_DETACH",
+			Reason:        drift.Reason,
+		})
+
 	default:
 		log.Warn("dispatcher: unrecognised drift class — skipping", "class", string(drift.Class))
 		return nil
@@ -230,6 +273,7 @@ func (d *Dispatcher) failInstance(ctx context.Context, log *slog.Logger, inst *d
 }
 
 // jobMaxAttempts returns the per-type max_attempts from JOB_MODEL_V1 §3.
+// VM Job 5: added VOLUME_DETACH and NIC_CLEANUP.
 func jobMaxAttempts(jobType string) int {
 	switch jobType {
 	case "INSTANCE_CREATE":
@@ -241,6 +285,10 @@ func jobMaxAttempts(jobType string) int {
 	case "INSTANCE_STOP":
 		return 5
 	case "INSTANCE_REBOOT":
+		return 5
+	case "VOLUME_DELETE":
+		return 5
+	case "VOLUME_DETACH":
 		return 5
 	default:
 		return 3

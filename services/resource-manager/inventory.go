@@ -159,7 +159,8 @@ func (s *HostInventory) IssueBootstrapToken(ctx context.Context, hostID string) 
 // VM-P2E Slice 2: fromGeneration is now forwarded from the handler's request body.
 //
 // Source: vm-13-03__blueprint__ §interaction_or_ops_contract "Operator initiates
-//         single-host drain".
+//
+//	single-host drain".
 func (i *HostInventory) DrainHost(ctx context.Context, hostID string, fromGeneration int64, reason string) (runningCount int, updated bool, err error) {
 	// Attempt CAS: ready → draining.
 	// If the host is already draining (repeated call), the generation check
@@ -201,7 +202,8 @@ func (i *HostInventory) DrainHost(ctx context.Context, hostID string, fromGenera
 // guard in MarkHostDrained prevents re-application.
 //
 // Source: vm-13-03__blueprint__ §interaction_or_ops_contract
-//         "Operator confirms drain complete / drain watch signals completion".
+//
+//	"Operator confirms drain complete / drain watch signals completion".
 func (i *HostInventory) CompleteDrain(ctx context.Context, hostID string, fromGeneration int64) (activeCount int, updated bool, err error) {
 	return i.repo.MarkHostDrained(ctx, hostID, fromGeneration)
 }
@@ -218,7 +220,8 @@ func (i *HostInventory) CompleteDrain(ctx context.Context, hostID string, fromGe
 // reasonCode should be one of the db.ReasonXxx constants.
 //
 // Source: vm-13-03__blueprint__ §"DEGRADED state",
-//         §implementation_decisions "Introduce a DEGRADED state".
+//
+//	§implementation_decisions "Introduce a DEGRADED state".
 func (i *HostInventory) MarkDegraded(ctx context.Context, hostID string, fromGeneration int64, fromStatus, reasonCode string) (updated bool, err error) {
 	ok, err := i.repo.MarkHostDegraded(ctx, hostID, fromGeneration, fromStatus, reasonCode)
 	if err != nil {
@@ -439,7 +442,8 @@ func (i *HostInventory) ListCampaigns(ctx context.Context, statuses []string) ([
 // Returns a summary of which hosts were actioned and their outcomes.
 //
 // Source: vm-13-03__blueprint__ §interaction_or_ops_contract
-//         "Operator initiates a fleet-wide kernel update".
+//
+//	"Operator initiates a fleet-wide kernel update".
 func (i *HostInventory) AdvanceCampaign(ctx context.Context, campaignID, drainReason string) (*CampaignAdvanceResult, error) {
 	campaign, err := i.repo.GetCampaignByID(ctx, campaignID)
 	if err != nil {

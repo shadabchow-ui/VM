@@ -137,11 +137,12 @@ func (s *server) registerIAMRoutes(mux *http.ServeMux) {
 // project ID segment is a recognised IAM sub-path.
 //
 // path is the tail after /v1/projects/{project_id}/, e.g.:
-//   "service-accounts"
-//   "service-accounts/sa_abc123"
-//   "service-accounts/sa_abc123/disable"
-//   "iam/bindings"
-//   "iam/bindings/rb_abc123"
+//
+//	"service-accounts"
+//	"service-accounts/sa_abc123"
+//	"service-accounts/sa_abc123/disable"
+//	"iam/bindings"
+//	"iam/bindings/rb_abc123"
 //
 // principalID is the X-Principal-ID header value (already validated by caller).
 // projectID is already extracted by the caller.

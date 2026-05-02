@@ -138,8 +138,9 @@ func (row *campaignTestRow) Scan(dest ...any) error {
 }
 
 // scanCampaignRecord fills dest in the column order used by GetCampaignByID / ListCampaigns:
-//   id, campaign_reason, target_host_ids, completed_host_ids, failed_host_ids,
-//   max_parallel, status, created_at, updated_at
+//
+//	id, campaign_reason, target_host_ids, completed_host_ids, failed_host_ids,
+//	max_parallel, status, created_at, updated_at
 func scanCampaignRecord(c *db.CampaignRecord, dest []any) error {
 	if len(dest) < 9 {
 		return fmt.Errorf("scanCampaignRecord: need 9 dest, got %d", len(dest))

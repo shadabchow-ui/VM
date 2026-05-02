@@ -103,7 +103,9 @@ func TestWriteDBError(t *testing.T) {
 			t.Errorf("want 503, got %d", w.Code)
 		}
 		var body struct {
-			Error struct{ Code string `json:"code"` } `json:"error"`
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
 		}
 		json.NewDecoder(w.Body).Decode(&body) //nolint:errcheck
 		if body.Error.Code != errServiceUnavailable {
@@ -118,7 +120,9 @@ func TestWriteDBError(t *testing.T) {
 			t.Errorf("want 500, got %d", w.Code)
 		}
 		var body struct {
-			Error struct{ Code string `json:"code"` } `json:"error"`
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
 		}
 		json.NewDecoder(w.Body).Decode(&body) //nolint:errcheck
 		if body.Error.Code != errInternalError {

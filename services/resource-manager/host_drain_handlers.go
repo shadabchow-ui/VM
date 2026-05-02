@@ -284,7 +284,8 @@ func (s *server) handleDrainHost(w http.ResponseWriter, r *http.Request) {
 //   - 500: unexpected DB error.
 //
 // Source: vm-13-03__blueprint__ §interaction_or_ops_contract
-//         "Operator confirms drain complete".
+//
+//	"Operator confirms drain complete".
 func (s *server) handleCompleteDrainHost(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -380,7 +381,8 @@ func (s *server) handleCompleteDrainHost(w http.ResponseWriter, r *http.Request)
 //   - 500: unexpected DB error.
 //
 // Source: vm-13-03__blueprint__ §implementation_decisions
-//         "Introduce a DEGRADED state to precede the terminal UNHEALTHY state".
+//
+//	"Introduce a DEGRADED state to precede the terminal UNHEALTHY state".
 func (s *server) handleMarkDegraded(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -470,7 +472,8 @@ func (s *server) handleMarkDegraded(w http.ResponseWriter, r *http.Request) {
 //   - 500: unexpected DB error.
 //
 // Source: vm-13-03__blueprint__ §"Fencing Decision Logic",
-//         §"Fencing Controller" (fence_required is the Slice 4 seam).
+//
+//	§"Fencing Controller" (fence_required is the Slice 4 seam).
 func (s *server) handleMarkUnhealthy(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -647,13 +650,13 @@ type retireRequest struct {
 
 // retireResponse is returned by POST .../retire.
 type retireResponse struct {
-	HostID              string  `json:"host_id"`
-	Status              string  `json:"status"`
-	Generation          int64   `json:"generation"`
-	ReasonCode          *string `json:"reason_code,omitempty"`
+	HostID     string  `json:"host_id"`
+	Status     string  `json:"status"`
+	Generation int64   `json:"generation"`
+	ReasonCode *string `json:"reason_code,omitempty"`
 	// ActiveInstanceCount is non-zero when the transition was blocked.
 	// In that case HTTP status is 202 Accepted and Status is still the fromStatus.
-	ActiveInstanceCount int  `json:"active_instance_count"`
+	ActiveInstanceCount int `json:"active_instance_count"`
 	// Blocked is true when the transition was not applied due to active workload.
 	Blocked bool `json:"blocked"`
 }
@@ -698,7 +701,8 @@ type retiredListEntry struct {
 // active VM workload remains. Callers should poll again when workloads finish.
 //
 // The normal retirement path is:
-//   drain → drain-complete → retire → retired
+//
+//	drain → drain-complete → retire → retired
 //
 // Requires from_status in request so transition validation is server-side
 // without a redundant DB read in the hot path (same pattern as Slice 3).
@@ -713,7 +717,8 @@ type retiredListEntry struct {
 //   - 500: unexpected DB error.
 //
 // Source: vm-13-03__blueprint__ §"Emergency Retirement" operator procedure,
-//         §core_contracts "Stopped Instance Ephemerality".
+//
+//	§core_contracts "Stopped Instance Ephemerality".
 func (s *server) handleMarkRetiring(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -823,7 +828,8 @@ func (s *server) handleMarkRetiring(w http.ResponseWriter, r *http.Request) {
 //   - 500: unexpected DB error.
 //
 // Source: vm-13-03__blueprint__ §"RETIRED state — terminal",
-//         §components "Capacity Manager" (Slice 5+ seam via retired_at).
+//
+//	§components "Capacity Manager" (Slice 5+ seam via retired_at).
 func (s *server) handleMarkRetired(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

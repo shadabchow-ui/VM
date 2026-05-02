@@ -28,10 +28,11 @@ import (
 
 // volumeRow scans a single VolumeRow for QueryRow calls.
 // Column order matches GetVolumeByID SELECT in volume_repo.go:
-//   id, owner_principal_id, display_name, region, availability_zone,
-//   size_gb, origin, source_disk_id, source_snapshot_id,
-//   status, storage_path, storage_pool_id,
-//   version, locked_by, created_at, updated_at, deleted_at  (17 columns)
+//
+//	id, owner_principal_id, display_name, region, availability_zone,
+//	size_gb, origin, source_disk_id, source_snapshot_id,
+//	status, storage_path, storage_pool_id,
+//	version, locked_by, created_at, updated_at, deleted_at  (17 columns)
 type volumeRow struct{ r *db.VolumeRow }
 
 func (row *volumeRow) Scan(dest ...any) error {
@@ -99,14 +100,15 @@ func (r *volumeRows) Scan(dest ...any) error {
 	return nil
 }
 
-func (r *volumeRows) Close() {}
+func (r *volumeRows) Close()     {}
 func (r *volumeRows) Err() error { return nil }
 
 // ── volumeAttachmentRow — scans a single VolumeAttachmentRow ─────────────────
 
 // volumeAttachmentRow scans a single VolumeAttachmentRow for QueryRow calls.
 // Column order matches GetActiveAttachmentByVolume SELECT in volume_repo.go:
-//   id, volume_id, instance_id, device_path, delete_on_termination, attached_at, detached_at  (7 columns)
+//
+//	id, volume_id, instance_id, device_path, delete_on_termination, attached_at, detached_at  (7 columns)
 type volumeAttachmentRow struct{ r *db.VolumeAttachmentRow }
 
 func (row *volumeAttachmentRow) Scan(dest ...any) error {
@@ -154,7 +156,7 @@ func (r *attachmentRows) Scan(dest ...any) error {
 	return nil
 }
 
-func (r *attachmentRows) Close() {}
+func (r *attachmentRows) Close()     {}
 func (r *attachmentRows) Err() error { return nil }
 
 // ── devicePathRows — iterates device paths for NextDevicePath ─────────────────
@@ -180,7 +182,7 @@ func (r *devicePathRows) Scan(dest ...any) error {
 	return nil
 }
 
-func (r *devicePathRows) Close() {}
+func (r *devicePathRows) Close()     {}
 func (r *devicePathRows) Err() error { return nil }
 
 // ── Compile-time interface guards ─────────────────────────────────────────────

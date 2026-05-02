@@ -209,3 +209,118 @@ func TestClassifier_NonNone_HasReason(t *testing.T) {
 		}
 	}
 }
+
+// ── VM Job 5: New drift classification tests ──────────────────────────────────
+
+// TestClassifier_HostUnhealthyWithLiveInstance verifies that a running instance
+// on a degraded or unhealthy host is flagged.
+// VM Job 5 — Case 2: DB says running but host unhealthy.
+func TestClassifier_HostUnhealthyWithLiveInstance_Degraded(t *testing.T) {
+	inst := instWithState("running", 1*time.Minute)
+	result := ClassifyHostInstanceDrift(inst, "degraded", 2*time.Minute, time.Now())
+	if result.Class != DriftHostUnhealthyWithLiveInstance {
+		t.Errorf("running on degraded host: class = %q, want host_unhealthy_with_live_instance", result.Class)
+	}
+}
+
+func TestClassifier_HostUnhealthyWithLiveInstance_HealthyHost(t *testing.T) {
+	inst := instWithState("running", 1*time.Minute)
+	result := ClassifyHostInstanceDrift(inst, "ready", 1*time.Minute, time.Now())
+	if result.Class != DriftNone {
+		t.Errorf("running on healthy host: class = %q, want none", result.Class)
+	}
+}
+
+func TestClassifier_HostUnhealthyWithLiveInstance_StaleHeartbeat(t *testing.T) {
+	inst := instWithState("running", 1*time.Minute)
+	result := ClassifyHostInstanceDrift(inst, "ready", 10*time.Minute, time.Now())
+	if result.Class != DriftHostUnhealthyWithLiveInstance {
+		t.Errorf("running on host with stale heartbeat: class = %q, want host_unhealthy_with_live_instance", result.Class)
+	}
+}
+
+func TestClassifier_HostUnhealthyWithLiveInstance_NotRunning(t *testing.T) {
+	inst := instWithState("stopped", 1*time.Minute)
+	result := ClassifyHostInstanceDrift(inst, "degraded", 2*time.Minute, time.Now())
+	if result.Class != DriftNone {
+		t.Errorf("stopped instance on bad host: class = %q, want none (only running instances flagged)", result.Class)
+	}
+}
+
+// TestClassifier_VolumeOrphanArtifact verifies detection of orphan storage.
+// VM Job 5 — Case 6: Volume artifact exists but DB says deleted.
+func TestClassifier_VolumeOrphanArtifact_Deleted(t *testing.T) {
+	sp := "/mnt/vols/vol-abc.qcow2"
+	result := ClassifyVolumeOrphanArtifact("deleted", &sp)
+	if result.Class != DriftVolumeOrphanArtifact {
+		t.Errorf("deleted volume with storage_path: class = %q, want volume_orphan_artifact", result.Class)
+	}
+}
+
+func TestClassifier_VolumeOrphanArtifact_Available(t *testing.T) {
+	sp := "/mnt/vols/vol-abc.qcow2"
+	result := ClassifyVolumeOrphanArtifact("available", &sp)
+	if result.Class != DriftNone {
+		t.Errorf("available volume: class = %q, want none", result.Class)
+	}
+}
+
+func TestClassifier_VolumeOrphanArtifact_NoPath(t *testing.T) {
+	result := ClassifyVolumeOrphanArtifact("deleted", nil)
+	if result.Class != DriftNone {
+		t.Errorf("deleted volume with nil storage_path: class = %q, want none", result.Class)
+	}
+}
+
+// TestClassifier_NetworkStaleForDeleted verifies stale NIC detection.
+// VM Job 5 — Case 5: Stale TAP/NAT/firewall state for deleted/stopped instances.
+func TestClassifier_NetworkStaleForDeleted(t *testing.T) {
+	result := ClassifyNetworkStaleForDeleted(true, "attached")
+	if result.Class != DriftNetworkStaleForDeleted {
+		t.Errorf("stale NIC: class = %q, want network_stale_for_deleted", result.Class)
+	}
+}
+
+func TestClassifier_NetworkStaleForDeleted_Cleaned(t *testing.T) {
+	result := ClassifyNetworkStaleForDeleted(true, "deleted")
+	if result.Class != DriftNone {
+		t.Errorf("already-cleaned NIC: class = %q, want none", result.Class)
+	}
+}
+
+func TestClassifier_NetworkStaleForDeleted_LiveInstance(t *testing.T) {
+	result := ClassifyNetworkStaleForDeleted(false, "attached")
+	if result.Class != DriftNone {
+		t.Errorf("live instance NIC: class = %q, want none", result.Class)
+	}
+}
+
+// TestClassifier_AttachmentMissingRuntime verifies stale attachment detection.
+// VM Job 5 — Case 7: DB attachment intent exists but runtime disk attachment missing.
+func TestClassifier_AttachmentMissingRuntime_InstanceDeleted(t *testing.T) {
+	result := ClassifyAttachmentMissingRuntime(true, "deleted", "available")
+	if result.Class != DriftAttachmentMissingRuntime {
+		t.Errorf("attachment on deleted instance: class = %q, want attachment_missing_runtime", result.Class)
+	}
+}
+
+func TestClassifier_AttachmentMissingRuntime_VolumeDeleted(t *testing.T) {
+	result := ClassifyAttachmentMissingRuntime(true, "running", "deleted")
+	if result.Class != DriftAttachmentMissingRuntime {
+		t.Errorf("attachment on deleted volume: class = %q, want attachment_missing_runtime", result.Class)
+	}
+}
+
+func TestClassifier_AttachmentMissingRuntime_Healthy(t *testing.T) {
+	result := ClassifyAttachmentMissingRuntime(true, "running", "in_use")
+	if result.Class != DriftNone {
+		t.Errorf("healthy attachment: class = %q, want none", result.Class)
+	}
+}
+
+func TestClassifier_AttachmentMissingRuntime_Inactive(t *testing.T) {
+	result := ClassifyAttachmentMissingRuntime(false, "deleted", "deleted")
+	if result.Class != DriftNone {
+		t.Errorf("inactive attachment: class = %q, want none", result.Class)
+	}
+}

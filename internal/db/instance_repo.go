@@ -204,3 +204,61 @@ func (r *Repo) ListActiveInstances(ctx context.Context) ([]*InstanceRow, error) 
 	}
 	return out, rows.Err()
 }
+
+// ── VM Job 5: Host-instance cross-reference for reconciliation ────────────────
+
+// HostInstanceRow pairs an instance with its host health data.
+// Used by the host heartbeat cross-check sub-scan.
+type HostInstanceRow struct {
+	InstanceID        string
+	VMState           string
+	HostID            string
+	HostStatus        string
+	HostReasonCode    *string
+	HostFenceRequired bool
+	LastHeartbeatAt   *time.Time
+}
+
+// ListRunningInstancesOnUnhealthyHosts returns instances in 'running' state
+// whose assigned host is degraded, unhealthy, or has a stale heartbeat (>5 min).
+// VM Job 5 — Case 2: DB says running but host may be unreachable.
+// The caller must verify whether the VM is actually alive on the host.
+func (r *Repo) ListRunningInstancesOnUnhealthyHosts(ctx context.Context) ([]*HostInstanceRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT
+			i.id                    AS instance_id,
+			i.vm_state,
+			COALESCE(i.host_id, '') AS host_id,
+			COALESCE(h.status, '')  AS host_status,
+			h.reason_code,
+			COALESCE(h.fence_required, FALSE) AS host_fence_required,
+			h.last_heartbeat_at
+		FROM instances i
+		JOIN hosts h ON h.id = i.host_id
+		WHERE i.deleted_at IS NULL
+		  AND i.vm_state = 'running'
+		  AND (
+		      h.status IN ('degraded', 'unhealthy')
+		      OR h.last_heartbeat_at < NOW() - INTERVAL '5 minutes'
+		      OR h.last_heartbeat_at IS NULL
+		  )
+		ORDER BY i.updated_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListRunningInstancesOnUnhealthyHosts: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*HostInstanceRow
+	for rows.Next() {
+		r := &HostInstanceRow{}
+		if err := rows.Scan(
+			&r.InstanceID, &r.VMState, &r.HostID, &r.HostStatus,
+			&r.HostReasonCode, &r.HostFenceRequired, &r.LastHeartbeatAt,
+		); err != nil {
+			return nil, fmt.Errorf("ListRunningInstancesOnUnhealthyHosts scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

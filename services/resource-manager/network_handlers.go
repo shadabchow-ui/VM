@@ -186,9 +186,10 @@ type NetworkErrorDetail struct {
 //
 // repo: satisfies the original NetworkRepo interface — used by all base handlers.
 // igwRepo: satisfies IGWNetworkRepo (extends NetworkRepo with IGW + validation).
-//          Set to nil when constructed via NewNetworkHandlers (base tests).
-//          Set to the same value as repo when constructed via NewNetworkHandlersExtended
-//          (P3A tests / production wiring).
+//
+//	Set to nil when constructed via NewNetworkHandlers (base tests).
+//	Set to the same value as repo when constructed via NewNetworkHandlersExtended
+//	(P3A tests / production wiring).
 type NetworkHandlers struct {
 	repo    NetworkRepo
 	igwRepo IGWNetworkRepo

@@ -152,7 +152,8 @@ func (i *HostInventory) GetHostRecoveryLog(ctx context.Context, hostID string) (
 // Returns error only for unexpected DB failures (not for CAS failure or skip).
 //
 // Source: vm-13-03__skill__ §instructions "fence-then-recover" protocol,
-//         vm-13-03__blueprint__ §"HA VM Recovery" and §"Fencing Decision Logic".
+//
+//	vm-13-03__blueprint__ §"HA VM Recovery" and §"Fencing Decision Logic".
 func (i *HostInventory) ExecuteHostRecovery(ctx context.Context, req *HostRecoveryRequest) (*HostRecoveryResult, error) {
 	// Step 1: re-read the host record for current state.
 	host, err := i.repo.GetHostByID(ctx, req.HostID)
@@ -288,7 +289,8 @@ func (i *HostInventory) ExecuteHostRecovery(ctx context.Context, req *HostRecove
 // Returns ErrCampaignNotFound when the campaign does not exist.
 //
 // Source: vm-13-03__blueprint__ §components "Maintenance Orchestrator",
-//         §interaction_or_ops_contract "Operator initiates a fleet-wide kernel update".
+//
+//	§interaction_or_ops_contract "Operator initiates a fleet-wide kernel update".
 func (i *HostInventory) EvaluateCampaignFailedHostRecovery(ctx context.Context, campaignID string) (*CampaignRecoveryAssessment, error) {
 	campaign, err := i.repo.GetCampaignByID(ctx, campaignID)
 	if err != nil {

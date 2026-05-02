@@ -2072,6 +2072,11 @@ func TestCreate_Happy(t *testing.T) {
 	if out.Instance.Labels == nil {
 		t.Error("want labels to be non-nil map (even if empty)")
 	}
+	// VM Job 1: Owner ARN must be present.
+	wantOwner := "arn:cs:compute::principal/" + alice
+	if out.Instance.Owner != wantOwner {
+		t.Errorf("want owner=%q, got %q", wantOwner, out.Instance.Owner)
+	}
 }
 
 func TestCreate_MalformedJSON(t *testing.T) {
@@ -2462,7 +2467,8 @@ func TestCreate_WithProjectScope_CrossProject(t *testing.T) {
 //
 // This confirms that project scope and user scope are independent quota pools.
 // Source: vm-13-02__blueprint__ §core_contracts "Error Code Separation",
-//         vm-16-01__blueprint__ §quota_enforcement_point.
+//
+//	vm-16-01__blueprint__ §quota_enforcement_point.
 func TestCreate_WithProjectScope_QuotaIsolation(t *testing.T) {
 	s := newTestSrv(t)
 	seedProject(s.mem, "proj_quota_s4", "prin_proj_quota_s4", alice, "quota-project-s4")
@@ -2701,5 +2707,281 @@ func TestCreate_WithProjectScope_QuotaErrorStillDistinctFromCapacity(t *testing.
 	}
 	if env.Error.Code != errQuotaExceeded {
 		t.Errorf("want %q, got %q", errQuotaExceeded, env.Error.Code)
+	}
+}
+
+// ── VM Job 1: Ownership isolation for lifecycle actions ─────────────────────
+
+// TestOwnership_CrossOwner_Stop verifies that attempting to stop an instance
+// owned by a different principal returns 404 (hide-existence contract).
+// Source: AUTH_OWNERSHIP_MODEL_V1 §3, API_ERROR_CONTRACT_V1 §3.
+func TestOwnership_CrossOwner_Stop(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_bob_run", "bob-running", bob, "running")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_bob_run/stop", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for cross-owner stop, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errInstanceNotFound {
+		t.Errorf("want code %q, got %q", errInstanceNotFound, env.Error.Code)
+	}
+}
+
+// TestOwnership_CrossOwner_Start verifies that attempting to start an instance
+// owned by a different principal returns 404.
+func TestOwnership_CrossOwner_Start(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_bob_stopped", "bob-stopped", bob, "stopped")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_bob_stopped/start", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for cross-owner start, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errInstanceNotFound {
+		t.Errorf("want code %q, got %q", errInstanceNotFound, env.Error.Code)
+	}
+}
+
+// TestOwnership_CrossOwner_Reboot verifies that attempting to reboot an instance
+// owned by a different principal returns 404.
+func TestOwnership_CrossOwner_Reboot(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_bob_reboot", "bob-reboot", bob, "running")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_bob_reboot/reboot", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for cross-owner reboot, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errInstanceNotFound {
+		t.Errorf("want code %q, got %q", errInstanceNotFound, env.Error.Code)
+	}
+}
+
+// TestOwnership_CrossOwner_Delete verifies that attempting to delete an instance
+// owned by a different principal returns 404.
+func TestOwnership_CrossOwner_Delete(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_bob_del", "bob-del", bob, "running")
+
+	resp := doReq(t, s.ts, http.MethodDelete, "/v1/instances/inst_bob_del", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for cross-owner delete, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errInstanceNotFound {
+		t.Errorf("want code %q, got %q", errInstanceNotFound, env.Error.Code)
+	}
+}
+
+// ── VM Job 1: Illegal state transition hardening ────────────────────────────
+
+// TestIllegalTransition_DeleteOnDeleted verifies that attempting to delete
+// an already-deleted instance returns 409 illegal_state_transition.
+// Source: LIFECYCLE_STATE_MACHINE_V1 §2.
+func TestIllegalTransition_DeleteOnDeleted(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_deleted_2", "already-deleted", alice, "deleted")
+
+	resp := doReq(t, s.ts, http.MethodDelete, "/v1/instances/inst_deleted_2", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409 for delete on deleted, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errIllegalTransition {
+		t.Errorf("want code %q, got %q", errIllegalTransition, env.Error.Code)
+	}
+}
+
+// TestIllegalTransition_StartOnRunning verifies that attempting to start
+// a running instance returns 409.
+func TestIllegalTransition_StartOnRunning(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_running_2", "already-running", alice, "running")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_running_2/start", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409 for start on running, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errIllegalTransition {
+		t.Errorf("want code %q, got %q", errIllegalTransition, env.Error.Code)
+	}
+}
+
+// TestIllegalTransition_RebootOnStopped verifies that attempting to reboot
+// a stopped instance returns 409.
+func TestIllegalTransition_RebootOnStopped(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_stopped_3", "stopped-reboot", alice, "stopped")
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances/inst_stopped_3/reboot", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("want 409 for reboot on stopped, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errIllegalTransition {
+		t.Errorf("want code %q, got %q", errIllegalTransition, env.Error.Code)
+	}
+}
+
+// ── VM Job 1: Idempotency replay for create across different payloads ───────
+
+// TestIdempotency_Create_SameKeyDifferentPayload verifies that reusing
+// the same Idempotency-Key with a different create body returns the original
+// instance (Phase 1 behavior: no body comparison — Phase 2 adds body hash).
+// In the current contract, the key deduplicates regardless of body.
+func TestIdempotency_Create_SameKeyDifferentPayload(t *testing.T) {
+	s := newTestSrv(t)
+
+	body1 := validCreateBody()
+	body1.Name = "first-name"
+	resp1 := doReq(t, s.ts, http.MethodPost, "/v1/instances", body1, authHdrWithIkey(alice, "ikey-body-001"))
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("first create: want 202, got %d", resp1.StatusCode)
+	}
+	var out1 CreateInstanceResponse
+	decodeBody(t, resp1, &out1)
+
+	// Same key with different body returns original instance (current Phase 1 behavior).
+	body2 := validCreateBody()
+	body2.Name = "second-name"
+	resp2 := doReq(t, s.ts, http.MethodPost, "/v1/instances", body2, authHdrWithIkey(alice, "ikey-body-001"))
+	if resp2.StatusCode != http.StatusAccepted {
+		t.Fatalf("duplicate create with different body: want 202, got %d", resp2.StatusCode)
+	}
+	var out2 CreateInstanceResponse
+	decodeBody(t, resp2, &out2)
+
+	if out1.Instance.ID != out2.Instance.ID {
+		t.Errorf("same idempotency key must return same instance regardless of body, got %q vs %q",
+			out1.Instance.ID, out2.Instance.ID)
+	}
+	if len(s.mem.instances) != 1 {
+		t.Errorf("want 1 instance in store, got %d", len(s.mem.instances))
+	}
+}
+
+// ── VM Job 1: Response shape verification ───────────────────────────────────
+
+// TestGetInstance_Happy_OwnerField verifies the Owner field is populated
+// as an ARN string that contains the owner principal ID.
+// Source: INSTANCE_MODEL_V1 §2, AUTH_OWNERSHIP_MODEL_V1 §3.
+func TestGetInstance_Happy_OwnerField(t *testing.T) {
+	s := newTestSrv(t)
+	s.mem.seed(&db.InstanceRow{
+		ID: "inst_owner_test", Name: "owner-test", OwnerPrincipalID: bob,
+		VMState: "running", InstanceTypeID: "c1.medium",
+		ImageID: "00000000-0000-0000-0000-000000000011", AvailabilityZone: "us-east-1b",
+	})
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances/inst_owner_test", nil, authHdr(bob))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	var out InstanceResponse
+	decodeBody(t, resp, &out)
+
+	expectedOwner := "arn:cs:compute::principal/" + bob
+	if out.Owner != expectedOwner {
+		t.Errorf("want owner=%q, got %q", expectedOwner, out.Owner)
+	}
+}
+
+// TestListInstances_OwnerFieldPresent verifies the Owner field is populated
+// for each instance in list responses.
+func TestListInstances_OwnerFieldPresent(t *testing.T) {
+	s := newTestSrv(t)
+	seedInstance(s.mem, "inst_list_own1", "list-own-1", alice, "running")
+	seedInstance(s.mem, "inst_list_own2", "list-own-2", alice, "stopped")
+
+	resp := doReq(t, s.ts, http.MethodGet, "/v1/instances", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want 200, got %d", resp.StatusCode)
+	}
+	var out ListInstancesResponse
+	decodeBody(t, resp, &out)
+
+	if out.Total < 2 {
+		t.Fatalf("want at least 2 instances, got %d", out.Total)
+	}
+	for _, inst := range out.Instances {
+		expectedOwner := "arn:cs:compute::principal/" + alice
+		if inst.Owner != expectedOwner {
+			t.Errorf("instance %q: want owner=%q, got %q", inst.ID, expectedOwner, inst.Owner)
+		}
+	}
+}
+
+// ── VM Job 1: Quota error code isolation ───────────────────────────────────
+
+// TestQuota_ErrorCodeIsolation verifies that the quota_exceeded error code is
+// never confused with any capacity, runtime, or service-unavailability code.
+// This test enumerates all known capacity/runtime codes and asserts quota
+// responses never contain them.
+func TestQuota_ErrorCodeIsolation(t *testing.T) {
+	s := newTestSrv(t)
+
+	for i := 0; i < 10; i++ {
+		seedInstance(s.mem, fmt.Sprintf("inst_qisol_%d", i), fmt.Sprintf("qisol-%d", i), alice, "running")
+	}
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances", validCreateBody(), authHdr(alice))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+
+	// quota_exceeded must be machine-distinguishable from every known
+	// capacity, runtime, and infrastructure failure code.
+	forbidden := []string{
+		"insufficient_capacity",
+		"service_unavailable",
+		"internal_error",
+		"capacity_exceeded",
+		"host_unavailable",
+		"provisioning_failed",
+	}
+	for _, code := range forbidden {
+		if env.Error.Code == code {
+			t.Errorf("quota error must not be coded as %q", code)
+		}
+	}
+	if env.Error.Code != errQuotaExceeded {
+		t.Errorf("want code %q, got %q", errQuotaExceeded, env.Error.Code)
+	}
+}
+
+// ── VM Job 1: Capacity error code is defined ────────────────────────────────
+
+// TestCapacity_ErrorCodeDefined verifies that errInsufficientCapacity is a
+// non-empty, distinct constant that does not overlap with quota or internal
+// error codes.
+func TestCapacity_ErrorCodeDefined(t *testing.T) {
+	if errInsufficientCapacity == "" {
+		t.Fatal("errInsufficientCapacity must be non-empty")
+	}
+	if errInsufficientCapacity == errQuotaExceeded {
+		t.Errorf("errInsufficientCapacity (%q) must differ from errQuotaExceeded (%q)",
+			errInsufficientCapacity, errQuotaExceeded)
+	}
+	if errInsufficientCapacity == errServiceUnavailable {
+		t.Errorf("errInsufficientCapacity (%q) must differ from errServiceUnavailable (%q)",
+			errInsufficientCapacity, errServiceUnavailable)
+	}
+	if errInsufficientCapacity == errInternalError {
+		t.Errorf("errInsufficientCapacity (%q) must differ from errInternalError (%q)",
+			errInsufficientCapacity, errInternalError)
 	}
 }

@@ -226,19 +226,20 @@ type createImageRouteRequest struct {
 // These fields are forwarded to the appropriate sub-handler request type.
 //
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §3 (custom image flows),
-//         vm-13-01__blueprint__ §family_seam.
+//
+//	vm-13-01__blueprint__ §family_seam.
 func (s *server) handleCreateImage(w http.ResponseWriter, r *http.Request) {
 	// Decode a combined struct containing all fields of both request types plus
 	// the new family fields. The validator checks only the relevant subset.
 	var combined struct {
-		SourceType       string  `json:"source_type"`
-		Name             string  `json:"name"`
-		SourceSnapshotID string  `json:"source_snapshot_id"`
-		ImportURL        string  `json:"import_url"`
-		OSFamily         string  `json:"os_family"`
-		OSVersion        string  `json:"os_version"`
-		Architecture     string  `json:"architecture"`
-		MinDiskGB        *int    `json:"min_disk_gb"`
+		SourceType       string `json:"source_type"`
+		Name             string `json:"name"`
+		SourceSnapshotID string `json:"source_snapshot_id"`
+		ImportURL        string `json:"import_url"`
+		OSFamily         string `json:"os_family"`
+		OSVersion        string `json:"os_version"`
+		Architecture     string `json:"architecture"`
+		MinDiskGB        *int   `json:"min_disk_gb"`
 		// VM-P2C-P3: family membership fields.
 		FamilyName    *string `json:"family_name"`
 		FamilyVersion *int    `json:"family_version"`
@@ -389,7 +390,8 @@ func (s *server) handleCreateImageFromSnapshot(w http.ResponseWriter, r *http.Re
 //  4. Return 202 + image resource + job_id.
 //
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §3 (import lifecycle),
-//         vm-13-01__blueprint__ §family_seam.
+//
+//	vm-13-01__blueprint__ §family_seam.
 func (s *server) handleImportImage(w http.ResponseWriter, r *http.Request, req *ImportImageRequest) {
 	principal, _ := principalFromCtx(r.Context())
 
@@ -549,7 +551,8 @@ func (s *server) handleObsoleteImage(w http.ResponseWriter, r *http.Request, id 
 // VM-P2C-P3: family_name and family_version are exposed when set (non-nil).
 //
 // Source: image_types.go, P2_IMAGE_SNAPSHOT_MODEL.md §3.3,
-//         vm-13-01__blueprint__ §family_seam.
+//
+//	vm-13-01__blueprint__ §family_seam.
 func imageToResponse(row *db.ImageRow) ImageResponse {
 	return ImageResponse{
 		ID:               row.ID,

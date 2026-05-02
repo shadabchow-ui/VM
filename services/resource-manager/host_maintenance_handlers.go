@@ -66,15 +66,15 @@ type createCampaignRequest struct {
 //     which hosts failed without a schema change.
 //   - campaign_status values are stable: pending, running, paused, completed, cancelled.
 type campaignResponse struct {
-	ID               string    `json:"id"`
-	Reason           string    `json:"reason"`
-	Status           string    `json:"status"`
-	MaxParallel      int       `json:"max_parallel"`
-	TargetHostIDs    []string  `json:"target_host_ids"`
-	CompletedHostIDs []string  `json:"completed_host_ids"`
-	FailedHostIDs    []string  `json:"failed_host_ids"`
+	ID               string   `json:"id"`
+	Reason           string   `json:"reason"`
+	Status           string   `json:"status"`
+	MaxParallel      int      `json:"max_parallel"`
+	TargetHostIDs    []string `json:"target_host_ids"`
+	CompletedHostIDs []string `json:"completed_host_ids"`
+	FailedHostIDs    []string `json:"failed_host_ids"`
 	// RemainingCount is the number of target hosts not yet completed or failed.
-	RemainingCount int `json:"remaining_count"`
+	RemainingCount int       `json:"remaining_count"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
@@ -94,9 +94,9 @@ type advanceCampaignRequest struct {
 
 // advanceCampaignResponse is returned by POST .../advance.
 type advanceCampaignResponse struct {
-	CampaignID string                 `json:"campaign_id"`
-	Status     string                 `json:"status"`
-	Actioned   []advanceHostOutcome   `json:"actioned"`
+	CampaignID string               `json:"campaign_id"`
+	Status     string               `json:"status"`
+	Actioned   []advanceHostOutcome `json:"actioned"`
 	// RemainingCount is the number of hosts still to be actioned after this advance.
 	RemainingCount int `json:"remaining_count"`
 }
@@ -141,8 +141,9 @@ func campaignFromRecord(c *db.CampaignRecord) campaignResponse {
 }
 
 // extractCampaignID extracts the campaign ID from paths like:
-//   /internal/v1/maintenance/campaigns/{id}
-//   /internal/v1/maintenance/campaigns/{id}/advance
+//
+//	/internal/v1/maintenance/campaigns/{id}
+//	/internal/v1/maintenance/campaigns/{id}/advance
 func extractCampaignID(path string) string {
 	const prefix = "/internal/v1/maintenance/campaigns/"
 	idx := strings.Index(path, prefix)
@@ -181,7 +182,7 @@ func isNoTargetsErr(err error) bool {
 //
 // Error mapping:
 //   - 400: invalid JSON, missing required fields, max_parallel exceeds blast limit,
-//          or empty target_host_ids.
+//     or empty target_host_ids.
 //   - 201: campaign created successfully.
 //   - 500: unexpected DB error.
 //
@@ -334,7 +335,8 @@ func (s *server) handleListCampaigns(w http.ResponseWriter, r *http.Request) {
 //   - 500: unexpected DB error.
 //
 // Source: vm-13-03__blueprint__ §interaction_or_ops_contract
-//         "Operator initiates a fleet-wide kernel update".
+//
+//	"Operator initiates a fleet-wide kernel update".
 func (s *server) handleAdvanceCampaign(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

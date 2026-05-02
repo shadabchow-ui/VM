@@ -195,7 +195,7 @@ func (r *reconcilerRows) Scan(dest ...any) error {
 	}
 	return nil
 }
-func (r *reconcilerRows) Close() {}
+func (r *reconcilerRows) Close()     {}
 func (r *reconcilerRows) Err() error { return nil }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

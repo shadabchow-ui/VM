@@ -1,3 +1,14 @@
 .DS_Store
 bin/
-host-agent
+
+# Compiled binary and packaging artifacts
+*.test
+/resource-manager
+/host-agent
+_claude_vm_p2a_s3_repo_pack/
+
+# Local frontend dependencies
+console/node_modules/
+
+# Local frontend build output
+console/dist/

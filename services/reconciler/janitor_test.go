@@ -29,10 +29,10 @@ type janitorFakeRepo struct {
 	instances map[string]*db.InstanceRow
 
 	// outputs (captured calls)
-	requeuedJobIDs     []string
-	deadJobIDs         []string
-	instanceStateSets  map[string]string // instanceID → new state
-	insertedEvents     []*db.EventRow
+	requeuedJobIDs    []string
+	deadJobIDs        []string
+	instanceStateSets map[string]string // instanceID → new state
+	insertedEvents    []*db.EventRow
 
 	// error injection
 	listStuckErr   error

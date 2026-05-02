@@ -34,26 +34,26 @@ type mockPublicConnectivityRepo struct {
 	mockNetworkRepo
 
 	// ElasticIP
-	createEIPErr              error
-	getEIPByIDRow             *db.ElasticIPRow
-	getEIPByIDErr             error
-	listEIPsRows              []*db.ElasticIPRow
-	listEIPsErr               error
-	associateEIPErr           error
-	disassociateEIPErr        error
-	softDeleteEIPErr          error
-	getEIPByAssocResourceRow  *db.ElasticIPRow
-	getEIPByAssocResourceErr  error
+	createEIPErr             error
+	getEIPByIDRow            *db.ElasticIPRow
+	getEIPByIDErr            error
+	listEIPsRows             []*db.ElasticIPRow
+	listEIPsErr              error
+	associateEIPErr          error
+	disassociateEIPErr       error
+	softDeleteEIPErr         error
+	getEIPByAssocResourceRow *db.ElasticIPRow
+	getEIPByAssocResourceErr error
 
 	// NATGateway
-	createNATGWErr         error
-	getNATGWByIDRow        *db.NATGatewayRow
-	getNATGWByIDErr        error
-	getNATGWBySubnetRow    *db.NATGatewayRow
-	getNATGWBySubnetErr    error
-	listNATGWsRows         []*db.NATGatewayRow
-	listNATGWsErr          error
-	softDeleteNATGWErr     error
+	createNATGWErr      error
+	getNATGWByIDRow     *db.NATGatewayRow
+	getNATGWByIDErr     error
+	getNATGWBySubnetRow *db.NATGatewayRow
+	getNATGWBySubnetErr error
+	listNATGWsRows      []*db.NATGatewayRow
+	listNATGWsErr       error
+	softDeleteNATGWErr  error
 
 	// NIC
 	getNICByIDRow  *db.NetworkInterfaceRow
@@ -176,12 +176,12 @@ func TestJob2_HandleGetElasticIP_Success(t *testing.T) {
 	now := time.Now()
 	repo := &mockPublicConnectivityRepo{
 		getEIPByIDRow: &db.ElasticIPRow{
-			ID:              "eip_001",
+			ID:               "eip_001",
 			OwnerPrincipalID: "princ_001",
-			PublicIP:        "203.0.113.1",
-			AssociationType: "none",
-			Status:          "available",
-			CreatedAt:       now,
+			PublicIP:         "203.0.113.1",
+			AssociationType:  "none",
+			Status:           "available",
+			CreatedAt:        now,
 		},
 	}
 	h := newPCHandlers(repo)
@@ -703,7 +703,7 @@ func TestJob2_HandleGetNATGateway_WrongVPC_Returns404(t *testing.T) {
 		},
 		getNATGWByIDRow: &db.NATGatewayRow{
 			ID: "natgw_001", OwnerPrincipalID: "princ_001",
-			VPCID: "vpc_other", // different VPC
+			VPCID:  "vpc_other", // different VPC
 			Status: "available", CreatedAt: now,
 		},
 	}

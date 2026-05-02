@@ -97,7 +97,6 @@ func seedSnapshotWithSource(mem *memPool, id, owner, status, sourceVolID string,
 	mem.snapshots[id].SourceVolumeID = &sourceVolID
 }
 
-
 // seedVolume seeds a VolumeRow directly into memPool.
 // Matches the signature expected by snapshot tests that need a volume as a
 // snapshot source. All non-required fields default to sensible values.
@@ -610,5 +609,4 @@ func TestRestoreSnapshot_CrossAccount_Returns404(t *testing.T) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-// strPtr returns a pointer to a string literal.
-func strPtr(s string) *string { return &s }
+// strPtr and intPtr are declared in network_handlers_test.go (shared helpers).

@@ -31,6 +31,7 @@ import (
 	"log/slog"
 
 	"github.com/compute-platform/compute-platform/internal/db"
+	runtime "github.com/compute-platform/compute-platform/services/host-agent/runtime"
 )
 
 // VolumeRestoreHandler handles VOLUME_RESTORE jobs.
@@ -100,12 +101,9 @@ func (h *VolumeRestoreHandler) Execute(ctx context.Context, job *db.JobRow) erro
 	log.Info("step2: destination volume found", "volume_id", volID)
 
 	// ── Step 3: Persist storage path ─────────────────────────────────────────
-	// Phase 2: the restored volume's storage_path is a CoW overlay on the
-	// snapshot's storage_path. The storage data-plane registers the new volume
-	// root pointer; here we record the derived path in the control plane so
-	// the path is durably persisted before the status transition.
-	// Source: vm-15-02__blueprint__ §Snapshot Immutability (restored volume uses RoW).
-	storagePath := deriveRestoreStoragePath(snapID, volID)
+	// Derive deterministic safe storage path under the configured local root.
+	// If Storage is nil (tests without manager), fall back to legacy path.
+	storagePath := deriveRestoreStoragePath(h.deps.Storage, snapID, volID)
 	if err := h.deps.Store.SetVolumeStoragePath(ctx, volID, storagePath); err != nil {
 		_ = h.deps.Store.UnlockVolume(ctx, volID, db.VolumeStatusError)
 		return fmt.Errorf("step3 set storage path: %w", err)
@@ -126,9 +124,11 @@ func (h *VolumeRestoreHandler) Execute(ctx context.Context, job *db.JobRow) erro
 }
 
 // deriveRestoreStoragePath returns the control-plane storage path for a restored volume.
-// Phase 2: deterministic path combining snapshot ID and volume ID.
-// Real implementation: the storage subsystem registers the CoW chain.
-// Source: vm-15-02__blueprint__ §interaction_or_ops_contract.
-func deriveRestoreStoragePath(snapID, volID string) string {
+// Uses the LocalStorageManager when available for safe, configurable path derivation.
+// Falls back to a deterministic legacy path when manager is nil.
+func deriveRestoreStoragePath(mgr *runtime.LocalStorageManager, snapID, volID string) string {
+	if mgr != nil {
+		return mgr.RestoreVolumePath(snapID, volID)
+	}
 	return "/volumes/" + volID + "/restore-from-" + snapID + ".img"
 }

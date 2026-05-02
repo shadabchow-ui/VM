@@ -79,43 +79,43 @@ type recoveryEligibleResponse struct {
 
 // recoveryEligibleHostSummary is the per-host entry in the recovery-eligible list.
 type recoveryEligibleHostSummary struct {
-	ID               string     `json:"id"`
-	AvailabilityZone string     `json:"availability_zone"`
-	Status           string     `json:"status"`
-	Generation       int64      `json:"generation"`
-	ReasonCode       *string    `json:"reason_code,omitempty"`
-	FenceRequired    bool       `json:"fence_required"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	ID               string    `json:"id"`
+	AvailabilityZone string    `json:"availability_zone"`
+	Status           string    `json:"status"`
+	Generation       int64     `json:"generation"`
+	ReasonCode       *string   `json:"reason_code,omitempty"`
+	FenceRequired    bool      `json:"fence_required"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // recoveryLogResponse is returned by GET /internal/v1/hosts/{host_id}/recovery-log.
 type recoveryLogResponse struct {
-	HostID  string               `json:"host_id"`
-	Entries []recoveryLogEntry   `json:"entries"`
-	Count   int                  `json:"count"`
+	HostID  string             `json:"host_id"`
+	Entries []recoveryLogEntry `json:"entries"`
+	Count   int                `json:"count"`
 }
 
 // recoveryLogEntry is one record from host_recovery_log.
 type recoveryLogEntry struct {
-	ID                      string     `json:"id"`
-	Verdict                 string     `json:"verdict"`
-	Reason                  string     `json:"reason"`
-	HostStatusAtAttempt     string     `json:"host_status_at_attempt"`
-	HostGenerationAtAttempt int64      `json:"host_generation_at_attempt"`
-	FenceRequiredAtAttempt  bool       `json:"fence_required_at_attempt"`
-	Actor                   string     `json:"actor"`
-	CampaignID              *string    `json:"campaign_id,omitempty"`
-	AttemptedAt             time.Time  `json:"attempted_at"`
+	ID                      string    `json:"id"`
+	Verdict                 string    `json:"verdict"`
+	Reason                  string    `json:"reason"`
+	HostStatusAtAttempt     string    `json:"host_status_at_attempt"`
+	HostGenerationAtAttempt int64     `json:"host_generation_at_attempt"`
+	FenceRequiredAtAttempt  bool      `json:"fence_required_at_attempt"`
+	Actor                   string    `json:"actor"`
+	CampaignID              *string   `json:"campaign_id,omitempty"`
+	AttemptedAt             time.Time `json:"attempted_at"`
 }
 
 // campaignRecoveryAssessmentResponse is returned by
 // GET /internal/v1/maintenance/campaigns/{id}/failed-hosts/recovery.
 type campaignRecoveryAssessmentResponse struct {
-	CampaignID     string                        `json:"campaign_id"`
-	EligibleHosts  []recoveryEligibleHostSummary `json:"eligible_hosts"`
+	CampaignID       string                        `json:"campaign_id"`
+	EligibleHosts    []recoveryEligibleHostSummary `json:"eligible_hosts"`
 	BlockedByFencing []recoveryEligibleHostSummary `json:"blocked_by_fencing"`
-	NotRecoverable []recoveryEligibleHostSummary `json:"not_recoverable"`
-	NotFound       []string                      `json:"not_found"`
+	NotRecoverable   []recoveryEligibleHostSummary `json:"not_recoverable"`
+	NotFound         []string                      `json:"not_found"`
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -134,13 +134,15 @@ func recoveryEligibleSummaryFromRecord(h *db.HostRecord) recoveryEligibleHostSum
 }
 
 // extractRecoveryLogHostID extracts host_id from paths like:
-//   /internal/v1/hosts/{id}/recovery-log
+//
+//	/internal/v1/hosts/{id}/recovery-log
 func extractRecoveryLogHostID(path string) string {
 	return extractPathSegment(path, "hosts", "recovery-log")
 }
 
 // extractRecoverHostID extracts host_id from paths like:
-//   /internal/v1/hosts/{id}/recover
+//
+//	/internal/v1/hosts/{id}/recover
 func extractRecoverHostID(path string) string {
 	return extractPathSegment(path, "hosts", "recover")
 }
@@ -320,7 +322,8 @@ func (s *server) handleGetHostRecoveryLog(w http.ResponseWriter, r *http.Request
 }
 
 // handleGetCampaignFailedHostsRecovery handles:
-//   GET /internal/v1/maintenance/campaigns/{id}/failed-hosts/recovery
+//
+//	GET /internal/v1/maintenance/campaigns/{id}/failed-hosts/recovery
 //
 // Returns a read-only recovery assessment for the campaign's failed_host_ids.
 // No host state changes are made. The operator uses this to decide which

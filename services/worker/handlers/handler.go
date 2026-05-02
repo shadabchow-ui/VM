@@ -26,6 +26,7 @@ import (
 
 	"github.com/compute-platform/compute-platform/internal/db"
 	runtimeclient "github.com/compute-platform/compute-platform/packages/runtime-client"
+	runtime "github.com/compute-platform/compute-platform/services/host-agent/runtime"
 )
 
 // Handler is implemented by every job type handler.
@@ -135,6 +136,10 @@ type VolumeStore interface {
 // Separate from Deps to keep the instance handler dependency set stable.
 type VolumeDeps struct {
 	Store VolumeStore
+	// Storage derives deterministic, safe artifact paths under the configured
+	// local storage root. Used by VOLUME_CREATE and VOLUME_RESTORE handlers.
+	// Source: VM Job 4 — Local block-volume persistence and snapshot foundation.
+	Storage *runtime.LocalStorageManager
 }
 
 // ── SnapshotStore ─────────────────────────────────────────────────────────────
@@ -176,6 +181,10 @@ type SnapshotStore interface {
 // Separate from Deps and VolumeDeps to keep dependency sets stable.
 type SnapshotDeps struct {
 	Store SnapshotStore
+	// Storage derives deterministic, safe artifact paths under the configured
+	// local storage root. Used by SNAPSHOT_CREATE and VOLUME_RESTORE handlers.
+	// Source: VM Job 4 — Local block-volume persistence and snapshot foundation.
+	Storage *runtime.LocalStorageManager
 }
 
 // ── NetworkControllerClient ───────────────────────────────────────────────────

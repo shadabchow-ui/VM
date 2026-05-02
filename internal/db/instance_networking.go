@@ -83,8 +83,8 @@ func (r *Repo) ListSecurityGroupIDsByNIC(ctx context.Context, nicID string) ([]s
 type EffectiveSGRuleRow struct {
 	RuleID                string
 	SecurityGroupID       string
-	Direction             string  // 'ingress' | 'egress'
-	Protocol              string  // 'tcp' | 'udp' | 'icmp' | 'all'
+	Direction             string // 'ingress' | 'egress'
+	Protocol              string // 'tcp' | 'udp' | 'icmp' | 'all'
 	PortFrom              *int
 	PortTo                *int
 	CIDR                  *string // source (ingress) or destination (egress) CIDR
@@ -194,11 +194,12 @@ func (r *Repo) GetPrimaryNetworkInterfaceByInstance(ctx context.Context, instanc
 	return row, nil
 }
 
-
 // UpdateNetworkInterfaceStatus sets the status field of a network_interfaces row.
 // Used by worker lifecycle handlers to advance NIC state through:
-//   pending → attached (create/start)
-//   attached → detached (stop)
+//
+//	pending → attached (create/start)
+//	attached → detached (stop)
+//
 // Silently succeeds when the row does not exist (already cleaned up).
 // Source: P2_VPC_NETWORK_CONTRACT §5 (NIC model), VM-P2A-S2 audit finding R3.
 func (r *Repo) UpdateNetworkInterfaceStatus(ctx context.Context, nicID, status string) error {
@@ -358,4 +359,60 @@ func SubnetContainsIP(cidr, ipStr string) (bool, error) {
 		return false, fmt.Errorf("invalid IP %s", ipStr)
 	}
 	return network.Contains(ip), nil
+}
+
+// ── VM Job 5: Stale NIC detection for reconciliation ─────────────────────────
+
+// StaleNICRow is the result row for ListStaleNetworkInterfaces.
+// Captures NICs whose instance has been deleted but the NIC record remains active.
+type StaleNICRow struct {
+	NICID         string
+	InstanceID    string
+	SubnetID      string
+	VPCID         string
+	PrivateIP     string
+	NICStatus     string
+	InstanceState string
+}
+
+// ListStaleNetworkInterfaces returns NIC rows where the owning instance is
+// deleted but the NIC has not been cleaned up.
+// VM Job 5 — Case 5: Stale TAP/NAT/firewall state for deleted/stopped instances.
+func (r *Repo) ListStaleNetworkInterfaces(ctx context.Context) ([]*StaleNICRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT
+			n.id            AS nic_id,
+			n.instance_id,
+			n.subnet_id,
+			n.vpc_id,
+			n.private_ip,
+			n.status        AS nic_status,
+			COALESCE(i.vm_state, 'unknown') AS instance_state
+		FROM network_interfaces n
+		LEFT JOIN instances i ON i.id = n.instance_id
+		WHERE n.deleted_at IS NULL
+		  AND n.status != 'deleted'
+		  AND (
+		      i.deleted_at IS NOT NULL
+		      OR i.vm_state IN ('deleted')
+		  )
+		ORDER BY n.created_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListStaleNetworkInterfaces: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*StaleNICRow
+	for rows.Next() {
+		r := &StaleNICRow{}
+		if err := rows.Scan(
+			&r.NICID, &r.InstanceID, &r.SubnetID, &r.VPCID,
+			&r.PrivateIP, &r.NICStatus, &r.InstanceState,
+		); err != nil {
+			return nil, fmt.Errorf("ListStaleNetworkInterfaces scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

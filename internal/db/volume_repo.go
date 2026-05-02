@@ -470,3 +470,96 @@ func (r *Repo) NextDevicePath(ctx context.Context, instanceID string) (string, e
 	}
 	return "", fmt.Errorf("NextDevicePath: no available device paths for instance %s", instanceID)
 }
+
+// ── VM Job 5: Reconciliation scan methods ─────────────────────────────────────
+
+// VolumeOrphanRow is the result row for ListVolumesWithOrphanStorage.
+// Captures volumes that have a storage_path but are in a terminal/cleaned state
+// where the physical storage may need GC.
+type VolumeOrphanRow struct {
+	VolumeID    string
+	StoragePath string
+	Status      string
+	Version     int
+}
+
+// ListVolumesWithOrphanStorage returns volumes that have storage_path set but
+// whose status indicates the volume record has been deleted or is in error.
+// The reconciling sub-scan uses this to detect orphan storage artifacts that
+// may be safe to clean up.
+// VM Job 5 — Case 6: Volume artifact exists but DB says deleted.
+func (r *Repo) ListVolumesWithOrphanStorage(ctx context.Context) ([]*VolumeOrphanRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, COALESCE(storage_path,''), status, version
+		FROM volumes
+		WHERE storage_path IS NOT NULL
+		  AND storage_path != ''
+		  AND status IN ('deleted', 'error')
+		ORDER BY updated_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListVolumesWithOrphanStorage: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*VolumeOrphanRow
+	for rows.Next() {
+		r := &VolumeOrphanRow{}
+		if err := rows.Scan(&r.VolumeID, &r.StoragePath, &r.Status, &r.Version); err != nil {
+			return nil, fmt.Errorf("ListVolumesWithOrphanStorage scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// StaleAttachmentRow is the result row for ListStaleAttachments.
+// Captures attachments whose instance or volume is in a terminal state.
+type StaleAttachmentRow struct {
+	AttachmentID  string
+	VolumeID      string
+	InstanceID    string
+	InstanceState string
+	VolumeState   string
+}
+
+// ListStaleAttachments returns active volume attachments where the owning
+// instance or volume is in a terminal state (deleted, failed, error).
+// VM Job 5 — Case 7: DB attachment intent exists but runtime disk attachment missing.
+func (r *Repo) ListStaleAttachments(ctx context.Context) ([]*StaleAttachmentRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT
+			a.id          AS attachment_id,
+			a.volume_id,
+			a.instance_id,
+			COALESCE(i.vm_state, 'unknown') AS instance_state,
+			COALESCE(v.status,   'unknown') AS volume_state
+		FROM volume_attachments a
+		LEFT JOIN instances i ON i.id = a.instance_id
+		LEFT JOIN volumes   v ON v.id = a.volume_id
+		WHERE a.detached_at IS NULL
+		  AND (
+		      i.deleted_at IS NOT NULL
+		      OR i.vm_state IN ('deleted', 'failed')
+		      OR v.deleted_at IS NOT NULL
+		      OR v.status IN ('deleted', 'error')
+		  )
+		ORDER BY a.attached_at ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("ListStaleAttachments: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*StaleAttachmentRow
+	for rows.Next() {
+		r := &StaleAttachmentRow{}
+		if err := rows.Scan(&r.AttachmentID, &r.VolumeID, &r.InstanceID,
+			&r.InstanceState, &r.VolumeState,
+		); err != nil {
+			return nil, fmt.Errorf("ListStaleAttachments scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

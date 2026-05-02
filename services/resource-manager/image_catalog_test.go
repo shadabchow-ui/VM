@@ -126,7 +126,7 @@ func newCatalogTestSrv(t *testing.T) *catalogTestSrv {
 		StorageURL: "nfs://images/ubuntu-22.04.qcow2", MinDiskGB: 10,
 		Status: "ACTIVE", ValidationStatus: "passed",
 		SignatureValid: &sigOK,
-		CreatedAt: now, UpdatedAt: now,
+		CreatedAt:      now, UpdatedAt: now,
 	}
 
 	return &catalogTestSrv{ts: ts, mem: pool}
@@ -764,7 +764,6 @@ func TestFamilyAlias_UpdateFamilyAlias_WrongFamilyRejected(t *testing.T) {
 //   - PLATFORM + provenanceHash≠nil + signatureValid=false: NOT trusted.
 //   - PLATFORM + provenanceHash≠nil + signatureValid=true: trusted.
 
-
 func TestImageIsTrusted_PlatformNilProvenance_Trusted(t *testing.T) {
 	// PLATFORM with nil provenance_hash → backward-compatible, trusted (no factory sig yet).
 	if !db.ImageIsTrusted(db.ImageSourceTypePlatform, nil, nil) {
@@ -889,5 +888,3 @@ func TestDispatch_SignatureSQL_IsDistinct(t *testing.T) {
 		t.Error("want isUpdateImageSignatureSQL=false for UpdateImageStatus SQL")
 	}
 }
-
-

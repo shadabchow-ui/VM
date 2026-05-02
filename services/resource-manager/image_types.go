@@ -43,22 +43,23 @@ import "time"
 //   - family_name / family_version: omitted when nil (images not in a family).
 //
 // Source: INSTANCE_MODEL_V1.md §7, P2_IMAGE_SNAPSHOT_MODEL.md §3.3,
-//         vm-13-01__blueprint__ §family_seam.
+//
+//	vm-13-01__blueprint__ §family_seam.
 type ImageResponse struct {
-	ID               string     `json:"id"`
-	Name             string     `json:"name"`
-	OSFamily         string     `json:"os_family"`
-	OSVersion        string     `json:"os_version"`
-	Architecture     string     `json:"architecture"`
-	Visibility       string     `json:"visibility"`
-	SourceType       string     `json:"source_type"`
-	MinDiskGB        int        `json:"min_disk_gb"`
-	Status           string     `json:"status"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	OSFamily     string `json:"os_family"`
+	OSVersion    string `json:"os_version"`
+	Architecture string `json:"architecture"`
+	Visibility   string `json:"visibility"`
+	SourceType   string `json:"source_type"`
+	MinDiskGB    int    `json:"min_disk_gb"`
+	Status       string `json:"status"`
 	// source_snapshot_id is exposed for custom (SNAPSHOT-sourced) images so callers
 	// can trace which snapshot the image was created from.
 	// nil / omitted for PLATFORM and IMPORT images.
 	// VM-P2C-P2.
-	SourceSnapshotID *string    `json:"source_snapshot_id,omitempty"`
+	SourceSnapshotID *string `json:"source_snapshot_id,omitempty"`
 	// family_name / family_version: set when the image belongs to a named family.
 	// Omitted (null) for images without family membership.
 	// VM-P2C-P3. Source: vm-13-01__blueprint__ §family_seam.
@@ -94,15 +95,16 @@ type ListImagesResponse struct {
 // family_version requires family_name to be set.
 //
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §3.6 (snapshot → custom image creation flow),
-//         vm-13-01__blueprint__ §family_seam.
+//
+//	vm-13-01__blueprint__ §family_seam.
 type CreateImageFromSnapshotRequest struct {
-	Name             string  `json:"name"`
-	SourceSnapshotID string  `json:"source_snapshot_id"`
-	OSFamily         string  `json:"os_family"`
-	OSVersion        string  `json:"os_version"`
-	Architecture     string  `json:"architecture"`
+	Name             string `json:"name"`
+	SourceSnapshotID string `json:"source_snapshot_id"`
+	OSFamily         string `json:"os_family"`
+	OSVersion        string `json:"os_version"`
+	Architecture     string `json:"architecture"`
 	// MinDiskGB is optional; defaults to snapshot size_gb when omitted.
-	MinDiskGB     *int    `json:"min_disk_gb,omitempty"`
+	MinDiskGB *int `json:"min_disk_gb,omitempty"`
 	// Family membership (optional). VM-P2C-P3.
 	FamilyName    *string `json:"family_name,omitempty"`
 	FamilyVersion *int    `json:"family_version,omitempty"`
@@ -130,14 +132,15 @@ type CreateImageFromSnapshotResponse struct {
 // VM-P2C-P3: family_name and family_version are optional.
 //
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §3 (import lifecycle),
-//         vm-13-01__blueprint__ §family_seam.
+//
+//	vm-13-01__blueprint__ §family_seam.
 type ImportImageRequest struct {
-	Name         string  `json:"name"`
-	ImportURL    string  `json:"import_url"`
-	OSFamily     string  `json:"os_family"`
-	OSVersion    string  `json:"os_version"`
-	Architecture string  `json:"architecture"`
-	MinDiskGB    int     `json:"min_disk_gb"`
+	Name         string `json:"name"`
+	ImportURL    string `json:"import_url"`
+	OSFamily     string `json:"os_family"`
+	OSVersion    string `json:"os_version"`
+	Architecture string `json:"architecture"`
+	MinDiskGB    int    `json:"min_disk_gb"`
 	// Family membership (optional). VM-P2C-P3.
 	FamilyName    *string `json:"family_name,omitempty"`
 	FamilyVersion *int    `json:"family_version,omitempty"`
@@ -178,7 +181,8 @@ type ObsoleteImageResponse struct {
 // When set, the exact version is required to exist and be launchable.
 //
 // Source: vm-13-01__blueprint__ §family_seam,
-//         08-01-api-resource-model-and-endpoint-design.md §CreateInstance.
+//
+//	08-01-api-resource-model-and-endpoint-design.md §CreateInstance.
 type ImageFamilyRef struct {
 	FamilyName    string `json:"family_name"`
 	FamilyVersion *int   `json:"family_version,omitempty"`

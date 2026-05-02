@@ -151,7 +151,7 @@ func (h *StartHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	}
 	if _, err := rtClient.CreateInstance(ctx, createReq); err != nil {
 		// Rollback: release IP, then fail instance.
-		if relErr := h.deps.Network.ReleaseIP(ctx, allocatedIP, vpcID, inst.ID); relErr != nil {
+		if relErr := h.deps.Network.ReleaseIP(ctx, allocatedIP, phase1VPCID, inst.ID); relErr != nil {
 			log.Error("rollback: IP release failed", "error", relErr)
 		}
 		return h.failInstance(ctx, inst, fmt.Errorf("step6 CreateInstance: %w", err))
@@ -169,7 +169,7 @@ func (h *StartHandler) Execute(ctx context.Context, job *db.JobRow) error {
 			}); delErr != nil {
 				log.Error("rollback: DeleteInstance failed", "error", delErr)
 			}
-			if relErr := h.deps.Network.ReleaseIP(ctx, allocatedIP, vpcID, inst.ID); relErr != nil {
+			if relErr := h.deps.Network.ReleaseIP(ctx, allocatedIP, phase1VPCID, inst.ID); relErr != nil {
 				log.Error("rollback: IP release failed", "error", relErr)
 			}
 			return h.failInstance(ctx, inst, fmt.Errorf("step7 readiness: %w", err))

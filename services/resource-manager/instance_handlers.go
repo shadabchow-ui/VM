@@ -829,13 +829,20 @@ func writeDBError(w http.ResponseWriter, err error) {
 // M7: ip param carries the allocated IP from GetIPByInstance (empty string = nil fields).
 // M10 Slice 4: BlockDevices initialized to empty slice (populated by caller or enrichment).
 // VM-P2D Slice 4: ProjectID is not populated here — set by the caller when known
-//   (create path has it from the request; get/list paths do not reconstruct it from DB
-//   since owner_principal_id alone does not reveal the original project_id string).
+//
+//	(create path has it from the request; get/list paths do not reconstruct it from DB
+//	since owner_principal_id alone does not reveal the original project_id string).
+//
+// VM Job 1: Owner field populated as ARN per INSTANCE_MODEL_V1 §2 (R-13).
+//
+//	Phase 1 format: arn:cs:compute::principal/{owner_principal_id}.
+//
 // Source: INSTANCE_MODEL_V1 §2, §4.
 func instanceToResponse(row *db.InstanceRow, region, ip string) InstanceResponse {
 	resp := InstanceResponse{
 		ID:               row.ID,
 		Name:             row.Name,
+		Owner:            "arn:cs:compute::principal/" + row.OwnerPrincipalID,
 		Status:           row.VMState,
 		InstanceType:     row.InstanceTypeID,
 		ImageID:          row.ImageID,

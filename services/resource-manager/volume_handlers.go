@@ -416,11 +416,12 @@ func (s *server) handleAttachVolume(w http.ResponseWriter, r *http.Request, inst
 		return
 	}
 
-	// Step 3: instance must be running or stopped.
-	// Source: P2_VOLUME_MODEL.md §4.1.
-	if inst.VMState != "running" && inst.VMState != "stopped" {
+	// Step 3: instance must be stopped.
+	// Prefer stopped-only attach unless runtime safely supports hotplug.
+	// Source: VM Job 4 — Local block-volume persistence (stopped-only attach/detach).
+	if inst.VMState != "stopped" {
 		writeAPIError(w, http.StatusConflict, errIllegalTransition,
-			"Cannot attach a volume to an instance in state '"+inst.VMState+"'. Instance must be running or stopped.", "status")
+			"Cannot attach a volume to an instance in state '"+inst.VMState+"'. Instance must be stopped.", "status")
 		return
 	}
 
@@ -552,11 +553,12 @@ func (s *server) handleDetachVolume(w http.ResponseWriter, r *http.Request, inst
 		return
 	}
 
-	// Step 2: instance must be running or stopped.
-	// Source: P2_VOLUME_MODEL.md §4.3.
-	if inst.VMState != "running" && inst.VMState != "stopped" {
+	// Step 2: instance must be stopped.
+	// Prefer stopped-only detach unless runtime safely supports hotplug.
+	// Source: VM Job 4 — Local block-volume persistence (stopped-only attach/detach).
+	if inst.VMState != "stopped" {
 		writeAPIError(w, http.StatusConflict, errIllegalTransition,
-			"Cannot detach a volume from an instance in state '"+inst.VMState+"'. Instance must be running or stopped.", "status")
+			"Cannot detach a volume from an instance in state '"+inst.VMState+"'. Instance must be stopped.", "status")
 		return
 	}
 

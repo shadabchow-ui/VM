@@ -33,6 +33,7 @@ import (
 	"log/slog"
 
 	"github.com/compute-platform/compute-platform/internal/db"
+	runtime "github.com/compute-platform/compute-platform/services/host-agent/runtime"
 )
 
 // SnapshotCreateHandler handles SNAPSHOT_CREATE jobs.
@@ -100,11 +101,9 @@ func (h *SnapshotCreateHandler) Execute(ctx context.Context, job *db.JobRow) err
 	}
 
 	// ── Step 5: Storage operation ─────────────────────────────────────────────
-	// Phase 2: the RoW metadata freeze is delegated to the storage data-plane.
-	// Here we derive a deterministic storage_path and confirm it synchronously.
-	// Real integration with the storage subsystem is a separate concern (P2-OD-1).
-	// Source: P2_IMAGE_SNAPSHOT_MODEL.md §6 open decisions P2-IMG-OD-1.
-	storagePath := deriveSnapshotStoragePath(snapID)
+	// Derive deterministic safe storage path under the configured local root.
+	// If Storage is nil (tests without manager), fall back to legacy path.
+	storagePath := deriveSnapshotStoragePath(h.deps.Storage, snapID)
 	log.Info("step5: storage operation complete", "storage_path", storagePath)
 
 	// ── Step 6: Mark available — SNAP-I-1 ─────────────────────────────────────
@@ -133,8 +132,11 @@ func (h *SnapshotCreateHandler) unlock(ctx context.Context, snapID, newStatus st
 }
 
 // deriveSnapshotStoragePath returns the storage path for a snapshot.
-// Phase 2: deterministic path based on snapshot ID. The actual storage backend
-// integration determines the real path; this is the control-plane record.
-func deriveSnapshotStoragePath(snapID string) string {
+// Uses the LocalStorageManager when available for safe, configurable path derivation.
+// Falls back to a deterministic legacy path when manager is nil.
+func deriveSnapshotStoragePath(mgr *runtime.LocalStorageManager, snapID string) string {
+	if mgr != nil {
+		return mgr.SnapshotDataPath(snapID)
+	}
 	return "/snapshots/" + snapID + "/data"
 }

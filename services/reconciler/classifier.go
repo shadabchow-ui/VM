@@ -27,6 +27,8 @@ import (
 
 // DriftClass enumerates all detectable Phase 1 drift classes.
 // Source: IMPLEMENTATION_PLAN_V1 §WS-3.
+// VM Job 5 additions: host_unhealthy_with_live_instance, volume_orphan_artifact,
+// network_stale_for_deleted, attachment_missing_runtime.
 type DriftClass string
 
 const (
@@ -36,7 +38,38 @@ const (
 	DriftMissingRuntimeProcess DriftClass = "missing_runtime_process"
 	DriftOrphanedResource      DriftClass = "orphaned_resource"
 	DriftJobTimeout            DriftClass = "job_timeout"
+
+	// VM Job 5: reconciliation hardening drift classes.
+	//
+	// DriftHostUnhealthyWithLiveInstance — instance is running on a host that is
+	// degraded/unhealthy with a stale heartbeat. The instance state may be stale
+	// and the host may be fenced. No automatic repair; logged for operator action.
+	DriftHostUnhealthyWithLiveInstance DriftClass = "host_unhealthy_with_live_instance"
+
+	// DriftVolumeOrphanArtifact — a volume has a storage_path persisted but the
+	// volume status is deleted. The storage artifact is orphaned and may be
+	// safe to clean up. Conservative: only when volume is fully deleted.
+	DriftVolumeOrphanArtifact DriftClass = "volume_orphan_artifact"
+
+	// DriftNetworkStaleForDeleted — a network interface (NIC) exists with
+	// IP allocation for an instance that is already deleted. The NIC + IP
+	// are stale and safe to clean up.
+	DriftNetworkStaleForDeleted DriftClass = "network_stale_for_deleted"
+
+	// DriftAttachmentMissingRuntime — a volume attachment record exists in DB
+	// (attachment active) but the volume or instance is in a state that makes
+	// the attachment impossible (volume deleted, instance deleted).
+	DriftAttachmentMissingRuntime DriftClass = "attachment_missing_runtime"
 )
+
+// Collision avoidance: assign a unique idempotency scope key to each new class
+// for use when generating dispatcher idempotency keys.
+var driftClassScopeKeys = map[DriftClass]string{
+	DriftHostUnhealthyWithLiveInstance: "hhl",
+	DriftVolumeOrphanArtifact:          "voa",
+	DriftNetworkStaleForDeleted:        "nsd",
+	DriftAttachmentMissingRuntime:      "amr",
+}
 
 // Phase 1 drift detection thresholds.
 // Source: LIFECYCLE_STATE_MACHINE_V1 §5 (Failure timeouts per state).
@@ -179,5 +212,87 @@ func ClassifyDrift(inst *db.InstanceRow, now time.Time) DriftResult {
 		// Nothing to do.
 	}
 
+	return NoDrift
+}
+
+// ── VM Job 5: extended classification helpers ─────────────────────────────────
+
+// ClassifyHostInstanceDrift detects drift for an instance whose host health is
+// known. Called only when the reconciler has host data available (e.g. during
+// periodic resync when host records are also scanned).
+//
+// When the instance is running on a host that is degraded, unhealthy, or has a
+// stale heartbeat, surface DriftHostUnhealthyWithLiveInstance. This does NOT
+// auto-repair — the host may be fenced. The event is observable for operators.
+func ClassifyHostInstanceDrift(inst *db.InstanceRow, hostStatus string, heartbeatAge time.Duration, now time.Time) DriftResult {
+	if inst.VMState != "running" {
+		return NoDrift
+	}
+	if hostStatus == "" {
+		return NoDrift
+	}
+
+	// Host is unhealthy or degraded → the running instance may be stale.
+	if hostStatus == "unhealthy" || hostStatus == "degraded" {
+		return DriftResult{
+			Class:  DriftHostUnhealthyWithLiveInstance,
+			Reason: "instance running on host with status " + hostStatus,
+		}
+	}
+
+	// Host is ready but heartbeat is very stale (> 5 min).
+	if heartbeatAge > 5*time.Minute {
+		return DriftResult{
+			Class:  DriftHostUnhealthyWithLiveInstance,
+			Reason: "instance running on host with stale heartbeat",
+		}
+	}
+
+	return NoDrift
+}
+
+// ClassifyVolumeOrphanArtifact detects volumes that have a storage_path set
+// but are in deleted status. The storage artifact is orphaned.
+// Pure analysis — never mutates.
+func ClassifyVolumeOrphanArtifact(volStatus string, storagePath *string) DriftResult {
+	if volStatus == "deleted" && storagePath != nil && *storagePath != "" {
+		return DriftResult{
+			Class:  DriftVolumeOrphanArtifact,
+			Reason: "volume deleted but storage_path still references artifact",
+		}
+	}
+	return NoDrift
+}
+
+// ClassifyNetworkStaleForDeleted detects NIC rows whose instance has been deleted.
+// Pure analysis — the caller passes instanceDeleted (bool from cross-reference).
+func ClassifyNetworkStaleForDeleted(instanceDeleted bool, nicStatus string) DriftResult {
+	if instanceDeleted && nicStatus != "deleted" {
+		return DriftResult{
+			Class:  DriftNetworkStaleForDeleted,
+			Reason: "network interface for deleted instance is not cleaned up",
+		}
+	}
+	return NoDrift
+}
+
+// ClassifyAttachmentMissingRuntime detects volume attachments where the owning
+// instance or volume is in a terminal state that makes the attachment impossible.
+func ClassifyAttachmentMissingRuntime(attachmentActive bool, instanceState string, volumeState string) DriftResult {
+	if !attachmentActive {
+		return NoDrift
+	}
+	if instanceState == "deleted" || instanceState == "failed" {
+		return DriftResult{
+			Class:  DriftAttachmentMissingRuntime,
+			Reason: "volume attachment exists but instance is " + instanceState,
+		}
+	}
+	if volumeState == "deleted" || volumeState == "error" {
+		return DriftResult{
+			Class:  DriftAttachmentMissingRuntime,
+			Reason: "volume attachment exists but volume is " + volumeState,
+		}
+	}
 	return NoDrift
 }

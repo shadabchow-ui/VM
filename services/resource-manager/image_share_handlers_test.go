@@ -128,7 +128,8 @@ func (p *sharePool) Exec(ctx context.Context, sql string, args ...any) (db.Comma
 
 // imageGrantRow scans a single ImageGrantRow (5 columns).
 // Column order matches image_grant_repo.go GetImageGrant SELECT list:
-//   id, image_id, owner_principal_id, grantee_principal_id, created_at
+//
+//	id, image_id, owner_principal_id, grantee_principal_id, created_at
 type imageGrantRow struct{ r *db.ImageGrantRow }
 
 func (row *imageGrantRow) Scan(dest ...any) error {

@@ -212,7 +212,7 @@ func (r *healthTestRows) Scan(dest ...any) error {
 	}
 	return nil
 }
-func (r *healthTestRows) Close() {}
+func (r *healthTestRows) Close()     {}
 func (r *healthTestRows) Err() error { return nil }
 
 // ── buildHealthServer ─────────────────────────────────────────────────────────

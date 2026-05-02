@@ -254,9 +254,9 @@ type recoveryTestRows struct {
 	idx  int
 }
 
-func (r *recoveryTestRows) Next() bool        { r.idx++; return r.idx < len(r.data) }
-func (r *recoveryTestRows) Close()             {}
-func (r *recoveryTestRows) Err() error         { return nil }
+func (r *recoveryTestRows) Next() bool { r.idx++; return r.idx < len(r.data) }
+func (r *recoveryTestRows) Close()     {}
+func (r *recoveryTestRows) Err() error { return nil }
 func (r *recoveryTestRows) Scan(dest ...any) error {
 	if r.idx >= len(r.data) {
 		return fmt.Errorf("no row")

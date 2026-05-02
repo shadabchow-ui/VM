@@ -31,29 +31,31 @@ import "time"
 // M7: added PublicIP, PrivateIP from ip_allocations join.
 // M10 Slice 4: added BlockDevices.
 // VM-P2D Slice 4: added ProjectID (omitempty — nil for classic/no-project instances).
+// VM Job 1: added Owner ARN field per INSTANCE_MODEL_V1 §2 (R-13).
 // Source: INSTANCE_MODEL_V1 §2.
 type InstanceResponse struct {
-	ID               string                     `json:"id"`
-	Name             string                     `json:"name"`
-	Status           string                     `json:"status"`
-	InstanceType     string                     `json:"instance_type"`
-	ImageID          string                     `json:"image_id"`
-	ImageFamily      string                     `json:"image_family,omitempty"`
-	ImageVersion     *string                    `json:"image_version,omitempty"`
-	AvailabilityZone string                     `json:"availability_zone"`
-	Region           string                     `json:"region"`
+	ID               string  `json:"id"`
+	Name             string  `json:"name"`
+	Owner            string  `json:"owner"`
+	Status           string  `json:"status"`
+	InstanceType     string  `json:"instance_type"`
+	ImageID          string  `json:"image_id"`
+	ImageFamily      string  `json:"image_family,omitempty"`
+	ImageVersion     *string `json:"image_version,omitempty"`
+	AvailabilityZone string  `json:"availability_zone"`
+	Region           string  `json:"region"`
 	// ProjectID is the project this instance belongs to.
 	// Nil for classic (no-project) instances created without a project_id.
 	// When set, owner_principal_id in DB equals the project's principal_id.
 	// Source: VM-P2D Slice 4, AUTH_OWNERSHIP_MODEL_V1 §3.
-	ProjectID        *string                    `json:"project_id,omitempty"`
-	Labels           map[string]string          `json:"labels"`
-	BlockDevices     []BlockDeviceMapping       `json:"block_devices"`
-	Networking       *InstanceNetworkingResponse `json:"networking,omitempty"`
-	PublicIP         *string                    `json:"public_ip"`
-	PrivateIP        *string                    `json:"private_ip"`
-	CreatedAt        time.Time                  `json:"created_at"`
-	UpdatedAt        time.Time                  `json:"updated_at"`
+	ProjectID    *string                     `json:"project_id,omitempty"`
+	Labels       map[string]string           `json:"labels"`
+	BlockDevices []BlockDeviceMapping        `json:"block_devices"`
+	Networking   *InstanceNetworkingResponse `json:"networking,omitempty"`
+	PublicIP     *string                     `json:"public_ip"`
+	PrivateIP    *string                     `json:"private_ip"`
+	CreatedAt    time.Time                   `json:"created_at"`
+	UpdatedAt    time.Time                   `json:"updated_at"`
 }
 
 // ── Block device mapping (M10 Slice 4) ──────────────────────────────────────
@@ -62,7 +64,8 @@ type InstanceResponse struct {
 // and instance response. Phase 1: exactly one entry (root disk).
 // Phase 1 constraint: delete_on_termination must be true.
 // Source: INSTANCE_MODEL_V1 §2 (block_devices item shape),
-//         execution_blueprint §7.7, 12-03-risks-and-phase-2-expansion.md.
+//
+//	execution_blueprint §7.7, 12-03-risks-and-phase-2-expansion.md.
 type BlockDeviceMapping struct {
 	ImageID             string `json:"image_id"`
 	SizeGB              int    `json:"size_gb"`
@@ -77,7 +80,8 @@ type BlockDeviceMapping struct {
 // VM-P2D Slice 4: added ProjectID. When set, the instance is created in project
 // scope. The project must exist and be owned by the calling principal.
 // Source: 08-01 §CreateInstance, INSTANCE_MODEL_V1 §2, 08-02 §validation,
-//         execution_blueprint §7.7, AUTH_OWNERSHIP_MODEL_V1 §3.
+//
+//	execution_blueprint §7.7, AUTH_OWNERSHIP_MODEL_V1 §3.
 type CreateInstanceRequest struct {
 	Name             string               `json:"name"`
 	InstanceType     string               `json:"instance_type"`
@@ -92,9 +96,8 @@ type CreateInstanceRequest struct {
 	// exist and be owned by the calling principal; owner_principal_id is set to
 	// the project's principal_id. When absent, classic (user-principal) scope is used.
 	// Source: VM-P2D Slice 4, AUTH_OWNERSHIP_MODEL_V1 §3.
-	ProjectID        *string              `json:"project_id,omitempty"`
+	ProjectID *string `json:"project_id,omitempty"`
 }
-
 
 // CreateInstanceResponse is returned from POST /v1/instances with 202 Accepted.
 // Source: 08-01 §CreateInstance response.

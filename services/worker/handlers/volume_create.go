@@ -31,6 +31,7 @@ import (
 	"log/slog"
 
 	"github.com/compute-platform/compute-platform/internal/db"
+	runtime "github.com/compute-platform/compute-platform/services/host-agent/runtime"
 )
 
 // VolumeCreateHandler handles VOLUME_CREATE jobs.
@@ -88,11 +89,9 @@ func (h *VolumeCreateHandler) Execute(ctx context.Context, job *db.JobRow) error
 	}
 
 	// ── Step 4: Storage provisioning ──────────────────────────────────────────
-	// Phase 2: the real block device provisioning (thin-provision on NFS/local
-	// storage pool) is handled by the storage subsystem. Here we record the
-	// control-plane storage_path for visibility and worker idempotency.
-	// Source: vm-15-01__blueprint__ §data_model (storage_path assigned on create).
-	storagePath := deriveVolumeStoragePath(volumeID)
+	// Derive deterministic safe storage path under the configured local root.
+	// If Storage is nil (tests without manager), fall back to legacy path.
+	storagePath := deriveVolumeStoragePath(h.deps.Storage, volumeID)
 	if err := h.deps.Store.SetVolumeStoragePath(ctx, volumeID, storagePath); err != nil {
 		_ = h.unlock(ctx, volumeID, db.VolumeStatusError)
 		return fmt.Errorf("step4 set storage path: %w", err)
@@ -122,9 +121,12 @@ func (h *VolumeCreateHandler) unlock(ctx context.Context, volumeID, newStatus st
 }
 
 // deriveVolumeStoragePath returns the control-plane storage path for a volume.
-// Phase 2: deterministic path based on volume ID. The actual storage backend
-// determines the real physical location; this is the control-plane record.
-// Source: vm-15-01__blueprint__ §data_model.
-func deriveVolumeStoragePath(volumeID string) string {
+// Uses the LocalStorageManager when available for safe, configurable path derivation.
+// Falls back to a deterministic legacy path when manager is nil (test compatibility).
+// Source: vm-15-01__blueprint__ §data_model, VM Job 4.
+func deriveVolumeStoragePath(mgr *runtime.LocalStorageManager, volumeID string) string {
+	if mgr != nil {
+		return mgr.VolumeDiskPath(volumeID)
+	}
 	return "/volumes/" + volumeID + "/disk.img"
 }

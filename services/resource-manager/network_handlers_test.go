@@ -51,14 +51,14 @@ type mockNetworkRepo struct {
 	listRulesErr  error
 
 	// RouteTable
-	createRouteTableErr      error
-	getRouteTableByIDRow     *db.RouteTableRow
-	getRouteTableByIDErr     error
-	getDefaultRouteTableRow  *db.RouteTableRow
-	getDefaultRouteTableErr  error
-	listRouteTablesRows      []*db.RouteTableRow
-	listRouteTablesErr       error
-	softDeleteRouteTableErr  error
+	createRouteTableErr     error
+	getRouteTableByIDRow    *db.RouteTableRow
+	getRouteTableByIDErr    error
+	getDefaultRouteTableRow *db.RouteTableRow
+	getDefaultRouteTableErr error
+	listRouteTablesRows     []*db.RouteTableRow
+	listRouteTablesErr      error
+	softDeleteRouteTableErr error
 
 	// RouteEntry
 	createRouteEntryErr  error
@@ -1527,3 +1527,111 @@ func TestNetworkHandlers_HandleAddSecurityGroupRule_UDPPortRange_BoundaryValues(
 		t.Errorf("status = %d, want %d (udp 0-65535 must be accepted)", w.Code, http.StatusCreated)
 	}
 }
+
+// ── VM Job 3: Cross-Tenant Security Group Safety Tests ────────────────────────
+// These verify that security group ownership is enforced at all levels:
+//   - Cannot add rules to an SG owned by a different principal (404).
+//   - Cannot get/list SGs belonging to a different principal.
+//   - Fail-close on unknown SG state — missing/absent SG is 404.
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_CrossTenant_Returns404(t *testing.T) {
+	// SG is owned by "princ_other", request comes from "princ_001"
+	repo := &mockNetworkRepo{
+		getSGByIDRow: &db.SecurityGroupRow{
+			ID:               "sg_001",
+			VPCID:            "vpc_001",
+			OwnerPrincipalID: "princ_other", // different owner
+			Name:             "other-sg",
+		},
+	}
+	h := NewNetworkHandlers(repo)
+
+	body := []byte(`{"direction":"ingress","protocol":"tcp","port_from":22,"port_to":22,"cidr":"0.0.0.0/0"}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (cross-tenant rule add must not leak SG existence)", w.Code)
+	}
+}
+
+func TestNetworkHandlers_HandleGetSecurityGroup_CrossTenant_Returns404(t *testing.T) {
+	repo := &mockNetworkRepo{
+		getSGByIDRow: &db.SecurityGroupRow{
+			ID:               "sg_001",
+			VPCID:            "vpc_001",
+			OwnerPrincipalID: "princ_other",
+			Name:             "other-sg",
+		},
+	}
+	h := NewNetworkHandlers(repo)
+
+	req := testNetworkRequest("GET", "/v1/security_groups/sg_001", nil, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleGetSecurityGroup(w, req, "sg_001")
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (cross-tenant SG get must return 404)", w.Code)
+	}
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_NilSG_Returns404(t *testing.T) {
+	// SG does not exist at all.
+	repo := &mockNetworkRepo{getSGByIDRow: nil}
+	h := NewNetworkHandlers(repo)
+
+	body := []byte(`{"direction":"ingress","protocol":"tcp","cidr":"0.0.0.0/0"}`)
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_missing/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_missing")
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (nil SG must return 404)", w.Code)
+	}
+}
+
+func TestNetworkHandlers_HandleAddSecurityGroupRule_CIDRMustNotBeSourceSG_StillValidated(t *testing.T) {
+	// SG-I-5: cannot specify both cidr AND source_security_group_id.
+	// This test was already present but also verify the error response shape.
+	now := time.Now()
+	repo := &mockNetworkRepo{
+		getSGByIDRow: &db.SecurityGroupRow{
+			ID:               "sg_001",
+			VPCID:            "vpc_001",
+			OwnerPrincipalID: "princ_001",
+			Name:             "my-sg",
+			CreatedAt:        now,
+		},
+	}
+	h := NewNetworkHandlers(repo)
+
+	bothSG := "sg_002"
+	body, _ := json.Marshal(SecurityGroupRuleCreateRequest{
+		Direction:             "ingress",
+		Protocol:              "tcp",
+		CIDR:                  strPtr("10.0.0.0/8"),
+		SourceSecurityGroupID: &bothSG,
+	})
+	req := testNetworkRequest("POST", "/v1/security_groups/sg_001/rules", body, "princ_001")
+	w := httptest.NewRecorder()
+
+	h.HandleAddSecurityGroupRule(w, req, "sg_001")
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422 (SG-I-5: cannot set both CIDR and source_security_group_id)", w.Code)
+	}
+
+	var errResp NetworkAPIError
+	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if errResp.Error.Code != "invalid_rule" {
+		t.Errorf("error code = %q, want invalid_rule", errResp.Error.Code)
+	}
+}
+
+func strPtr(s string) *string { return &s }

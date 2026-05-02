@@ -69,29 +69,29 @@ func (row *imageRow) Scan(dest ...any) error {
 	if len(dest) < 22 {
 		return fmt.Errorf("imageRow.Scan: need 22 dest, got %d", len(dest))
 	}
-	*dest[0].(*string)      = r.ID
-	*dest[1].(*string)      = r.Name
-	*dest[2].(*string)      = r.OSFamily
-	*dest[3].(*string)      = r.OSVersion
-	*dest[4].(*string)      = r.Architecture
-	*dest[5].(*string)      = r.OwnerID
-	*dest[6].(*string)      = r.Visibility
-	*dest[7].(*string)      = r.SourceType
-	*dest[8].(*string)      = r.StorageURL
-	*dest[9].(*int)         = r.MinDiskGB
-	*dest[10].(*string)     = r.Status
-	*dest[11].(*string)     = r.ValidationStatus
-	*dest[12].(**time.Time)  = r.DeprecatedAt
-	*dest[13].(**time.Time)  = r.ObsoletedAt
-	*dest[14].(**string)    = r.SourceSnapshotID
-	*dest[15].(**string)    = r.ImportURL
-	*dest[16].(**string)    = r.FamilyName
-	*dest[17].(**int)       = r.FamilyVersion
-	*dest[18].(*time.Time)  = r.CreatedAt
-	*dest[19].(*time.Time)  = r.UpdatedAt
+	*dest[0].(*string) = r.ID
+	*dest[1].(*string) = r.Name
+	*dest[2].(*string) = r.OSFamily
+	*dest[3].(*string) = r.OSVersion
+	*dest[4].(*string) = r.Architecture
+	*dest[5].(*string) = r.OwnerID
+	*dest[6].(*string) = r.Visibility
+	*dest[7].(*string) = r.SourceType
+	*dest[8].(*string) = r.StorageURL
+	*dest[9].(*int) = r.MinDiskGB
+	*dest[10].(*string) = r.Status
+	*dest[11].(*string) = r.ValidationStatus
+	*dest[12].(**time.Time) = r.DeprecatedAt
+	*dest[13].(**time.Time) = r.ObsoletedAt
+	*dest[14].(**string) = r.SourceSnapshotID
+	*dest[15].(**string) = r.ImportURL
+	*dest[16].(**string) = r.FamilyName
+	*dest[17].(**int) = r.FamilyVersion
+	*dest[18].(*time.Time) = r.CreatedAt
+	*dest[19].(*time.Time) = r.UpdatedAt
 	// VM-P3B Job 2: trust boundary columns.
 	*dest[20].(**string) = r.ProvenanceHash
-	*dest[21].(**bool)   = r.SignatureValid
+	*dest[21].(**bool) = r.SignatureValid
 	return nil
 }
 
@@ -119,29 +119,29 @@ func (r *imageRows) Scan(dest ...any) error {
 	if len(dest) < 22 {
 		return fmt.Errorf("imageRows.Scan: need 22 dest, got %d", len(dest))
 	}
-	*dest[0].(*string)      = row.ID
-	*dest[1].(*string)      = row.Name
-	*dest[2].(*string)      = row.OSFamily
-	*dest[3].(*string)      = row.OSVersion
-	*dest[4].(*string)      = row.Architecture
-	*dest[5].(*string)      = row.OwnerID
-	*dest[6].(*string)      = row.Visibility
-	*dest[7].(*string)      = row.SourceType
-	*dest[8].(*string)      = row.StorageURL
-	*dest[9].(*int)         = row.MinDiskGB
-	*dest[10].(*string)     = row.Status
-	*dest[11].(*string)     = row.ValidationStatus
-	*dest[12].(**time.Time)  = row.DeprecatedAt
-	*dest[13].(**time.Time)  = row.ObsoletedAt
-	*dest[14].(**string)    = row.SourceSnapshotID
-	*dest[15].(**string)    = row.ImportURL
-	*dest[16].(**string)    = row.FamilyName
-	*dest[17].(**int)       = row.FamilyVersion
-	*dest[18].(*time.Time)  = row.CreatedAt
-	*dest[19].(*time.Time)  = row.UpdatedAt
+	*dest[0].(*string) = row.ID
+	*dest[1].(*string) = row.Name
+	*dest[2].(*string) = row.OSFamily
+	*dest[3].(*string) = row.OSVersion
+	*dest[4].(*string) = row.Architecture
+	*dest[5].(*string) = row.OwnerID
+	*dest[6].(*string) = row.Visibility
+	*dest[7].(*string) = row.SourceType
+	*dest[8].(*string) = row.StorageURL
+	*dest[9].(*int) = row.MinDiskGB
+	*dest[10].(*string) = row.Status
+	*dest[11].(*string) = row.ValidationStatus
+	*dest[12].(**time.Time) = row.DeprecatedAt
+	*dest[13].(**time.Time) = row.ObsoletedAt
+	*dest[14].(**string) = row.SourceSnapshotID
+	*dest[15].(**string) = row.ImportURL
+	*dest[16].(**string) = row.FamilyName
+	*dest[17].(**int) = row.FamilyVersion
+	*dest[18].(*time.Time) = row.CreatedAt
+	*dest[19].(*time.Time) = row.UpdatedAt
 	// VM-P3B Job 2: trust boundary columns.
 	*dest[20].(**string) = row.ProvenanceHash
-	*dest[21].(**bool)   = row.SignatureValid
+	*dest[21].(**bool) = row.SignatureValid
 	return nil
 }
 
