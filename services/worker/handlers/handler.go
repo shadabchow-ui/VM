@@ -68,6 +68,15 @@ type InstanceStore interface {
 	UpdateRootDiskStatus(ctx context.Context, diskID, status string) error
 	DeleteRootDisk(ctx context.Context, diskID string) error
 	DetachRootDisk(ctx context.Context, diskID string) error
+
+	// Volume attachment operations (VM Job 8 — Volume attach/persistence gate)
+	// ListActiveAttachmentsByInstance returns all non-detached volume attachments
+	// for an instance. Used by the create handler to collect attached volumes
+	// and pass them as extra block devices to the runtime.
+	ListActiveAttachmentsByInstance(ctx context.Context, instanceID string) ([]*db.VolumeAttachmentRow, error)
+	// GetVolumeByID returns a volume row by ID. Used by the create handler to
+	// read volume storage_path for extra disk generation.
+	GetVolumeByID(ctx context.Context, id string) (*db.VolumeRow, error)
 }
 
 // ── NetworkController ─────────────────────────────────────────────────────────

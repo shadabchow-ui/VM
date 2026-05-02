@@ -375,6 +375,16 @@ func (s *server) handleCreateImageFromSnapshot(w http.ResponseWriter, r *http.Re
 	}
 
 	// 5. Return 202 using the inserted row directly.
+
+	// VM Job 10: audit event for image creation.
+	s.log.Info("audit_event",
+		"event_type", db.EventImageCreated,
+		"resource_type", "image",
+		"resource_id", imageID,
+		"source_type", "SNAPSHOT",
+		"actor", principal,
+	)
+
 	writeJSON(w, http.StatusAccepted, CreateImageFromSnapshotResponse{
 		Image: imageToResponse(imageRow),
 		JobID: jobID,
@@ -441,6 +451,16 @@ func (s *server) handleImportImage(w http.ResponseWriter, r *http.Request, req *
 	}
 
 	// 4. Return 202 using the inserted row directly.
+
+	// VM Job 10: audit event for image import.
+	s.log.Info("audit_event",
+		"event_type", db.EventImageImported,
+		"resource_type", "image",
+		"resource_id", imageID,
+		"source_type", "IMPORT",
+		"actor", principal,
+	)
+
 	writeJSON(w, http.StatusAccepted, ImportImageResponse{
 		Image: imageToResponse(imageRow),
 		JobID: jobID,
@@ -493,6 +513,15 @@ func (s *server) handleDeprecateImage(w http.ResponseWriter, r *http.Request, id
 		writeDBError(w, err)
 		return
 	}
+
+	// VM Job 10: audit event for image deprecation.
+	s.log.Info("audit_event",
+		"event_type", db.EventImageDeprecated,
+		"resource_type", "image",
+		"resource_id", id,
+		"actor", principal,
+	)
+
 	writeJSON(w, http.StatusOK, DeprecateImageResponse{Image: imageToResponse(updated)})
 }
 
@@ -537,6 +566,15 @@ func (s *server) handleObsoleteImage(w http.ResponseWriter, r *http.Request, id 
 	// changed only Status and ObsoletedAt; reflect those in-place.
 	img.Status = db.ImageStatusObsolete
 	img.ObsoletedAt = &now
+
+	// VM Job 10: audit event for image obsoletion.
+	s.log.Info("audit_event",
+		"event_type", db.EventImageObsoleted,
+		"resource_type", "image",
+		"resource_id", id,
+		"actor", principal,
+	)
+
 	writeJSON(w, http.StatusOK, ObsoleteImageResponse{Image: imageToResponse(img)})
 }
 

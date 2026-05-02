@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	defaultTimeout       = 60 * time.Second
+	defaultTimeout        = 60 * time.Second
 	createInstanceTimeout = 300 * time.Second
 )
 
@@ -49,17 +49,25 @@ type NetworkConfig struct {
 	MacAddress string `json:"mac_address"`
 }
 
+// ExtraDiskConfig describes an additional block device to attach to a VM.
+type ExtraDiskConfig struct {
+	DiskID     string `json:"disk_id"`
+	HostPath   string `json:"host_path"`
+	DeviceName string `json:"device_name"`
+}
+
 // CreateInstanceRequest matches the CreateInstanceRequest proto message.
 type CreateInstanceRequest struct {
-	InstanceID     string        `json:"instance_id"`
-	ImageURL       string        `json:"image_url"`
-	InstanceTypeID string        `json:"instance_type_id"`
-	CPUCores       int32         `json:"cpu_cores"`
-	MemoryMB       int32         `json:"memory_mb"`
-	DiskGB         int32         `json:"disk_gb"`
-	RootfsPath     string        `json:"rootfs_path"`
-	Network        NetworkConfig `json:"network"`
-	SSHPublicKey   string        `json:"ssh_public_key"`
+	InstanceID     string            `json:"instance_id"`
+	ImageURL       string            `json:"image_url"`
+	InstanceTypeID string            `json:"instance_type_id"`
+	CPUCores       int32             `json:"cpu_cores"`
+	MemoryMB       int32             `json:"memory_mb"`
+	DiskGB         int32             `json:"disk_gb"`
+	RootfsPath     string            `json:"rootfs_path"`
+	Network        NetworkConfig     `json:"network"`
+	SSHPublicKey   string            `json:"ssh_public_key"`
+	ExtraDisks     []ExtraDiskConfig `json:"extra_disks,omitempty"`
 }
 
 // CreateInstanceResponse matches the CreateInstanceResponse proto message.

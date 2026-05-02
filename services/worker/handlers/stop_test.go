@@ -44,7 +44,6 @@ func (r *fakeStopRuntime) DeleteInstance(_ context.Context, req *runtimeclient.D
 	return &runtimeclient.DeleteInstanceResponse{InstanceID: req.InstanceID, State: "DELETED"}, nil
 }
 
-
 func newTestStopHandler(store *fakeStore, net *fakeNetwork, rt RuntimeClient) *StopHandler {
 	deps := &Deps{
 		Store:        store,

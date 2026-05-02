@@ -141,19 +141,30 @@ const (
 
 	// ReasonOperatorRetired: operator explicitly retired the host.
 	// Stored as reason_code on the retiring/retired transition so the audit log
-	// shows why the host was removed from service.
-	// Does NOT set fence_required (retirement is deliberate, not an ambiguous failure).
-	// Source: vm-13-03__blueprint__ §"Emergency Retirement" operator procedure.
+	// records intent, not just a status change.
+	// Source: vm-13-03__blueprint__ §components "Fleet Management Service".
 	ReasonOperatorRetired = "OPERATOR_RETIRED"
+
+	// ReasonHostStale: host heartbeat has not been received within the
+	// degraded threshold (heartbeat staleness window > heartbeatInterval * degradedMultiplier).
+	// Stored as reason_code when a host transitions from 'ready' to 'degraded'
+	// due to stale heartbeat detection. Operator-visible so tooling can
+	// distinguish stale hosts from explicitly-degraded hosts.
+	ReasonHostStale = "HOST_STALE"
+
+	// ambiguousFenceReasonCodes is the set of reason codes that cause
+	// fence_required=TRUE when a host transitions to 'unhealthy'.
+	// These codes indicate the control plane cannot determine whether
+	// running VMs are still alive on the host, so STONITH isolation
+	// must complete before recovery automation may proceed.
 )
 
-// fenceRequiredReasons is the set of reason codes that trigger fence_required=TRUE
-// when a host transitions to 'unhealthy'. These are ambiguous failures where the
-// control plane cannot confirm the host is powered off, so VMs may still be
-// running — a split-brain risk if recovery automation were to start immediately.
-//
-// Source: vm-13-03__blueprint__ §"Fencing Decision Logic".
-var fenceRequiredReasons = map[string]bool{
+// ambiguousFenceReasonCodes is the set of reason codes that cause
+// fence_required=TRUE when a host transitions to 'unhealthy'.
+// These codes indicate the control plane cannot determine whether
+// running VMs are still alive on the host, so STONITH isolation
+// must complete before recovery automation may proceed.
+var ambiguousFenceReasonCodes = map[string]bool{
 	ReasonAgentUnresponsive:  true,
 	ReasonHypervisorFailed:   true,
 	ReasonNetworkUnreachable: true,
@@ -264,9 +275,9 @@ type HostRecord struct {
 	ID               string
 	AvailabilityZone string
 	Status           string
-	Generation       int64   // optimistic concurrency counter; incremented on every status CAS
-	DrainReason      *string // operator-supplied drain reason; nil if not set
-	ReasonCode       *string // machine-readable reason for current non-ready state; nil if ready
+	Generation       int64      // optimistic concurrency counter; incremented on every status CAS
+	DrainReason      *string    // operator-supplied drain reason; nil if not set
+	ReasonCode       *string    // machine-readable reason for current non-ready state; nil if ready
 	FenceRequired    bool       // TRUE when fence_required=TRUE: fencing must complete before recovery
 	RetiredAt        *time.Time // wall-clock time host transitioned to 'retired'; nil until then
 	TotalCPU         int
@@ -342,6 +353,26 @@ func (r *Repo) UpdateHeartbeat(ctx context.Context, hostID string, usedCPU, used
 	return nil
 }
 
+// SwitchToHeartbeat stores the host's boot_id and returns the previous boot_id
+// so the caller can detect a host reboot (boot_id change = host restarted).
+// If the boot_id changed and the previous was non-empty, the host has rebooted
+// and all VMs that were running on it are presumed lost.
+//
+// VM Job 9: boot_id change detection is a safety signal — a reboot event means
+// any previously-running VMs on this host are gone. The reconciler must handle
+// this by classifying those VMs as failed (host reboot = unambiguous failure).
+func (r *Repo) UpdateHeartbeatBootID(ctx context.Context, hostID, bootID string) (previousBootID string, err error) {
+	row := r.pool.QueryRow(ctx, `SELECT boot_id FROM hosts WHERE id = $1`, hostID)
+	if err := row.Scan(&previousBootID); err != nil {
+		return "", fmt.Errorf("UpdateHeartbeatBootID select: %w", err)
+	}
+	_, err = r.pool.Exec(ctx, `UPDATE hosts SET boot_id = $2, updated_at = NOW() WHERE id = $1`, hostID, bootID)
+	if err != nil {
+		return previousBootID, fmt.Errorf("UpdateHeartbeatBootID update: %w", err)
+	}
+	return previousBootID, nil
+}
+
 // GetAvailableHosts returns all ready hosts with a recent heartbeat.
 // VM-P2E Slice 2: scans generation and drain_reason alongside existing columns.
 // VM-P2E Slice 3: scans reason_code and fence_required.
@@ -374,6 +405,51 @@ func (r *Repo) GetAvailableHosts(ctx context.Context) ([]*HostRecord, error) {
 			&h.AgentVersion, &h.LastHeartbeatAt, &h.RegisteredAt, &h.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("GetAvailableHosts scan: %w", err)
+		}
+		hosts = append(hosts, h)
+	}
+	return hosts, rows.Err()
+}
+
+// GetStaleHosts returns ready hosts whose heartbeat is older than the staleness threshold.
+//
+// Staleness threshold: 90 seconds (3 × heartbeatInterval of 30s).
+// These hosts are still status=ready but have silently stopped heartbeating.
+// They are excluded from GetAvailableHosts by the heartbeat timestamp filter;
+// this query exposes them explicitly so operators can see which hosts need attention.
+//
+// This is a pure read — no status transitions are performed.
+// The operator explicitly marks stale hosts degraded via POST .../degraded.
+//
+// Source: VM Job 9 — host fleet operations + failure recovery gate.
+func (r *Repo) GetStaleHosts(ctx context.Context) ([]*HostRecord, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id, availability_zone, status,
+		       generation, drain_reason, reason_code, fence_required, retired_at,
+		       total_cpu, total_memory_mb, total_disk_gb,
+		       used_cpu, used_memory_mb, used_disk_gb,
+		       agent_version, last_heartbeat_at, registered_at, updated_at
+		FROM hosts
+		WHERE status = 'ready'
+		  AND last_heartbeat_at <= NOW() - INTERVAL '90 seconds'
+		ORDER BY last_heartbeat_at ASC NULLS FIRST
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("GetStaleHosts: %w", err)
+	}
+	defer rows.Close()
+
+	var hosts []*HostRecord
+	for rows.Next() {
+		h := &HostRecord{}
+		if err := rows.Scan(
+			&h.ID, &h.AvailabilityZone, &h.Status,
+			&h.Generation, &h.DrainReason, &h.ReasonCode, &h.FenceRequired, &h.RetiredAt,
+			&h.TotalCPU, &h.TotalMemoryMB, &h.TotalDiskGB,
+			&h.UsedCPU, &h.UsedMemoryMB, &h.UsedDiskGB,
+			&h.AgentVersion, &h.LastHeartbeatAt, &h.RegisteredAt, &h.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("GetStaleHosts scan: %w", err)
 		}
 		hosts = append(hosts, h)
 	}
@@ -490,7 +566,8 @@ func (r *Repo) UpdateHostStatus(ctx context.Context, hostID string, fromGenerati
 // because the WHERE clause requires status='draining', which will no longer match.
 //
 // Source: vm-13-03__blueprint__ §core_contracts "Host State Atomicity",
-//         §interaction_or_ops_contract "Operator confirms drain complete".
+//
+//	§interaction_or_ops_contract "Operator confirms drain complete".
 func (r *Repo) MarkHostDrained(ctx context.Context, hostID string, fromGeneration int64) (activeCount int, updated bool, err error) {
 	// Step 1: count active workload. Do this before the CAS attempt so we
 	// can return an informative count to the caller.
@@ -534,7 +611,8 @@ func (r *Repo) MarkHostDrained(ctx context.Context, hostID string, fromGeneratio
 // Returns (false, err) on DB error or illegal transition.
 //
 // Source: vm-13-03__blueprint__ §implementation_decisions
-//         "Introduce a DEGRADED state to precede the terminal UNHEALTHY state".
+//
+//	"Introduce a DEGRADED state to precede the terminal UNHEALTHY state".
 func (r *Repo) MarkHostDegraded(ctx context.Context, hostID string, fromGeneration int64, fromStatus, reasonCode string) (bool, error) {
 	if err := ValidateHostTransition(fromStatus, "degraded"); err != nil {
 		return false, err
@@ -566,7 +644,7 @@ func (r *Repo) MarkHostDegraded(ctx context.Context, hostID string, fromGenerati
 // Valid fromStatuses: ready, draining, degraded (see legalTransitions).
 // The transition is generation-checked.
 //
-// fence_required is set to TRUE when reasonCode is in the fenceRequiredReasons
+// fence_required is set to TRUE when reasonCode is in the ambiguousFenceReasonCodes
 // set (AGENT_UNRESPONSIVE, HYPERVISOR_FAILED, NETWORK_UNREACHABLE). For all
 // other reason codes, fence_required remains FALSE.
 //
@@ -581,13 +659,14 @@ func (r *Repo) MarkHostDegraded(ctx context.Context, hostID string, fromGenerati
 //   - (false,      false, err): DB error or illegal transition.
 //
 // Source: vm-13-03__blueprint__ §"Fencing Decision Logic",
-//         §"Fencing Controller" (fence_required flag is the seam for Slice 4).
+//
+//	§"Fencing Controller" (fence_required flag is the seam for Slice 4).
 func (r *Repo) MarkHostUnhealthy(ctx context.Context, hostID string, fromGeneration int64, fromStatus, reasonCode string) (fenceRequired bool, updated bool, err error) {
 	if err := ValidateHostTransition(fromStatus, "unhealthy"); err != nil {
 		return false, false, err
 	}
 
-	fenceRequired = fenceRequiredReasons[reasonCode]
+	fenceRequired = ambiguousFenceReasonCodes[reasonCode]
 
 	var reasonVal interface{}
 	if reasonCode != "" {
@@ -742,7 +821,8 @@ func (r *Repo) CountActiveInstancesOnHost(ctx context.Context, hostID string) (i
 //   - (0, false, err):   DB error or illegal transition.
 //
 // Source: vm-13-03__blueprint__ §"Emergency Retirement" and
-//         §core_contracts "Stopped Instance Ephemerality".
+//
+//	§core_contracts "Stopped Instance Ephemerality".
 func (r *Repo) MarkHostRetiring(ctx context.Context, hostID string, fromGeneration int64, fromStatus, reasonCode string) (activeCount int, updated bool, err error) {
 	if err := ValidateHostTransition(fromStatus, "retiring"); err != nil {
 		return 0, false, err
@@ -793,7 +873,8 @@ func (r *Repo) MarkHostRetiring(ctx context.Context, hostID string, fromGenerati
 // Returns (false, err) on DB error.
 //
 // Source: vm-13-03__blueprint__ §"Operator Procedures for Maintenance and
-//         Emergency Retirement", §"RETIRED state — terminal".
+//
+//	Emergency Retirement", §"RETIRED state — terminal".
 func (r *Repo) MarkHostRetired(ctx context.Context, hostID string, fromGeneration int64) (bool, error) {
 	res, err := r.pool.Exec(ctx, `
 		UPDATE hosts
@@ -822,7 +903,8 @@ func (r *Repo) MarkHostRetired(ctx context.Context, hostID string, fromGeneratio
 // This is a pure read — no state mutations.
 //
 // Source: vm-13-03__blueprint__ §"Capacity Rebalancing and Spare-Capacity Strategy",
-//         §components "Capacity Manager" (Slice 5+ seam).
+//
+//	§components "Capacity Manager" (Slice 5+ seam).
 func (r *Repo) GetRetiredHosts(ctx context.Context) ([]*HostRecord, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, availability_zone, status,
@@ -893,11 +975,11 @@ var ErrCampaignNoTargets = fmt.Errorf("campaign must have at least one target ho
 type CampaignRecord struct {
 	ID               string
 	CampaignReason   string
-	TargetHostIDs    []string   // full list of hosts submitted; immutable after creation
-	CompletedHostIDs []string   // hosts whose action succeeded
-	FailedHostIDs    []string   // hosts whose action failed; Slice 6 recovery seam
-	MaxParallel      int        // blast-radius limit; immutable after creation
-	Status           string     // pending | running | paused | completed | cancelled
+	TargetHostIDs    []string // full list of hosts submitted; immutable after creation
+	CompletedHostIDs []string // hosts whose action succeeded
+	FailedHostIDs    []string // hosts whose action failed; Slice 6 recovery seam
+	MaxParallel      int      // blast-radius limit; immutable after creation
+	Status           string   // pending | running | paused | completed | cancelled
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 }
@@ -1055,12 +1137,13 @@ func (r *Repo) ListCampaigns(ctx context.Context, statuses []string) ([]*Campaig
 // UpdateCampaignStatus updates the campaign status.
 //
 // Valid transitions:
-//   pending   → running   (first advance)
-//   running   → paused    (operator pause)
-//   paused    → running   (operator resume)
-//   running   → completed (all hosts done)
-//   running   → cancelled (operator cancel)
-//   paused    → cancelled (operator cancel while paused)
+//
+//	pending   → running   (first advance)
+//	running   → paused    (operator pause)
+//	paused    → running   (operator resume)
+//	running   → completed (all hosts done)
+//	running   → cancelled (operator cancel)
+//	paused    → cancelled (operator cancel while paused)
 //
 // Returns (true, nil) on success.
 // Returns (false, nil) when the campaign was not found or status unchanged.

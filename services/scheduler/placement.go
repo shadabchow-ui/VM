@@ -27,6 +27,7 @@ type HostSummary struct {
 	ID               string `json:"id"`
 	AvailabilityZone string `json:"availability_zone"`
 	Status           string `json:"status"`
+	FenceRequired    bool   `json:"fence_required"`
 	TotalCPU         int    `json:"total_cpu"`
 	TotalMemoryMB    int    `json:"total_memory_mb"`
 	TotalDiskGB      int    `json:"total_disk_gb"`
@@ -35,7 +36,7 @@ type HostSummary struct {
 	UsedDiskGB       int    `json:"used_disk_gb"`
 }
 
-func (h *HostSummary) AvailableCPU() int     { return h.TotalCPU - h.UsedCPU }
+func (h *HostSummary) AvailableCPU() int      { return h.TotalCPU - h.UsedCPU }
 func (h *HostSummary) AvailableMemoryMB() int { return h.TotalMemoryMB - h.UsedMemoryMB }
 func (h *HostSummary) AvailableDiskGB() int   { return h.TotalDiskGB - h.UsedDiskGB }
 
@@ -44,16 +45,26 @@ func (h *HostSummary) AvailableDiskGB() int   { return h.TotalDiskGB - h.UsedDis
 // VM-P2E Slice 1: draining, drained, degraded, unhealthy, fenced, retired, offline,
 // and maintenance hosts are ALL excluded from placement. Only status=ready qualifies.
 //
-// This matches ListReadyHosts on the DB side — the scheduler's admission filter and
-// the DB query must agree on which statuses are schedulable.
+// VM Job 9: added fence_required defense-in-depth check. Even if a host somehow
+// appears with status=ready AND fence_required=true, placement is denied.
+// The DB query (GetAvailableHosts) already excludes non-ready hosts, but the
+// scheduler double-checks here so no single layer failure can bypass the gate.
 //
 // Source: vm-13-03__blueprint__ §core_contracts "Host State Atomicity" (drain must be
-//         immediately visible to scheduler), 05-02 §Placement.
+//
+//	immediately visible to scheduler), 05-02 §Placement.
 func (h *HostSummary) CanFit(cpuCores, memoryMB, diskGB int) bool {
 	// Only status=ready hosts receive new placements.
 	// Draining hosts that were ready before the drain command must stop receiving
 	// new VMs immediately — the status change is the admission gate.
 	if h.Status != "ready" {
+		return false
+	}
+	// Defense-in-depth: fence_required=TRUE hosts must never receive placements.
+	// The DB GetAvailableHosts query only returns status=ready hosts; fence_required
+	// should be FALSE for ready hosts, but this check protects against any edge case
+	// where a host could be ready AND fence_required simultaneously.
+	if h.FenceRequired {
 		return false
 	}
 	return h.AvailableCPU() >= cpuCores &&

@@ -196,10 +196,10 @@ func TestLifecycle_Create_Stop_Start_Reboot_Delete(t *testing.T) {
 	// Full golden path: create → stop → start → reboot → delete
 	// Seed retained IP after create so stop and start both find it via GetIPByInstance.
 	steps := []struct {
-		name   string
-		setup  func() // optional pre-step hook
-		exec   func() error
-		want   string
+		name  string
+		setup func() // optional pre-step hook
+		exec  func() error
+		want  string
 	}{
 		{
 			name:  "create",

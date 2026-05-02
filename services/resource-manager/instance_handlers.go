@@ -579,8 +579,19 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		resp.PublicIP = nil
 	}
 
+	// VM Job 10: deprecated image launch warning.
+	// When the selected image is DEPRECATED, emit a warning so the caller
+	// knows the image is still launchable but should migrate.
+	var warnings []string
+	if img != nil && img.Status == db.ImageStatusDeprecated {
+		warnings = append(warnings, "Image '"+req.ImageID+"' is deprecated. "+
+			"Deprecated images are still launchable but will be removed in a future release. "+
+			"Please migrate to a newer image or switch to an image family alias.")
+	}
+
 	writeJSON(w, http.StatusAccepted, CreateInstanceResponse{
 		Instance: resp,
+		Warnings: warnings,
 	})
 }
 

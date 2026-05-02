@@ -417,13 +417,13 @@ func TestFenceRequiredReasons_AmbiguousSet(t *testing.T) {
 		ReasonOperatorUnhealthy,
 	}
 	for reason, expected := range expectedFence {
-		if fenceRequiredReasons[reason] != expected {
-			t.Errorf("fenceRequiredReasons[%q] = %v, want %v", reason, fenceRequiredReasons[reason], expected)
+		if ambiguousFenceReasonCodes[reason] != expected {
+			t.Errorf("ambiguousFenceReasonCodes[%q] = %v, want %v", reason, ambiguousFenceReasonCodes[reason], expected)
 		}
 	}
 	for _, reason := range expectedNoFence {
-		if fenceRequiredReasons[reason] {
-			t.Errorf("fenceRequiredReasons[%q] = true, want false", reason)
+		if ambiguousFenceReasonCodes[reason] {
+			t.Errorf("ambiguousFenceReasonCodes[%q] = true, want false", reason)
 		}
 	}
 }

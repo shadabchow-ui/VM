@@ -185,6 +185,7 @@ func (s *server) handleListHosts(w http.ResponseWriter, r *http.Request) {
 		ID               string `json:"id"`
 		AvailabilityZone string `json:"availability_zone"`
 		Status           string `json:"status"`
+		FenceRequired    bool   `json:"fence_required"`
 		TotalCPU         int    `json:"total_cpu"`
 		TotalMemoryMB    int    `json:"total_memory_mb"`
 		TotalDiskGB      int    `json:"total_disk_gb"`
@@ -199,6 +200,7 @@ func (s *server) handleListHosts(w http.ResponseWriter, r *http.Request) {
 			ID:               h.ID,
 			AvailabilityZone: h.AvailabilityZone,
 			Status:           h.Status,
+			FenceRequired:    h.FenceRequired,
 			TotalCPU:         h.TotalCPU,
 			TotalMemoryMB:    h.TotalMemoryMB,
 			TotalDiskGB:      h.TotalDiskGB,

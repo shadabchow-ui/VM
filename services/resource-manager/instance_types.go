@@ -100,9 +100,11 @@ type CreateInstanceRequest struct {
 }
 
 // CreateInstanceResponse is returned from POST /v1/instances with 202 Accepted.
+// VM Job 10: added Warnings field for deprecated image launch notifications.
 // Source: 08-01 §CreateInstance response.
 type CreateInstanceResponse struct {
 	Instance InstanceResponse `json:"instance"`
+	Warnings []string         `json:"warnings,omitempty"`
 }
 
 // ── List ──────────────────────────────────────────────────────────────────────

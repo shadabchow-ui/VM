@@ -150,10 +150,10 @@ func TestP3C_RolloutGate_ConcurrentAccess_NoRace(t *testing.T) {
 // p3cFakePool is a minimal db.Pool for dispatcher gate tests.
 type p3cFakePool struct {
 	mu               sync.Mutex
-	execCalls        int         // total Exec calls
-	insertJobCalls   int         // INSERT INTO jobs calls
-	updateStateCalls int         // UPDATE instances calls
-	countResult      int         // HasActivePendingJob result
+	execCalls        int // total Exec calls
+	insertJobCalls   int // INSERT INTO jobs calls
+	updateStateCalls int // UPDATE instances calls
+	countResult      int // HasActivePendingJob result
 }
 
 func (p *p3cFakePool) Exec(_ context.Context, query string, _ ...any) (db.CommandTag, error) {

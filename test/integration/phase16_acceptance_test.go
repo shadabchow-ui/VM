@@ -34,9 +34,9 @@ package integration
 //         P2_M1_GATE_CHECKLIST §Q-1, §DB-1, §REG-1.
 
 import (
-	_ "github.com/lib/pq"
 	"context"
 	"fmt"
+	_ "github.com/lib/pq"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -71,7 +71,8 @@ func TestPhase16_Healthz_DBReachable(t *testing.T) {
 // header contract using an in-process httptest server.
 //
 // Source: vm-16-03__blueprint__ §implementation_decisions "date-based versioning",
-//         vm-16-03__research__ §"API Compatibility, Versioning, and Deprecation Policy".
+//
+//	vm-16-03__research__ §"API Compatibility, Versioning, and Deprecation Policy".
 func TestPhase16_APIVersion_HeaderContract(t *testing.T) {
 	// Build a minimal test server that mimics the versioning middleware.
 	// We use an httptest.Server rather than a full resource-manager to keep
@@ -346,7 +347,8 @@ func TestPhase16_InstanceStateMachine_DBRoundTrip(t *testing.T) {
 // IMPLEMENTATION_PLAN_V1 §R-17.
 //
 // Source: EVENTS_SCHEMA_V1 §4 (usage.start / usage.end event types),
-//         IMPLEMENTATION_PLAN_V1 §R-17.
+//
+//	IMPLEMENTATION_PLAN_V1 §R-17.
 func TestPhase16_UsageEvents_WrittenOnStateChange(t *testing.T) {
 	ctx := context.Background()
 	repo := testRepo(t)

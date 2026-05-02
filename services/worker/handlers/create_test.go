@@ -32,7 +32,7 @@ type fakeStore struct {
 	instances map[string]*db.InstanceRow
 	events    []*db.EventRow
 	hosts     []*db.HostRecord
-	ips       map[string]string // instanceID → ip
+	ips       map[string]string          // instanceID → ip
 	rootDisks map[string]*db.RootDiskRow // diskID → disk (M10 Slice 3)
 }
 
@@ -199,6 +199,16 @@ func (s *fakeStore) SoftDeleteNetworkInterface(_ context.Context, _ string) erro
 	return nil // no-op: NIC state tracking is in fakeNICStore
 }
 
+// ── Volume attachment stubs (VM Job 8) ───────────────────────────────────────
+
+func (s *fakeStore) ListActiveAttachmentsByInstance(_ context.Context, _ string) ([]*db.VolumeAttachmentRow, error) {
+	return nil, nil // no active attachments in plain fakeStore
+}
+
+func (s *fakeStore) GetVolumeByID(_ context.Context, _ string) (*db.VolumeRow, error) {
+	return nil, nil // no volumes seeded in plain fakeStore
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // eventTypes returns the list of event types written so far (for assertions).
@@ -269,10 +279,10 @@ func (n *fakeNetwork) ReleaseIP(_ context.Context, ip, _, _ string) error {
 // ── fakeRuntimeClient — implements RuntimeClient ──────────────────────────────
 
 type fakeRuntime struct {
-	mu             sync.Mutex
-	createFail     bool
-	deletedInsts   []string
-	lastDeleteReq  *runtimeclient.DeleteInstanceRequest // M10 Slice 3: capture delete flags
+	mu            sync.Mutex
+	createFail    bool
+	deletedInsts  []string
+	lastDeleteReq *runtimeclient.DeleteInstanceRequest // M10 Slice 3: capture delete flags
 }
 
 func (r *fakeRuntime) CreateInstance(_ context.Context, req *runtimeclient.CreateInstanceRequest) (*runtimeclient.CreateInstanceResponse, error) {
@@ -322,10 +332,10 @@ func newRequestedInstance(id string) *db.InstanceRow {
 	return &db.InstanceRow{
 		ID: id, Name: "test-vm",
 		OwnerPrincipalID: "00000000-0000-0000-0000-000000000001",
-		VMState: "requested", InstanceTypeID: "c1.small",
-		ImageID: "00000000-0000-0000-0000-000000000010",
+		VMState:          "requested", InstanceTypeID: "c1.small",
+		ImageID:          "00000000-0000-0000-0000-000000000010",
 		AvailabilityZone: "us-east-1a",
-		Version: 0, CreatedAt: now, UpdatedAt: now,
+		Version:          0, CreatedAt: now, UpdatedAt: now,
 	}
 }
 

@@ -148,3 +148,54 @@ func TestDryRunPID_OutsideLinuxPIDRange(t *testing.T) {
 			dryRunPID, maxLinuxPID)
 	}
 }
+
+// TestFirecracker_ExtraDisks_ReturnsError verifies that FirecrackerManager.Create
+// returns a clear unsupported error when InstanceSpec has ExtraDisks.
+// The Firecracker backend does not support additional block devices.
+func TestFirecracker_ExtraDisks_ReturnsError(t *testing.T) {
+	t.Setenv("FIRECRACKER_DRY_RUN", "true")
+	mgr := newDryRunFirecrackerManager(t)
+
+	spec := InstanceSpec{
+		InstanceID: "inst-fc-extras",
+		CPUCores:   2,
+		MemoryMB:   4096,
+		RootfsPath: "/tmp/test.qcow2",
+		ExtraDisks: []ExtraDisk{
+			{DiskID: "vol-data1", HostPath: "/path/to/disk.img", DeviceName: "/dev/vdb"},
+		},
+	}
+
+	_, err := mgr.Create(context.Background(), spec)
+	if err == nil {
+		t.Fatal("expected error for extra disks on Firecracker, got nil")
+	}
+	if err.Error() == "" {
+		t.Error("error message is empty")
+	}
+	t.Logf("Firecracker extra-disk error: %v", err)
+}
+
+// TestFirecracker_NoExtraDisks_Succeeds verifies that FirecrackerManager.Create
+// succeeds when no ExtraDisks are present (existing behaviour preserved).
+func TestFirecracker_NoExtraDisks_Succeeds(t *testing.T) {
+	t.Setenv("FIRECRACKER_DRY_RUN", "true")
+	mgr := newDryRunFirecrackerManager(t)
+
+	spec := InstanceSpec{
+		InstanceID: "inst-fc-noextras",
+		CPUCores:   2,
+		MemoryMB:   4096,
+		RootfsPath: "/tmp/test.qcow2",
+		TapDevice:  "tap-noextras",
+		MacAddress: "02:00:00:00:00:FC",
+	}
+
+	info, err := mgr.Create(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("Create without ExtraDisks: %v", err)
+	}
+	if info.State != "RUNNING" {
+		t.Errorf("expected RUNNING state, got %q", info.State)
+	}
+}

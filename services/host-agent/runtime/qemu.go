@@ -55,10 +55,11 @@ const (
 
 // QemuManager implements VMRuntime using QEMU/KVM.
 type QemuManager struct {
-	artifacts *ArtifactManager
-	console   *ConsoleLogger
-	dryRun    bool // QEMU_DRY_RUN=true: skip binary launch
-	log       *slog.Logger
+	artifacts   *ArtifactManager
+	console     *ConsoleLogger
+	configDrive *ConfigDriveManager
+	dryRun      bool // QEMU_DRY_RUN=true: skip binary launch
+	log         *slog.Logger
 }
 
 // NewQemuManager constructs a QemuManager.
@@ -69,10 +70,11 @@ func NewQemuManager(dataRoot string, log *slog.Logger) *QemuManager {
 		log = slog.Default()
 	}
 	return &QemuManager{
-		artifacts: artifacts,
-		console:   NewConsoleLogger(artifacts),
-		dryRun:    os.Getenv("QEMU_DRY_RUN") == "true",
-		log:       log,
+		artifacts:   artifacts,
+		console:     NewConsoleLogger(artifacts),
+		configDrive: NewConfigDriveManager(artifacts),
+		dryRun:      os.Getenv("QEMU_DRY_RUN") == "true",
+		log:         log,
 	}
 }
 
@@ -101,6 +103,21 @@ func (q *QemuManager) Create(ctx context.Context, spec InstanceSpec) (*RuntimeIn
 	// Ensure instance directory.
 	if err := q.artifacts.EnsureInstanceDir(spec.InstanceID); err != nil {
 		return nil, fmt.Errorf("QemuManager.Create: %w", err)
+	}
+
+	// Generate cloud-init config-drive seed ISO (best-effort).
+	if spec.SSHPublicKey != "" {
+		seedPath, seedErr := q.configDrive.GenerateSeed(spec.InstanceID, CloudInitConfig{
+			InstanceID:   spec.InstanceID,
+			Hostname:     spec.InstanceID,
+			SSHPublicKey: spec.SSHPublicKey,
+		})
+		if seedErr != nil {
+			q.log.Warn("cloud-init seed generation failed — VM will boot without config-drive",
+				"instance_id", spec.InstanceID, "error", seedErr)
+		} else {
+			q.log.Info("cloud-init seed ISO generated", "instance_id", spec.InstanceID, "path", seedPath)
+		}
 	}
 
 	// Build QEMU command.
@@ -289,6 +306,30 @@ func (q *QemuManager) buildQEMUArgs(spec InstanceSpec) ([]string, error) {
 	if spec.KernelPath != "" {
 		args = append(args, "-kernel", spec.KernelPath)
 		args = append(args, "-append", fmt.Sprintf("console=ttyS0 ip=%s:::255.255.255.0::eth0:off", spec.PrivateIP))
+	}
+
+	// Cloud-init config-drive seed ISO if present.
+	seedPath := q.configDrive.SeedPath(spec.InstanceID)
+	if _, err := os.Stat(seedPath); err == nil {
+		args = append(args,
+			"-drive", fmt.Sprintf("file=%s,if=virtio,media=cdrom", seedPath),
+		)
+	}
+
+	// Extra block devices from attached volumes.
+	// Each volume maps to a virtio-blk drive with a deterministic serial.
+	for _, d := range spec.ExtraDisks {
+		if d.HostPath == "" {
+			continue
+		}
+		serial := "vol-" + d.DiskID
+		if len(serial) > 31 {
+			serial = serial[:31]
+		}
+		args = append(args,
+			"-drive",
+			fmt.Sprintf("file=%s,if=virtio,format=qcow2,serial=%s", d.HostPath, serial),
+		)
 	}
 
 	return args, nil

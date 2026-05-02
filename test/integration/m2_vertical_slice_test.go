@@ -32,8 +32,8 @@ import (
 
 	"github.com/compute-platform/compute-platform/internal/db"
 	"github.com/compute-platform/compute-platform/packages/idgen"
-	"github.com/compute-platform/compute-platform/services/worker/handlers"
 	runtimeclient "github.com/compute-platform/compute-platform/packages/runtime-client"
+	"github.com/compute-platform/compute-platform/services/worker/handlers"
 )
 
 // ── Integration-level fakes ───────────────────────────────────────────────────
@@ -400,9 +400,9 @@ func TestM2_CreateHandler_NoHosts_TransitionsToFailed(t *testing.T) {
 		ID: noHostInstID, Name: "no-host-test",
 		OwnerPrincipalID: "00000000-0000-0000-0000-000000000001",
 		VMState:          "requested", InstanceTypeID: "c1.small",
-		ImageID: "00000000-0000-0000-0000-000000000010",
+		ImageID:          "00000000-0000-0000-0000-000000000010",
 		AvailabilityZone: "az-with-no-hosts",
-		Version: 0, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		Version:          0, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	if err := repo.InsertInstance(ctx, noHostInst); err != nil {
 		t.Fatalf("InsertInstance: %v", err)

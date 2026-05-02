@@ -166,9 +166,40 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	h.writeEvent(ctx, inst.ID, db.EventIPAllocated, "IP allocated: "+allocatedIP)
 	log.Info("step4: IP allocated", "ip", allocatedIP)
 
-	// ── Step 5: CreateInstance on Host Agent ──────────────────────────────────
+	// ── Step 5: Collect volume attachments and CreateInstance on Host Agent ──
 	hostAddr := selectedHost.ID + ":50051"
 	rtClient := h.runtimeFactory(selectedHost.ID, hostAddr)
+
+	// Collect active volume attachments (VM Job 8 — Volume attach/persistence gate).
+	// Attached volumes that have a storage_path are passed as extra block devices
+	// to the runtime so the guest sees them at boot.
+	attachments, attErr := h.deps.Store.ListActiveAttachmentsByInstance(ctx, inst.ID)
+	if attErr != nil {
+		// Non-fatal: log and continue without extra disks.
+		h.log.Error("Step5: ListActiveAttachmentsByInstance failed — non-fatal, skipping extra disks",
+			"instance_id", inst.ID, "error", attErr)
+		attachments = nil
+	}
+
+	var extraDisks []runtimeclient.ExtraDiskConfig
+	for _, att := range attachments {
+		// Derive host path from the volume's recorded storage_path.
+		vol, volErr := h.deps.Store.GetVolumeByID(ctx, att.VolumeID)
+		if volErr != nil || vol == nil || vol.StoragePath == nil || *vol.StoragePath == "" {
+			h.log.Warn("Step5: volume storage path missing — skipping extra disk",
+				"volume_id", att.VolumeID, "error", volErr)
+			continue
+		}
+		extraDisks = append(extraDisks, runtimeclient.ExtraDiskConfig{
+			DiskID:     att.VolumeID,
+			HostPath:   *vol.StoragePath,
+			DeviceName: att.DevicePath,
+		})
+	}
+	if len(extraDisks) > 0 {
+		h.log.Info("Step5: collected extra block devices for attached volumes",
+			"instance_id", inst.ID, "count", len(extraDisks))
+	}
 
 	createReq := &runtimeclient.CreateInstanceRequest{
 		InstanceID:     inst.ID,
@@ -185,6 +216,7 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 			TapDevice:  "tap-" + inst.ID[:8],
 			MacAddress: deriveMACAddress(inst.ID),
 		},
+		ExtraDisks: extraDisks,
 	}
 	if _, err := rtClient.CreateInstance(ctx, createReq); err != nil {
 		// Rollback: release IP, then fail instance.

@@ -28,6 +28,16 @@ type heartbeatPayload struct {
 	UsedMemoryMB int    `json:"used_memory_mb"`
 	UsedDiskGB   int    `json:"used_disk_gb"`
 	AgentVersion string `json:"agent_version"`
+	// HealthOK reports whether the agent considers its local runtime healthy.
+	// If false, the Resource Manager may mark the host degraded.
+	HealthOK bool `json:"health_ok"`
+	// BootID is the host's boot identifier (/proc/sys/kernel/random/boot_id).
+	// If the boot_id changes, the host rebooted — all previously-running VMs
+	// on this host are now presumed lost. Sent on every heartbeat.
+	BootID string `json:"boot_id,omitempty"`
+	// VMLoad is the number of running VM processes reported by the local runtime.
+	// Sent on every heartbeat so the control plane can cross-check its DB view.
+	VMLoad int `json:"vm_load"`
 }
 
 // HeartbeatLoop sends a heartbeat every 30 seconds.
@@ -58,6 +68,9 @@ func sendHeartbeat(ctx context.Context, cfg agentConfig, client *http.Client, lo
 		UsedMemoryMB: measureUsedMemoryMB(),
 		UsedDiskGB:   measureUsedDiskGB(),
 		AgentVersion: cfg.AgentVersion,
+		HealthOK:     measureHealthOK(),
+		BootID:       readBootID(),
+		VMLoad:       countRunningVMs(),
 	}
 
 	body, err := json.Marshal(payload)
@@ -117,3 +130,21 @@ func measureUsedMemoryMB() int {
 // measureUsedDiskGB returns current disk usage.
 // Phase 1: return 0. Phase 2: syscall.Statfs("/").
 func measureUsedDiskGB() int { return 0 }
+
+// measureHealthOK returns whether the agent considers its local runtime healthy.
+// Phase 1: always true (health probes are M4). Phase 2: check firecracker daemon pid.
+func measureHealthOK() bool { return true }
+
+// readBootID reads the host's boot identifier from /proc/sys/kernel/random/boot_id.
+// Returns empty string if unreadable (non-Linux or permission denied).
+func readBootID() string {
+	data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// countRunningVMs returns the count of running Firecracker VM processes.
+// Phase 1: return 0. Phase 2: scan pid files in the instance directory.
+func countRunningVMs() int { return 0 }

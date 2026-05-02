@@ -21,9 +21,9 @@ import (
 // ── fakeStartRuntime — controls CreateInstance failure ───────────────────────
 
 type fakeStartRuntime struct {
-	createFail     bool
-	createCalled   []string
-	deletedInsts   []string
+	createFail   bool
+	createCalled []string
+	deletedInsts []string
 }
 
 func (r *fakeStartRuntime) CreateInstance(_ context.Context, req *runtimeclient.CreateInstanceRequest) (*runtimeclient.CreateInstanceResponse, error) {

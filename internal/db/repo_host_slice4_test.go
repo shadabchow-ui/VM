@@ -308,8 +308,8 @@ func TestReasonOperatorRetired_Defined(t *testing.T) {
 	}
 	// Confirm it is not in the fence-required set
 	// (retirement is deliberate; fence_required must not be set).
-	if fenceRequiredReasons[ReasonOperatorRetired] {
-		t.Error("ReasonOperatorRetired must not be in fenceRequiredReasons")
+	if ambiguousFenceReasonCodes[ReasonOperatorRetired] {
+		t.Error("ReasonOperatorRetired must not be in ambiguousFenceReasonCodes")
 	}
 }
 

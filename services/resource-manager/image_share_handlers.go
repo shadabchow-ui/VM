@@ -136,6 +136,16 @@ func (s *server) handleGrantImageAccess(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	// VM Job 10: audit event for image grant.
+	s.log.Info("audit_event",
+		"event_type", db.EventImageGranted,
+		"resource_type", "image_grant",
+		"resource_id", grantID,
+		"image_id", imageID,
+		"grantee", req.GranteePrincipalID,
+		"actor", principal,
+	)
+
 	writeJSON(w, http.StatusOK, GrantImageAccessResponse{
 		Grant: imageGrantToResponse(actual),
 	})
@@ -170,6 +180,15 @@ func (s *server) handleRevokeImageAccess(w http.ResponseWriter, r *http.Request,
 		writeDBError(w, err)
 		return
 	}
+
+	// VM Job 10: audit event for image grant revocation.
+	s.log.Info("audit_event",
+		"event_type", db.EventImageRevoked,
+		"resource_type", "image_grant",
+		"image_id", imageID,
+		"grantee", granteePrincipalID,
+		"actor", principal,
+	)
 
 	writeJSON(w, http.StatusOK, RevokeImageAccessResponse{Revoked: revoked})
 }

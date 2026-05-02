@@ -66,6 +66,11 @@ func (m *ArtifactManager) ConsolePath(instanceID string) string {
 	return filepath.Join(m.InstanceDir(instanceID), "console.log")
 }
 
+// SeedPath returns the cloud-init config-drive seed ISO path for an instance.
+func (m *ArtifactManager) SeedPath(instanceID string) string {
+	return filepath.Join(m.InstanceDir(instanceID), "seed.iso")
+}
+
 // MetadataPath returns the instance metadata file path.
 func (m *ArtifactManager) MetadataPath(instanceID string) string {
 	return filepath.Join(m.InstanceDir(instanceID), "metadata.json")

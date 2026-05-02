@@ -44,11 +44,12 @@ import (
 // VolumeAttachHandler executes VOLUME_ATTACH jobs.
 //
 // State machine:
-//   available → (lock → attaching) → in_use     [success]
-//   available → (lock → attaching) → error       [GetActiveAttachmentByVolume fails]
-//   available → (lock → attaching) → available   [no attachment row found]
-//   in_use                                        [idempotent no-op]
-//   attaching (locked by this job)  → in_use      [re-entrant resume]
+//
+//	available → (lock → attaching) → in_use     [success]
+//	available → (lock → attaching) → error       [GetActiveAttachmentByVolume fails]
+//	available → (lock → attaching) → available   [no attachment row found]
+//	in_use                                        [idempotent no-op]
+//	attaching (locked by this job)  → in_use      [re-entrant resume]
 //
 // Source: P2_VOLUME_MODEL.md §4.2 (attach flow), §3.2 (state machine).
 type VolumeAttachHandler struct {
@@ -129,10 +130,11 @@ func (h *VolumeAttachHandler) Execute(ctx context.Context, job *db.JobRow) error
 // VolumeDetachHandler executes VOLUME_DETACH jobs.
 //
 // State machine:
-//   in_use    → (lock → detaching) → available   [success: attachment closed]
-//   available                                      [idempotent no-op]
-//   detaching (locked by this job) → available    [re-entrant resume]
-//   detaching (locked by this job, att already closed) → available [re-entrant]
+//
+//	in_use    → (lock → detaching) → available   [success: attachment closed]
+//	available                                      [idempotent no-op]
+//	detaching (locked by this job) → available    [re-entrant resume]
+//	detaching (locked by this job, att already closed) → available [re-entrant]
 //
 // Source: P2_VOLUME_MODEL.md §4.4 (detach flow), §3.2 (state machine).
 type VolumeDetachHandler struct {
@@ -212,13 +214,14 @@ func (h *VolumeDetachHandler) Execute(ctx context.Context, job *db.JobRow) error
 // VolumeDeleteHandler executes VOLUME_DELETE jobs.
 //
 // State machine:
-//   available → (lock → deleting) → deleted      [success]
-//   available → (lock → deleting) → error        [SoftDeleteVolume fails]
-//   deleted                                       [idempotent no-op]
-//   (not found)                                   [idempotent no-op — ghost job]
-//   deleting (locked by this job) → deleted      [re-entrant resume]
-//   in_use                                        [error — VOL-SM-1]
-//   creating                                      [error — transitional]
+//
+//	available → (lock → deleting) → deleted      [success]
+//	available → (lock → deleting) → error        [SoftDeleteVolume fails]
+//	deleted                                       [idempotent no-op]
+//	(not found)                                   [idempotent no-op — ghost job]
+//	deleting (locked by this job) → deleted      [re-entrant resume]
+//	in_use                                        [error — VOL-SM-1]
+//	creating                                      [error — transitional]
 //
 // Source: P2_VOLUME_MODEL.md §5.2 (delete flow), §3.3 VOL-SM-1, §7 VOL-I-5.
 type VolumeDeleteHandler struct {

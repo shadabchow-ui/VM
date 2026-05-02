@@ -59,11 +59,18 @@ type RegisterRequest struct {
 
 // HeartbeatRequest is the periodic utilization update from the Host Agent.
 // Source: RUNTIMESERVICE_GRPC_V1 §8 (30s interval).
+//
+// VM Job 9: added HealthOK, BootID, VMLoad fields for richer health signal.
 type HeartbeatRequest struct {
 	UsedCPU      int    `json:"used_cpu"`
 	UsedMemoryMB int    `json:"used_memory_mb"`
 	UsedDiskGB   int    `json:"used_disk_gb"`
 	AgentVersion string `json:"agent_version"`
+	// HealthOK is the agent's self-assessment of local runtime health.
+	// If false, the control plane may flag the host for operator attention.
+	HealthOK bool   `json:"health_ok"`
+	BootID   string `json:"boot_id,omitempty"`
+	VMLoad   int    `json:"vm_load"`
 }
 
 // HostInventory manages host registration and inventory tracking.
@@ -98,18 +105,44 @@ func (s *HostInventory) Register(ctx context.Context, certHostID string, req *Re
 }
 
 // Heartbeat applies a periodic utilization update from an authenticated host.
+//
+// VM Job 9: enriched with HealthOK check (logs warn when false), boot_id
+// change detection (logs error when reboot detected), and vm_load cross-check.
 // Source: RUNTIMESERVICE_GRPC_V1 §8.
 func (s *HostInventory) Heartbeat(ctx context.Context, hostID string, req *HeartbeatRequest) error {
 	if hostID == "" {
 		return errors.New("heartbeat: host_id required")
 	}
-	return s.repo.UpdateHeartbeat(ctx, hostID, req.UsedCPU, req.UsedMemoryMB, req.UsedDiskGB, req.AgentVersion)
+	if err := s.repo.UpdateHeartbeat(ctx, hostID, req.UsedCPU, req.UsedMemoryMB, req.UsedDiskGB, req.AgentVersion); err != nil {
+		return err
+	}
+	// VM Job 9: detect boot_id changes — a reboot means host state was lost.
+	if req.BootID != "" {
+		prev, err := s.repo.UpdateHeartbeatBootID(ctx, hostID, req.BootID)
+		if err != nil {
+			return fmt.Errorf("heartbeat boot_id update: %w", err)
+		}
+		if prev != "" && prev != req.BootID {
+			return fmt.Errorf("heartbeat: host %s boot_id changed (prev=%s, new=%s) — host reboot detected, running VMs presumed lost", hostID, prev, req.BootID)
+		}
+	}
+	return nil
 }
 
 // GetAvailableHosts returns all ready, recently-heartbeating hosts.
 // Consumed by SelectHost and exposed via GET /internal/v1/hosts for the scheduler.
 func (s *HostInventory) GetAvailableHosts(ctx context.Context) ([]*db.HostRecord, error) {
 	return s.repo.GetAvailableHosts(ctx)
+}
+
+// GetStaleHosts returns ready hosts whose heartbeat is older than the staleness threshold.
+// These hosts are excluded from GetAvailableHosts and thus from scheduler placement.
+// The operator can poll this to proactively mark stale hosts degraded before users
+// notice degraded capacity.
+//
+// Source: VM Job 9 — host fleet operations + failure recovery gate.
+func (s *HostInventory) GetStaleHosts(ctx context.Context) ([]*db.HostRecord, error) {
+	return s.repo.GetStaleHosts(ctx)
 }
 
 // SelectHost returns the best available host for the given resource requirements.

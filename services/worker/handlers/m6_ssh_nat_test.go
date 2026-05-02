@@ -387,7 +387,8 @@ func TestNAT_RemovedOnDelete(t *testing.T) {
 // the TAP device and iptables rules are cleaned up for the stopped instance.
 //
 // Source: 04-02 §INSTANCE_STOP "Phase 1: stop always releases all runtime resources",
-//         IP_ALLOCATION_CONTRACT_V1 §5 (IP retained across stop/start).
+//
+//	IP_ALLOCATION_CONTRACT_V1 §5 (IP retained across stop/start).
 func TestNAT_RemovedOnStop(t *testing.T) {
 	store := newFakeStore()
 	store.hosts = []*db.HostRecord{newReadyHost()}

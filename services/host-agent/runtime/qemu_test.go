@@ -199,6 +199,102 @@ func assertFlagHasPrefix(t *testing.T, args []string, flag, prefix string) {
 	t.Errorf("args does not contain flag %q with value starting with %q\nargs: %v", flag, prefix, args)
 }
 
+// TestQEMUArgs_ExtraDisks verifies extra block devices generate virtio-blk drive args.
+func TestQEMUArgs_ExtraDisks(t *testing.T) {
+	qm := NewQemuManager("/tmp/vm-test-instances", nil)
+
+	spec := InstanceSpec{
+		InstanceID: "inst-extradisk001",
+		CPUCores:   2,
+		MemoryMB:   4096,
+		RootfsPath: "/mnt/nfs/vols/inst-extradisk001.qcow2",
+		TapDevice:  "tap-extradisk001",
+		MacAddress: "02:00:00:00:00:05",
+		ExtraDisks: []ExtraDisk{
+			{DiskID: "vol-data1", HostPath: "/mnt/nfs/vols/vol-data1/disk.img", DeviceName: "/dev/vdb"},
+			{DiskID: "vol-data2", HostPath: "/mnt/nfs/vols/vol-data2/disk.img", DeviceName: "/dev/vdc"},
+		},
+	}
+
+	args, err := qm.buildQEMUArgs(spec)
+	if err != nil {
+		t.Fatalf("buildQEMUArgs: %v", err)
+	}
+
+	assertFlagHas(t, args, "-drive", "file=/mnt/nfs/vols/vol-data1/disk.img,if=virtio,format=qcow2,serial=vol-vol-data1")
+	assertFlagHas(t, args, "-drive", "file=/mnt/nfs/vols/vol-data2/disk.img,if=virtio,format=qcow2,serial=vol-vol-data2")
+}
+
+// TestQEMUArgs_ExtraDisks_EmptyHostPathSkips verifies an ExtraDisk with empty HostPath is skipped.
+func TestQEMUArgs_ExtraDisks_EmptyHostPathSkips(t *testing.T) {
+	qm := NewQemuManager("/tmp/vm-test-instances", nil)
+
+	spec := InstanceSpec{
+		InstanceID: "inst-skip-empty",
+		CPUCores:   1,
+		MemoryMB:   2048,
+		RootfsPath: "/mnt/nfs/vols/inst-skip-empty.qcow2",
+		TapDevice:  "tap-skip-empty",
+		MacAddress: "02:00:00:00:00:06",
+		ExtraDisks: []ExtraDisk{
+			{DiskID: "vol-bad", HostPath: "", DeviceName: "/dev/vdb"},
+			{DiskID: "vol-good", HostPath: "/path/to/good.img", DeviceName: "/dev/vdc"},
+		},
+	}
+
+	args, err := qm.buildQEMUArgs(spec)
+	if err != nil {
+		t.Fatalf("buildQEMUArgs: %v", err)
+	}
+
+	// Vol-bad with empty path must not appear.
+	assertFlagNotPresent(t, args, "vol-bad")
+
+	// Vol-good must appear.
+	assertFlagHas(t, args, "-drive", "file=/path/to/good.img,if=virtio,format=qcow2,serial=vol-vol-good")
+}
+
+// TestQEMUArgs_ExtraDisks_None verifies no extra drive args when ExtraDisks is empty.
+func TestQEMUArgs_ExtraDisks_None(t *testing.T) {
+	qm := NewQemuManager("/tmp/vm-test-instances", nil)
+
+	spec := InstanceSpec{
+		InstanceID: "inst-noextras",
+		CPUCores:   1,
+		MemoryMB:   2048,
+		RootfsPath: "/tmp/test.qcow2",
+		TapDevice:  "tap-noextras",
+		MacAddress: "02:00:00:00:00:07",
+	}
+
+	args, err := qm.buildQEMUArgs(spec)
+	if err != nil {
+		t.Fatalf("buildQEMUArgs: %v", err)
+	}
+
+	// The only -drive arg should be the root disk.
+	driveCount := 0
+	for _, a := range args {
+		if a == "-drive" {
+			driveCount++
+		}
+	}
+	if driveCount != 1 {
+		t.Errorf("expected exactly 1 -drive arg (root disk only), got %d\nargs: %v", driveCount, args)
+	}
+}
+
+// assertFlagNotPresent checks that args does NOT contain value anywhere.
+func assertFlagNotPresent(t *testing.T, args []string, value string) {
+	t.Helper()
+	for _, a := range args {
+		if a == value {
+			t.Errorf("args unexpectedly contains %q\nargs: %v", value, args)
+			return
+		}
+	}
+}
+
 func hasPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }

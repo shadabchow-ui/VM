@@ -46,6 +46,15 @@ type VMRuntime interface {
 	DataRoot() string
 }
 
+// ExtraDisk describes an additional block device to attach to a VM at boot.
+// A volume attachment maps to exactly one ExtraDisk.
+// The HostPath is derived from the volume's storage_path under the storage root.
+type ExtraDisk struct {
+	DiskID     string // volume ID
+	HostPath   string // host file path (qcow2/raw)
+	DeviceName string // guest device name e.g. /dev/vdb
+}
+
 // InstanceSpec holds all parameters needed to launch a VM process.
 // This is the canonical input type for VMRuntime.Create.
 type InstanceSpec struct {
@@ -58,6 +67,7 @@ type InstanceSpec struct {
 	MacAddress   string
 	PrivateIP    string
 	SSHPublicKey string
+	ExtraDisks   []ExtraDisk // additional block devices from attached volumes
 }
 
 // RuntimeInfo holds the current runtime state of a single VM instance.

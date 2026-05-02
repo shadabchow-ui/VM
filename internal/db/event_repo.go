@@ -48,6 +48,24 @@ const (
 	// violated). Written once per affected instance per scan cycle.
 	// Source: IMPLEMENTATION_PLAN_V1 §M6 gate, IP_ALLOCATION_CONTRACT_V1.
 	EventIPUniquenessViolation = "instance.ip.uniqueness_violation"
+
+	// VM Job 10: image mutation audit event types.
+	// Emitted by resource-manager handlers for image lifecycle actions,
+	// grant/revoke operations, and image creation/import.
+	EventImageDeprecated = "image.deprecated"
+	EventImageObsoleted  = "image.obsoleted"
+	EventImageGranted    = "image.granted"
+	EventImageRevoked    = "image.revoked"
+	EventImageCreated    = "image.created"
+	EventImageImported   = "image.imported"
+
+	// VM Job 10: project mutation audit event types.
+	EventProjectCreated = "project.created"
+	EventProjectDeleted = "project.deleted"
+	EventProjectUpdated = "project.updated"
+
+	// VM Job 10: quota event type.
+	EventQuotaExceeded = "quota.exceeded"
 )
 
 // InsertEvent appends an event to the instance event log.

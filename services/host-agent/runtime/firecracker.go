@@ -492,7 +492,14 @@ var _ VMRuntime = (*FirecrackerManager)(nil)
 
 // Create implements VMRuntime.Create by delegating to StartVM.
 // Maps InstanceSpec → StartVMRequest and returns RuntimeInfo.
+// Returns an unsupported error when ExtraDisks are present — Firecracker
+// extra-drive support is a future Phase 2 feature.
 func (f *FirecrackerManager) Create(ctx context.Context, spec InstanceSpec) (*RuntimeInfo, error) {
+	if len(spec.ExtraDisks) > 0 {
+		return nil, fmt.Errorf("FirecrackerManager.Create: extra block devices are not supported by the Firecracker backend "+
+			"(requested %d extra disk(s); use QEMU/KVM for multi-disk instances)", len(spec.ExtraDisks))
+	}
+
 	req := &StartVMRequest{
 		InstanceID:   spec.InstanceID,
 		KernelPath:   spec.KernelPath,
