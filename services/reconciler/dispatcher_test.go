@@ -659,3 +659,111 @@ func TestDispatcher_AttachmentMissingRuntime_CreatesVolumeDetachRepair(t *testin
 		t.Error("AttachmentMissingRuntime: expected repair job insert")
 	}
 }
+
+// ── Runtime-aware drift dispatcher tests ──────────────────────────────────────
+//
+// All runtime-aware drift classes are detect-only: they write an event and do
+// NOT create repair jobs or fail instances.
+
+func TestDispatcher_DBRunningNoRuntime_WritesEvent_DoesNotFail(t *testing.T) {
+	pool := newDispatchTestPool()
+	// Instance is "running" so failInstance would be allowed if called.
+	inst := makeDispatchInstance("inst-rt-001", "running")
+	pool.addInstance(inst)
+
+	d := makeDispatcher(pool)
+	drift := DriftResult{
+		Class:  DriftDBRunningNoRuntime,
+		Reason: "DB says running but runtime reports no process",
+	}
+
+	err := d.Dispatch(dispCtx(), inst, drift)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	// Must NOT create a repair job.
+	if len(pool.insertJobCalls) > 0 {
+		t.Errorf("DBRunningNoRuntime: expected 0 job inserts, got %d — must be detect-only", len(pool.insertJobCalls))
+	}
+	// Must NOT fail the instance.
+	if len(pool.updateStateCalls) > 0 {
+		t.Errorf("DBRunningNoRuntime: expected 0 state updates, got %d — must be detect-only", len(pool.updateStateCalls))
+	}
+}
+
+func TestDispatcher_DBStoppedRuntimePresent_WritesEvent_DoesNotFail(t *testing.T) {
+	pool := newDispatchTestPool()
+	inst := makeDispatchInstance("inst-rt-002", "stopped")
+	pool.addInstance(inst)
+
+	d := makeDispatcher(pool)
+	drift := DriftResult{
+		Class:  DriftDBStoppedRuntimePresent,
+		Reason: "DB says stopped but runtime still present",
+	}
+
+	err := d.Dispatch(dispCtx(), inst, drift)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(pool.insertJobCalls) > 0 {
+		t.Errorf("DBStoppedRuntimePresent: expected 0 job inserts, got %d", len(pool.insertJobCalls))
+	}
+	if len(pool.updateStateCalls) > 0 {
+		t.Errorf("DBStoppedRuntimePresent: expected 0 state updates, got %d", len(pool.updateStateCalls))
+	}
+}
+
+func TestDispatcher_OrphanRuntimeProcess_WritesEvent_DoesNotFail(t *testing.T) {
+	pool := newDispatchTestPool()
+	inst := makeDispatchInstance("inst-rt-003", "running")
+	pool.addInstance(inst)
+
+	d := makeDispatcher(pool)
+	drift := DriftResult{
+		Class:  DriftOrphanRuntimeProcess,
+		Reason: "orphan runtime process inst-orphan has no DB record",
+	}
+
+	err := d.Dispatch(dispCtx(), inst, drift)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(pool.insertJobCalls) > 0 {
+		t.Errorf("OrphanRuntimeProcess: expected 0 job inserts, got %d", len(pool.insertJobCalls))
+	}
+	if len(pool.updateStateCalls) > 0 {
+		t.Errorf("OrphanRuntimeProcess: expected 0 state updates, got %d", len(pool.updateStateCalls))
+	}
+}
+
+func TestDispatcher_StaleHostArtifacts_WritesEvent_DoesNotFail(t *testing.T) {
+	pool := newDispatchTestPool()
+	inst := makeDispatchInstance("inst-rt-004", "deleted")
+	pool.addInstance(inst)
+
+	d := makeDispatcher(pool)
+	drift := DriftResult{
+		Class:  DriftStaleHostArtifacts,
+		Reason: "DB instance deleted but host has residual artifacts",
+	}
+
+	err := d.Dispatch(dispCtx(), inst, drift)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if len(pool.insertJobCalls) > 0 {
+		t.Errorf("StaleHostArtifacts: expected 0 job inserts, got %d", len(pool.insertJobCalls))
+	}
+	if len(pool.updateStateCalls) > 0 {
+		t.Errorf("StaleHostArtifacts: expected 0 state updates, got %d", len(pool.updateStateCalls))
+	}
+}

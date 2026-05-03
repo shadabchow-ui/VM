@@ -71,9 +71,25 @@ type InstanceSpec struct {
 }
 
 // RuntimeInfo holds the current runtime state of a single VM instance.
+// This is the canonical runtime inventory shape consumed by the reconciler
+// for runtime-aware drift detection.
 type RuntimeInfo struct {
-	InstanceID string
-	State      string // "RUNNING", "STOPPED", "DELETED"
-	PID        int32
-	DataDir    string // per-instance subdirectory under data root
+	InstanceID   string
+	State        string   // "RUNNING", "STOPPED", "DELETED"
+	PID          int32
+	DataDir      string   // per-instance subdirectory under data root
+	HostID       string   // host agent's host_id (populated at inventory collection time)
+	TapDevice    string   // TAP interface name if provisioned
+	DiskPaths    []string // overlay/disk file paths on host
+	SocketPath   string   // firecracker API socket path
+	LogPath      string   // console/firecracker log path
+	PolicyGen    int      // network policy generation number
+	CPUCores     int32
+	MemoryMB     int32
 }
+
+// IsRunning returns true when the runtime process is confirmed alive.
+func (r *RuntimeInfo) IsRunning() bool { return r.State == "RUNNING" && r.PID > 0 }
+
+// IsPresent returns true when the instance has at least one runtime artefact.
+func (r *RuntimeInfo) IsPresent() bool { return r.State != "" && r.State != "DELETED" }

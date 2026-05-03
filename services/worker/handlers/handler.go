@@ -83,6 +83,12 @@ type InstanceStore interface {
 	// GetVolumeByID returns a volume row by ID. Used by the create handler to
 	// read volume storage_path for extra disk generation.
 	GetVolumeByID(ctx context.Context, id string) (*db.VolumeRow, error)
+
+	// SSH key operations (VM-RUNTIME-BOOT-LANE-PHASE-A-B-C)
+	// GetSSHKeyByPrincipalName returns the SSH public key row for a given
+	// principal and key name. Used by the create/start/reboot handlers to
+	// resolve ssh_key_name into the actual public key for config-drive injection.
+	GetSSHKeyByPrincipalName(ctx context.Context, principalID, name string) (*db.SSHKeyRow, error)
 }
 
 // ── NetworkController ─────────────────────────────────────────────────────────

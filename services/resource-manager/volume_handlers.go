@@ -32,6 +32,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -177,6 +178,22 @@ func (s *server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 
 	if errs := validateCreateVolumeRequest(&req); len(errs) > 0 {
 		writeAPIErrors(w, errs)
+		return
+	}
+
+	// Quota admission: check before inserting the volume row or enqueuing a job.
+	// The quota scope is the calling principal (classic/no-project model).
+	// db.ErrQuotaExceeded → 422 quota_exceeded. Distinct from capacity errors.
+	// Source: vm-13-02__blueprint__ §core_contracts "Error Code Separation".
+	if err := s.repo.CheckVolumeCreateQuota(r.Context(), principal, req.SizeGB); err != nil {
+		if errors.Is(err, db.ErrQuotaExceeded) {
+			writeAPIError(w, http.StatusUnprocessableEntity, errQuotaExceeded,
+				"Volume storage quota exceeded: "+err.Error(),
+				"size_gb")
+			return
+		}
+		s.log.Error("CheckVolumeCreateQuota failed", "principal", principal, "error", err)
+		writeDBError(w, err)
 		return
 	}
 

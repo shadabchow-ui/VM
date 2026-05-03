@@ -23,6 +23,11 @@ import (
 
 const heartbeatInterval = 30 * time.Second
 
+// VMLoadFunc returns the current count of running VMs as reported by the runtime.
+// Injected at startup so the heartbeater can query the real VMRuntime without
+// coupling to a specific hypervisor backend.
+type VMLoadFunc func() int
+
 type heartbeatPayload struct {
 	UsedCPU      int    `json:"used_cpu"`
 	UsedMemoryMB int    `json:"used_memory_mb"`
@@ -42,14 +47,15 @@ type heartbeatPayload struct {
 
 // HeartbeatLoop sends a heartbeat every 30 seconds.
 // Stops cleanly on ctx cancellation (SIGTERM path).
-func HeartbeatLoop(ctx context.Context, cfg agentConfig, client *http.Client, log *slog.Logger) {
+// vmLoadFn may be nil — in that case vm_load is not reported (set to 0).
+func HeartbeatLoop(ctx context.Context, cfg agentConfig, client *http.Client, log *slog.Logger, vmLoadFn VMLoadFunc) {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
 	log.Info("heartbeat loop started", "interval", heartbeatInterval)
 
 	// Send immediately so the host appears ready without waiting 30s.
-	sendHeartbeat(ctx, cfg, client, log)
+	sendHeartbeat(ctx, cfg, client, log, vmLoadFn)
 
 	for {
 		select {
@@ -57,12 +63,16 @@ func HeartbeatLoop(ctx context.Context, cfg agentConfig, client *http.Client, lo
 			log.Info("heartbeat loop stopped")
 			return
 		case <-ticker.C:
-			sendHeartbeat(ctx, cfg, client, log)
+			sendHeartbeat(ctx, cfg, client, log, vmLoadFn)
 		}
 	}
 }
 
-func sendHeartbeat(ctx context.Context, cfg agentConfig, client *http.Client, log *slog.Logger) {
+func sendHeartbeat(ctx context.Context, cfg agentConfig, client *http.Client, log *slog.Logger, vmLoadFn VMLoadFunc) {
+	vmLoad := 0
+	if vmLoadFn != nil {
+		vmLoad = vmLoadFn()
+	}
 	payload := heartbeatPayload{
 		UsedCPU:      measureUsedCPU(),
 		UsedMemoryMB: measureUsedMemoryMB(),
@@ -70,7 +80,7 @@ func sendHeartbeat(ctx context.Context, cfg agentConfig, client *http.Client, lo
 		AgentVersion: cfg.AgentVersion,
 		HealthOK:     measureHealthOK(),
 		BootID:       readBootID(),
-		VMLoad:       countRunningVMs(),
+		VMLoad:       vmLoad,
 	}
 
 	body, err := json.Marshal(payload)
@@ -145,6 +155,10 @@ func readBootID() string {
 	return strings.TrimSpace(string(data))
 }
 
-// countRunningVMs returns the count of running Firecracker VM processes.
-// Phase 1: return 0. Phase 2: scan pid files in the instance directory.
-func countRunningVMs() int { return 0 }
+// countRunningVMs uses the provided VMLoadFunc to count running VMs.
+func countRunningVMs(fn VMLoadFunc) int {
+	if fn == nil {
+		return 0
+	}
+	return fn()
+}

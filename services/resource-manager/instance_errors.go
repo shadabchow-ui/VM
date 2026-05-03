@@ -114,6 +114,12 @@ const (
 	//         vm-13-02__blueprint__ §core_contracts "Error Code Separation",
 	//         AUTH_OWNERSHIP_MODEL_V1 §3.
 	errInsufficientCapacity = "insufficient_capacity"
+
+	// errForbidden is returned on explicit role-based authorization failures
+	// (not ownership/cross-account which returns 404). Used for project-scoped
+	// actions where the project exists and is owned by the caller, but the caller
+	// lacks sufficient role. Maps to HTTP 403 per API_ERROR_CONTRACT_V1 §2.
+	errForbidden = "forbidden"
 )
 
 // apiError is the structured error envelope sent in every error response.

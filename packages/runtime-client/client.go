@@ -72,6 +72,7 @@ type CreateInstanceRequest struct {
 	RootfsPath     string            `json:"rootfs_path"`
 	Network        NetworkConfig     `json:"network"`
 	SSHPublicKey   string            `json:"ssh_public_key"`
+	Hostname       string            `json:"hostname"`
 	ExtraDisks     []ExtraDiskConfig `json:"extra_disks,omitempty"`
 }
 
@@ -106,10 +107,17 @@ type DeleteInstanceResponse struct {
 }
 
 // InstanceStatus matches the InstanceStatus proto message.
+// Enriched with runtime inventory fields for the reconciler's drift detection.
 type InstanceStatus struct {
 	InstanceID string `json:"instance_id"`
 	State      string `json:"state"`
 	HostPID    int32  `json:"host_pid"`
+	DataDir    string `json:"data_dir,omitempty"`
+	TapDevice  string `json:"tap_device,omitempty"`
+	SocketPath string `json:"socket_path,omitempty"`
+	LogPath    string `json:"log_path,omitempty"`
+	CPUCores   int32  `json:"cpu_cores"`
+	MemoryMB   int32  `json:"memory_mb"`
 }
 
 // ListInstancesResponse matches the ListInstancesResponse proto message.

@@ -75,7 +75,9 @@ func (r *Repo) InsertJob(ctx context.Context, row *JobRow) error {
 func (r *Repo) GetJobByID(ctx context.Context, id string) (*JobRow, error) {
 	row := &JobRow{}
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, instance_id, volume_id, snapshot_id, job_type, status,
+		SELECT id, instance_id, volume_id, snapshot_id,
+		       COALESCE(image_id, NULL)::VARCHAR(64) AS image_id,
+		       job_type, status,
 		       idempotency_key, attempt_count, max_attempts,
 		       error_message, created_at, updated_at, claimed_at, completed_at
 		FROM jobs
@@ -100,7 +102,9 @@ func (r *Repo) GetJobByID(ctx context.Context, id string) (*JobRow, error) {
 func (r *Repo) GetJobByInstanceAndID(ctx context.Context, instanceID, jobID string) (*JobRow, error) {
 	row := &JobRow{}
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, instance_id, volume_id, snapshot_id, job_type, status,
+		SELECT id, instance_id, volume_id, snapshot_id,
+		       COALESCE(image_id, NULL)::VARCHAR(64) AS image_id,
+		       job_type, status,
 		       idempotency_key, attempt_count, max_attempts,
 		       error_message, created_at, updated_at, claimed_at, completed_at
 		FROM jobs
@@ -125,7 +129,9 @@ func (r *Repo) GetJobByInstanceAndID(ctx context.Context, instanceID, jobID stri
 func (r *Repo) GetJobByIdempotencyKey(ctx context.Context, key string) (*JobRow, error) {
 	row := &JobRow{}
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, instance_id, volume_id, snapshot_id, job_type, status,
+		SELECT id, instance_id, volume_id, snapshot_id,
+		       COALESCE(image_id, NULL)::VARCHAR(64) AS image_id,
+		       job_type, status,
 		       idempotency_key, attempt_count, max_attempts,
 		       error_message, created_at, updated_at, claimed_at, completed_at
 		FROM jobs
@@ -162,7 +168,9 @@ func (r *Repo) AtomicClaimJob(ctx context.Context) (*JobRow, error) {
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, instance_id, volume_id, snapshot_id, job_type, status,
+		RETURNING id, instance_id, volume_id, snapshot_id,
+		          COALESCE(image_id, NULL)::VARCHAR(64) AS image_id,
+		          job_type, status,
 		          idempotency_key, attempt_count, max_attempts,
 		          error_message, created_at, updated_at, claimed_at, completed_at
 	`).Scan(
@@ -232,7 +240,9 @@ func (r *Repo) RequeueFailedAttempt(ctx context.Context, id string, errorMessage
 // Source: JOB_MODEL_V1 §stuck_job_recovery.
 func (r *Repo) ListStuckInProgressJobs(ctx context.Context) ([]*JobRow, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, instance_id, volume_id, snapshot_id, job_type, status,
+		SELECT id, instance_id, volume_id, snapshot_id,
+		       COALESCE(image_id, NULL)::VARCHAR(64) AS image_id,
+		       job_type, status,
 		       idempotency_key, attempt_count, max_attempts,
 		       error_message, created_at, updated_at, claimed_at, completed_at
 		FROM jobs

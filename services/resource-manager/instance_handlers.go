@@ -464,6 +464,10 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	// Runs after image admission (image validity confirmed) and before InsertInstance
 	// (quota is not charged for requests that fail field or image validation).
 	//
+	// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: expanded to use CheckCreateQuota which
+	// validates max_instances, max_vcpu, max_memory_mb, and max_root_disk_gb
+	// dimensions against the scope's current aggregate usage.
+	//
 	// Scope resolution (VM-P2D Slice 4):
 	//   - Classic/no-project mode: quotaScopeID == principal (user's principal_id).
 	//   - Project-aware mode: quotaScopeID == project.principal_id.
@@ -483,15 +487,22 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 	// Source: vm-13-02__blueprint__ §mvp, §core_contracts "Transactional Quota Integrity",
 	//         vm-13-02__blueprint__ §core_contracts "Error Code Separation",
 	//         vm-16-01__blueprint__ §quota_enforcement_point.
-	if err := s.repo.CheckAndDecrementQuota(r.Context(), quotaScopeID); err != nil {
+	instanceVCPU := shapeVCPU[req.InstanceType]
+	instanceMemMB := shapeMemoryMB[req.InstanceType]
+	instanceDiskGB := 0
+	if len(req.BlockDevices) > 0 && req.BlockDevices[0].SizeGB > 0 {
+		instanceDiskGB = req.BlockDevices[0].SizeGB
+	} else {
+		instanceDiskGB = shapeDiskSizeGB[req.InstanceType]
+	}
+	if err := s.repo.CheckCreateQuota(r.Context(), quotaScopeID, instanceVCPU, instanceMemMB, instanceDiskGB); err != nil {
 		if errors.Is(err, db.ErrQuotaExceeded) {
 			writeAPIError(w, http.StatusUnprocessableEntity, errQuotaExceeded,
-				"Instance quota exceeded for this account or project. "+
-					"Delete existing instances or request a quota increase.",
+				"Resource quota exceeded for this account or project: "+err.Error(),
 				"instance_type")
 			return
 		}
-		s.log.Error("CheckAndDecrementQuota failed", "scope", quotaScopeID, "error", err)
+		s.log.Error("CheckCreateQuota failed", "scope", quotaScopeID, "error", err)
 		writeDBError(w, err)
 		return
 	}
@@ -505,6 +516,7 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		InstanceTypeID:   req.InstanceType,
 		ImageID:          req.ImageID,
 		AvailabilityZone: req.AvailabilityZone,
+		SSHKeyName:       req.SSHKeyName,
 	}
 
 	if err := s.repo.InsertInstance(r.Context(), row); err != nil {

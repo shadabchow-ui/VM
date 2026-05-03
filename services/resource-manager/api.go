@@ -272,6 +272,9 @@ func (s *server) routes() http.Handler {
 	// VM-P2B-S2: Snapshot management API.
 	s.registerSnapshotRoutes(mux)
 
+	// VM-P2C: Image management API.
+	s.registerImageRoutes(mux)
+
 	// VM-P2D: Project management API.
 	s.registerProjectRoutes(mux)
 

@@ -179,9 +179,11 @@ func TestListImages_MissingAuth(t *testing.T) {
 
 func TestListImages_MethodNotAllowed(t *testing.T) {
 	s := newTestSrv(t)
+	// POST /v1/images now dispatches to handleCreateImage (added in Phase J),
+	// which decodes JSON and returns 400 for nil/empty body instead of 405.
 	resp := doReq(t, s.ts, http.MethodPost, "/v1/images", nil, authHdr(alice))
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("want 405, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400 (invalid request body for create image), got %d", resp.StatusCode)
 	}
 }
 

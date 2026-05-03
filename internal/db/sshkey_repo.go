@@ -93,3 +93,24 @@ func (r *Repo) DeleteSSHKey(ctx context.Context, id, principalID string) error {
 	}
 	return nil
 }
+
+// GetSSHKeyByPrincipalName returns the SSH key row for a given principal and key name.
+// Returns nil, nil when no matching key is found.
+func (r *Repo) GetSSHKeyByPrincipalName(ctx context.Context, principalID, name string) (*SSHKeyRow, error) {
+	row := &SSHKeyRow{}
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, principal_id, name, public_key, fingerprint, key_type, created_at
+		FROM ssh_public_keys
+		WHERE principal_id = $1 AND name = $2
+	`, principalID, name).Scan(
+		&row.ID, &row.PrincipalID, &row.Name,
+		&row.PublicKey, &row.Fingerprint, &row.KeyType, &row.CreatedAt,
+	)
+	if err != nil {
+		if isNoRowsErr(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("GetSSHKeyByPrincipalName %s/%s: %w", principalID, name, err)
+	}
+	return row, nil
+}

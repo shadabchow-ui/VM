@@ -35,35 +35,68 @@ import (
 var ErrQuotaExceeded = errors.New("quota exceeded")
 
 // QuotaRow is the DB projection of a project_quotas or account_quotas row.
-// Phase 1 tracks instances only. vCPU/RAM quota is deferred (blueprint §mvp.deferred).
+// Phase G-H expansion: added vCPU, memory_mb, root_disk_gb, volume_gb, and
+// max_ip_count dimensions alongside the existing max_instances.
 type QuotaRow struct {
 	// ScopeID is the principal_id of the scope — either the project principal_id
 	// (project-aware path) or the owner principal_id (classic/no-project path).
 	ScopeID      string
 	MaxInstances int
+	MaxVCPU      int
+	MaxMemoryMB  int
+	MaxRootDiskGB int
+	MaxVolumeGB  int
+	MaxIPCount   int
 }
 
-// DefaultMaxInstances is the platform default applied to scopes without an
-// explicit quota row. Operators override this per scope via direct DB writes.
-// Phase 1 constant; a quota management API is deferred.
-const DefaultMaxInstances = 10
+// Default quota constants applied to scopes without an explicit row.
+// Operators override these per scope via direct DB writes.
+var (
+	DefaultMaxInstances = 10
+	DefaultMaxVCPU      = 64
+	DefaultMaxMemoryMB  = 262144 // 256 GB
+	DefaultMaxRootDiskGB = 5000
+	DefaultMaxVolumeGB  = 10000
+	DefaultMaxIPCount   = 10
+)
 
 // GetQuota returns the quota row for the given scopeID.
-// Returns a default row (DefaultMaxInstances) when no row exists.
+// Returns a default row when no explicit row exists.
 //
 // SQL pattern matches memPool.QueryRow dispatch:
 //
 //	"FROM project_quotas" AND "scope_id = $1"
 func (r *Repo) GetQuota(ctx context.Context, scopeID string) (*QuotaRow, error) {
 	const q = `
-SELECT scope_id, max_instances
+SELECT scope_id, max_instances,
+       COALESCE(max_vcpu, $2) AS max_vcpu,
+       COALESCE(max_memory_mb, $3) AS max_memory_mb,
+       COALESCE(max_root_disk_gb, $4) AS max_root_disk_gb,
+       COALESCE(max_volume_gb, $5) AS max_volume_gb,
+       COALESCE(max_ip_count, $6) AS max_ip_count
 FROM project_quotas
 WHERE scope_id = $1`
-	row := r.pool.QueryRow(ctx, q, scopeID)
+	row := r.pool.QueryRow(ctx, q,
+		scopeID,
+		DefaultMaxVCPU, DefaultMaxMemoryMB,
+		DefaultMaxRootDiskGB, DefaultMaxVolumeGB, DefaultMaxIPCount,
+	)
 	qr := &QuotaRow{}
-	if err := row.Scan(&qr.ScopeID, &qr.MaxInstances); err != nil {
-		// No row → return the platform default. This is expected for new scopes.
-		return &QuotaRow{ScopeID: scopeID, MaxInstances: DefaultMaxInstances}, nil
+	if err := row.Scan(
+		&qr.ScopeID, &qr.MaxInstances,
+		&qr.MaxVCPU, &qr.MaxMemoryMB,
+		&qr.MaxRootDiskGB, &qr.MaxVolumeGB, &qr.MaxIPCount,
+	); err != nil {
+		// No row → return the platform defaults.
+		return &QuotaRow{
+			ScopeID:       scopeID,
+			MaxInstances:  DefaultMaxInstances,
+			MaxVCPU:       DefaultMaxVCPU,
+			MaxMemoryMB:   DefaultMaxMemoryMB,
+			MaxRootDiskGB: DefaultMaxRootDiskGB,
+			MaxVolumeGB:   DefaultMaxVolumeGB,
+			MaxIPCount:    DefaultMaxIPCount,
+		}, nil
 	}
 	return qr, nil
 }
@@ -162,4 +195,169 @@ func (r *Repo) RefundQuota(ctx context.Context, scopeID string) error {
 // Source: vm-13-02__blueprint__ §future_phases "Reservation-Based Quota".
 func (r *Repo) ReserveQuota(ctx context.Context, scopeID string) error {
 	return r.CheckAndDecrementQuota(ctx, scopeID)
+}
+
+// CheckCreateQuota validates enhanced quota dimensions for a VM create request.
+//
+// Primary check: max_instances count-based (backward compatible, uses existing
+// CountActiveInstancesByScope which queries the actual instances table).
+//
+// Dimension checks (shape-based, no DB SUM needed since instances table does not
+// denormalize vcpus/memory_mb/root_gb): these compute aggregate usage by joining
+// instance_type data from the instance_types reference table. When the shape
+// resolution fails (unknown instance type), the dimension checks are skipped.
+//
+// Returns ErrQuotaExceeded when any dimension would be exceeded.
+// The error message names the specific dimension that is at limit.
+//
+// Source: vm-13-02__blueprint__ §mvp (expanded dimensions for P2D).
+func (r *Repo) CheckCreateQuota(ctx context.Context, scopeID string, instanceVCPU, instanceMemoryMB, instanceRootDiskGB int) error {
+	quota, err := r.GetQuota(ctx, scopeID)
+	if err != nil {
+		return fmt.Errorf("CheckCreateQuota get quota: %w", err)
+	}
+
+	// Primary: instance count.
+	currentInstances, err := r.CountActiveInstancesByScope(ctx, scopeID)
+	if err != nil {
+		return fmt.Errorf("CheckCreateQuota count instances: %w", err)
+	}
+	if currentInstances >= quota.MaxInstances {
+		return fmt.Errorf("%w: max_instances (%d)", ErrQuotaExceeded, quota.MaxInstances)
+	}
+
+	// Dimension checks: compute aggregates via instance_type reference table join.
+	// This works without denormalized columns on the instances table.
+	currentVCPU, err := r.SumActiveVCPUByScopeViaTypes(ctx, scopeID)
+	if err == nil && currentVCPU >= 0 {
+		if currentVCPU+instanceVCPU > quota.MaxVCPU {
+			return fmt.Errorf("%w: max_vcpu (%d, would be %d)", ErrQuotaExceeded, quota.MaxVCPU, currentVCPU+instanceVCPU)
+		}
+	}
+
+	currentMem, err := r.SumActiveMemoryMBByScopeViaTypes(ctx, scopeID)
+	if err == nil && currentMem >= 0 {
+		if currentMem+instanceMemoryMB > quota.MaxMemoryMB {
+			return fmt.Errorf("%w: max_memory_mb (%d, would be %d)", ErrQuotaExceeded, quota.MaxMemoryMB, currentMem+instanceMemoryMB)
+		}
+	}
+
+	currentDisk, err := r.SumActiveRootDiskGBByScope(ctx, scopeID)
+	if err == nil && currentDisk >= 0 {
+		if currentDisk+instanceRootDiskGB > quota.MaxRootDiskGB {
+			return fmt.Errorf("%w: max_root_disk_gb (%d, would be %d)", ErrQuotaExceeded, quota.MaxRootDiskGB, currentDisk+instanceRootDiskGB)
+		}
+	}
+
+	return nil
+}
+
+// SumActiveVCPUByScopeViaTypes returns total vcpus across all active instances
+// in the scope, joining instance_types to resolve shape dimensions.
+func (r *Repo) SumActiveVCPUByScopeViaTypes(ctx context.Context, scopeID string) (int, error) {
+	const q = `
+SELECT COALESCE(SUM(it.vcpus), 0)
+FROM instances i
+JOIN instance_types it ON i.instance_type_id = it.id
+WHERE i.owner_principal_id = $1
+  AND i.deleted_at IS NULL
+  AND i.vm_state NOT IN ('deleted', 'failed')`
+	row := r.pool.QueryRow(ctx, q, scopeID)
+	var total int
+	if err := row.Scan(&total); err != nil {
+		return 0, fmt.Errorf("SumActiveVCPUByScopeViaTypes %s: %w", scopeID, err)
+	}
+	return total, nil
+}
+
+// SumActiveMemoryMBByScopeViaTypes returns total memory_mb across all active
+// instances in the scope, joining instance_types for shape dimensions.
+func (r *Repo) SumActiveMemoryMBByScopeViaTypes(ctx context.Context, scopeID string) (int, error) {
+	const q = `
+SELECT COALESCE(SUM(it.memory_mb), 0)
+FROM instances i
+JOIN instance_types it ON i.instance_type_id = it.id
+WHERE i.owner_principal_id = $1
+  AND i.deleted_at IS NULL
+  AND i.vm_state NOT IN ('deleted', 'failed')`
+	row := r.pool.QueryRow(ctx, q, scopeID)
+	var total int
+	if err := row.Scan(&total); err != nil {
+		return 0, fmt.Errorf("SumActiveMemoryMBByScopeViaTypes %s: %w", scopeID, err)
+	}
+	return total, nil
+}
+
+// SumActiveRootDiskGBByScope retrieves total root_gb via root_disks table.
+func (r *Repo) SumActiveRootDiskGBByScope(ctx context.Context, scopeID string) (int, error) {
+	const q = `
+SELECT COALESCE(SUM(rd.size_gb), 0)
+FROM root_disks rd
+JOIN instances i ON i.id = rd.instance_id
+WHERE i.owner_principal_id = $1
+  AND i.deleted_at IS NULL
+  AND i.vm_state NOT IN ('deleted', 'failed')
+  AND rd.deleted_at IS NULL`
+	row := r.pool.QueryRow(ctx, q, scopeID)
+	var total int
+	if err := row.Scan(&total); err != nil {
+		return 0, fmt.Errorf("SumActiveRootDiskGBByScope %s: %w", scopeID, err)
+	}
+	return total, nil
+}
+
+// CountAllocatedIPsByScope counts IP allocations for the scope's instances.
+func (r *Repo) CountAllocatedIPsByScope(ctx context.Context, scopeID string) (int, error) {
+	const q = `
+SELECT COUNT(*)
+FROM ip_allocations ia
+JOIN instances i ON i.id = ia.instance_id
+WHERE i.owner_principal_id = $1
+  AND i.deleted_at IS NULL
+  AND i.vm_state NOT IN ('deleted', 'failed')
+  AND ia.released = FALSE`
+	row := r.pool.QueryRow(ctx, q, scopeID)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("CountAllocatedIPsByScope %s: %w", scopeID, err)
+	}
+	return count, nil
+}
+
+// CheckVolumeCreateQuota validates volume quota dimensions for a volume create.
+//
+// Checks max_volume_gb against the scope's current total volume GB usage.
+// Returns ErrQuotaExceeded when the limit would be exceeded.
+//
+// Source: vm-13-02__blueprint__ §mvp (expanded dimensions for P2D).
+func (r *Repo) CheckVolumeCreateQuota(ctx context.Context, scopeID string, volumeSizeGB int) error {
+	quota, err := r.GetQuota(ctx, scopeID)
+	if err != nil {
+		return fmt.Errorf("CheckVolumeCreateQuota get quota: %w", err)
+	}
+
+	currentGB, err := r.SumActiveVolumeGBByScope(ctx, scopeID)
+	if err != nil {
+		return fmt.Errorf("CheckVolumeCreateQuota sum: %w", err)
+	}
+	if currentGB+volumeSizeGB > quota.MaxVolumeGB {
+		return fmt.Errorf("%w: max_volume_gb (%d, would be %d)", ErrQuotaExceeded, quota.MaxVolumeGB, currentGB+volumeSizeGB)
+	}
+	return nil
+}
+
+// SumActiveVolumeGBByScope returns the total size_gb of all active volumes in the scope.
+func (r *Repo) SumActiveVolumeGBByScope(ctx context.Context, scopeID string) (int, error) {
+	const q = `
+SELECT COALESCE(SUM(size_gb), 0)
+FROM volumes
+WHERE owner_principal_id = $1
+  AND deleted_at IS NULL
+  AND status NOT IN ('deleted', 'failed')`
+	row := r.pool.QueryRow(ctx, q, scopeID)
+	var total int
+	if err := row.Scan(&total); err != nil {
+		return 0, fmt.Errorf("SumActiveVolumeGBByScope %s: %w", scopeID, err)
+	}
+	return total, nil
 }

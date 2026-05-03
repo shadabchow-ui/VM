@@ -63,6 +63,24 @@ var shapeDiskSizeGB = map[string]int{
 	"c1.xlarge": 500,
 }
 
+// shapeVCPU maps instance type → vCPU count for quota dimension checks.
+// Source: INSTANCE_MODEL_V1 §6, worker/handlers/create.go shapeCPU.
+var shapeVCPU = map[string]int{
+	"c1.small":  2,
+	"c1.medium": 4,
+	"c1.large":  8,
+	"c1.xlarge": 16,
+}
+
+// shapeMemoryMB maps instance type → memory in MB for quota dimension checks.
+// Source: INSTANCE_MODEL_V1 §6, worker/handlers/create.go shapeMemMB.
+var shapeMemoryMB = map[string]int{
+	"c1.small":  4096,
+	"c1.medium": 8192,
+	"c1.large":  16384,
+	"c1.xlarge": 32768,
+}
+
 // ── AZ catalog ────────────────────────────────────────────────────────────────
 // Phase 1: single region, two AZs. Source: 07-01 §Phase 1 network architecture.
 

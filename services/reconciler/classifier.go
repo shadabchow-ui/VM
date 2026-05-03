@@ -60,6 +60,32 @@ const (
 	// (attachment active) but the volume or instance is in a state that makes
 	// the attachment impossible (volume deleted, instance deleted).
 	DriftAttachmentMissingRuntime DriftClass = "attachment_missing_runtime"
+
+	// ── Runtime-aware drift classes ─────────────────────────────────────────
+	//
+	// These drift classes compare the DB instance state against actual runtime
+	// inventory reported by the host agent. They are detect-only — the reconciler
+	// writes events and does NOT perform destructive cleanup or auto-remediation.
+
+	// DriftDBRunningNoRuntime — DB says running but host-agent ListInstances
+	// reports no matching runtime process. The VM process may have crashed or
+	// the host may have rebooted. Detect-only; emits event for operator awareness.
+	DriftDBRunningNoRuntime DriftClass = "db_running_no_runtime"
+
+	// DriftDBStoppedRuntimePresent — DB says stopped/deleted but host-agent
+	// still reports a runtime process/artifact. The cleanup job may have failed
+	// silently or the worker missed the delete. Detect-only; emits event.
+	DriftDBStoppedRuntimePresent DriftClass = "db_stopped_runtime_present"
+
+	// DriftOrphanRuntimeProcess — host-agent reports a runtime process for an
+	// instance_id that is not known to the DB at all. The instance may have been
+	// deleted from DB without runtime cleanup. Detect-only; emits event.
+	DriftOrphanRuntimeProcess DriftClass = "orphan_runtime_process"
+
+	// DriftStaleHostArtifacts — DB instance is deleted/terminal but the host
+	// has disk paths, TAP devices, or socket paths still present. This is a
+	// superset of db_stopped_runtime_present but scoped to terminal DB states.
+	DriftStaleHostArtifacts DriftClass = "stale_host_artifacts"
 )
 
 // Collision avoidance: assign a unique idempotency scope key to each new class
@@ -69,6 +95,10 @@ var driftClassScopeKeys = map[DriftClass]string{
 	DriftVolumeOrphanArtifact:          "voa",
 	DriftNetworkStaleForDeleted:        "nsd",
 	DriftAttachmentMissingRuntime:      "amr",
+	DriftDBRunningNoRuntime:            "drn",
+	DriftDBStoppedRuntimePresent:       "dsr",
+	DriftOrphanRuntimeProcess:          "orp",
+	DriftStaleHostArtifacts:            "sha",
 }
 
 // Phase 1 drift detection thresholds.
@@ -295,4 +325,84 @@ func ClassifyAttachmentMissingRuntime(attachmentActive bool, instanceState strin
 		}
 	}
 	return NoDrift
+}
+
+// ── Runtime-aware drift classification ────────────────────────────────────────
+
+// RuntimeInventoryEntry is a lightweight view of one runtime process/artefact
+// as reported by the host agent's ListInstances.
+type RuntimeInventoryEntry struct {
+	InstanceID string
+	State      string // "RUNNING", "STOPPED", "DELETED"
+	PID        int32
+	HasTap     bool
+	HasDisk    bool
+}
+
+// ClassifyRuntimeDrift compares the DB instance against runtime inventory to
+// detect four runtime-aware drift classes.
+//
+// runtimeByID maps instanceID → RuntimeInventoryEntry for the host this instance
+// is assigned to. Pass nil or empty map when the host is unreachable (no runtime
+// truth available) — in that case only DB-side analysis is performed.
+//
+// dbDeleted should be true when the DB instance row has been soft-deleted or
+// the vm_state is "deleted" or "failed".
+//
+// All detected drifts are detect-only — no destructive mutations.
+func ClassifyRuntimeDrift(inst *db.InstanceRow, runtimeByID map[string]RuntimeInventoryEntry) DriftResult {
+	runtime, hasRuntime := runtimeByID[inst.ID]
+
+	switch {
+	case inst.VMState == "running" && inst.HostID != nil:
+		if !hasRuntime || !runtime.IsPresent() {
+			// DB says running+assigned but runtime inventory says nothing.
+			return DriftResult{
+				Class:  DriftDBRunningNoRuntime,
+				Reason: "DB says running but runtime reports no matching process or artifact",
+			}
+		}
+
+	case inst.VMState == "stopped" || inst.VMState == "deleting":
+		if hasRuntime && runtime.IsPresent() {
+			return DriftResult{
+				Class:  DriftDBStoppedRuntimePresent,
+				Reason: "DB says " + inst.VMState + " but runtime still reports process/artifact for instance " + inst.ID,
+			}
+		}
+
+	case inst.VMState == "deleted" || inst.VMState == "failed":
+		if hasRuntime && runtime.IsPresent() {
+			return DriftResult{
+				Class:  DriftStaleHostArtifacts,
+				Reason: "DB instance is " + inst.VMState + " but host has residual runtime artifacts",
+			}
+		}
+	}
+
+	return NoDrift
+}
+
+// ClassifyOrphanRuntimes identifies runtime processes that exist on a host but
+// have no corresponding DB instance record (the instance was deleted from DB
+// without cleanup, or the runtime process belongs to an unknown instance).
+//
+// Returns a slice of DriftResults — one per orphan. The DriftResult.Reason
+// contains the instance_id from the runtime inventory.
+func ClassifyOrphanRuntimes(runtimeByID map[string]RuntimeInventoryEntry, dbInstanceIDs map[string]bool) []DriftResult {
+	var orphans []DriftResult
+	for id, entry := range runtimeByID {
+		if !dbInstanceIDs[id] && entry.IsPresent() {
+			orphans = append(orphans, DriftResult{
+				Class:  DriftOrphanRuntimeProcess,
+				Reason: "runtime process " + id + " has no corresponding DB instance",
+			})
+		}
+	}
+	return orphans
+}
+
+// IsPresent returns true when the runtime entry represents a live process or artefact.
+func (e *RuntimeInventoryEntry) IsPresent() bool {
+	return e.State != "" && e.State != "DELETED"
 }

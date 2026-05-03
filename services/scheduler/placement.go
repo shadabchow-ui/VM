@@ -40,7 +40,8 @@ func (h *HostSummary) AvailableCPU() int      { return h.TotalCPU - h.UsedCPU }
 func (h *HostSummary) AvailableMemoryMB() int { return h.TotalMemoryMB - h.UsedMemoryMB }
 func (h *HostSummary) AvailableDiskGB() int   { return h.TotalDiskGB - h.UsedDiskGB }
 
-// CanFit reports whether the host has enough free resources.
+// CanFit reports whether the host has enough free resources AND matches the
+// requested availability zone (if az is non-empty).
 //
 // VM-P2E Slice 1: draining, drained, degraded, unhealthy, fenced, retired, offline,
 // and maintenance hosts are ALL excluded from placement. Only status=ready qualifies.
@@ -50,10 +51,13 @@ func (h *HostSummary) AvailableDiskGB() int   { return h.TotalDiskGB - h.UsedDis
 // The DB query (GetAvailableHosts) already excludes non-ready hosts, but the
 // scheduler double-checks here so no single layer failure can bypass the gate.
 //
+// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: added az parameter for AZ-filtered placement.
+// When az is non-empty, only hosts in that AZ are considered.
+//
 // Source: vm-13-03__blueprint__ §core_contracts "Host State Atomicity" (drain must be
 //
 //	immediately visible to scheduler), 05-02 §Placement.
-func (h *HostSummary) CanFit(cpuCores, memoryMB, diskGB int) bool {
+func (h *HostSummary) CanFit(cpuCores, memoryMB, diskGB int, az string) bool {
 	// Only status=ready hosts receive new placements.
 	// Draining hosts that were ready before the drain command must stop receiving
 	// new VMs immediately — the status change is the admission gate.
@@ -65,6 +69,10 @@ func (h *HostSummary) CanFit(cpuCores, memoryMB, diskGB int) bool {
 	// should be FALSE for ready hosts, but this check protects against any edge case
 	// where a host could be ready AND fence_required simultaneously.
 	if h.FenceRequired {
+		return false
+	}
+	// AZ filtering: when az is specified, only match hosts in that zone.
+	if az != "" && h.AvailabilityZone != az {
 		return false
 	}
 	return h.AvailableCPU() >= cpuCores &&
@@ -88,15 +96,17 @@ func newScheduler(rmURL string, client *http.Client, log *slog.Logger) *Schedule
 // Resource Manager returns hosts pre-sorted by (total_cpu - used_cpu) DESC so
 // the first host satisfying CanFit is the correct selection.
 //
+// az: availability zone filter. Pass empty string to accept any AZ.
+//
 // Returns ErrNoCapacity if no ready host satisfies the request.
 // Source: IMPLEMENTATION_PLAN_V1 §C3.
-func (s *Scheduler) SelectHost(ctx context.Context, cpuCores, memoryMB, diskGB int) (*HostSummary, error) {
+func (s *Scheduler) SelectHost(ctx context.Context, cpuCores, memoryMB, diskGB int, az string) (*HostSummary, error) {
 	hosts, err := s.fetchAvailableHosts(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("SelectHost: %w", err)
 	}
 	for _, h := range hosts {
-		if h.CanFit(cpuCores, memoryMB, diskGB) {
+		if h.CanFit(cpuCores, memoryMB, diskGB, az) {
 			s.log.Info("host selected",
 				"host_id", h.ID,
 				"az", h.AvailabilityZone,
@@ -110,6 +120,7 @@ func (s *Scheduler) SelectHost(ctx context.Context, cpuCores, memoryMB, diskGB i
 	}
 	s.log.Warn("no capacity",
 		"req_cpu", cpuCores, "req_mem_mb", memoryMB, "req_disk_gb", diskGB,
+		"req_az", az,
 		"candidates", len(hosts),
 	)
 	return nil, ErrNoCapacity

@@ -167,6 +167,67 @@ func (d *Dispatcher) Dispatch(ctx context.Context, inst *db.InstanceRow, drift D
 			Reason:        drift.Reason,
 		})
 
+	// ── Runtime-aware drift: detect-only, no destructive mutations ─────────
+	case DriftDBRunningNoRuntime:
+		// DB says running but host runtime reports no process. The VM may have
+		// crashed, the host may have rebooted, or the host-agent may be stale.
+		// Detect-only: write event, do NOT auto-fail the instance.
+		log.Warn("dispatcher: DriftDBRunningNoRuntime — detect-only, writing event",
+			"reason", drift.Reason,
+		)
+		_ = d.repo.InsertEvent(ctx, &db.EventRow{
+			ID:         idgen.New(idgen.PrefixEvent),
+			InstanceID: inst.ID,
+			EventType:  db.EventRuntimeDriftDBRunningNoRuntime,
+			Message:    drift.Reason,
+			Actor:      "reconciler",
+		})
+		return nil
+
+	case DriftDBStoppedRuntimePresent:
+		// DB says stopped/deleting but host still has runtime artifacts.
+		// Detect-only: write event, do NOT auto-delete.
+		log.Warn("dispatcher: DriftDBStoppedRuntimePresent — detect-only, writing event",
+			"reason", drift.Reason,
+		)
+		_ = d.repo.InsertEvent(ctx, &db.EventRow{
+			ID:         idgen.New(idgen.PrefixEvent),
+			InstanceID: inst.ID,
+			EventType:  db.EventRuntimeDriftDBStoppedRuntimePresent,
+			Message:    drift.Reason,
+			Actor:      "reconciler",
+		})
+		return nil
+
+	case DriftOrphanRuntimeProcess:
+		// Runtime process exists with no DB record. Detect-only.
+		log.Warn("dispatcher: DriftOrphanRuntimeProcess — detect-only, writing event",
+			"reason", drift.Reason,
+		)
+		_ = d.repo.InsertEvent(ctx, &db.EventRow{
+			ID:         idgen.New(idgen.PrefixEvent),
+			InstanceID: inst.ID,
+			EventType:  db.EventRuntimeDriftOrphanRuntime,
+			Message:    drift.Reason,
+			Actor:      "reconciler",
+		})
+		return nil
+
+	case DriftStaleHostArtifacts:
+		// DB instance is terminal but host has residual artifacts (disks, TAP, etc).
+		// Detect-only: write event, do NOT auto-cleanup.
+		log.Warn("dispatcher: DriftStaleHostArtifacts — detect-only, writing event",
+			"reason", drift.Reason,
+		)
+		_ = d.repo.InsertEvent(ctx, &db.EventRow{
+			ID:         idgen.New(idgen.PrefixEvent),
+			InstanceID: inst.ID,
+			EventType:  db.EventRuntimeDriftStaleArtifacts,
+			Message:    drift.Reason,
+			Actor:      "reconciler",
+		})
+		return nil
+
 	default:
 		log.Warn("dispatcher: unrecognised drift class — skipping", "class", string(drift.Class))
 		return nil

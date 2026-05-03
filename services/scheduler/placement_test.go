@@ -20,7 +20,7 @@ func TestCanFit_ReadyHost_WithSufficientResources_ReturnsTrue(t *testing.T) {
 		TotalMemoryMB: 65536, UsedMemoryMB: 16384,
 		TotalDiskGB: 500, UsedDiskGB: 100,
 	}
-	if !h.CanFit(4, 8192, 50) {
+	if !h.CanFit(4, 8192, 50, "") {
 		t.Error("expected CanFit=true for ready host with sufficient resources")
 	}
 }
@@ -32,7 +32,7 @@ func TestCanFit_ReadyHost_InsufficientCPU_ReturnsFalse(t *testing.T) {
 		TotalMemoryMB: 65536, UsedMemoryMB: 0,
 		TotalDiskGB: 500, UsedDiskGB: 0,
 	}
-	if h.CanFit(4, 1024, 10) {
+	if h.CanFit(4, 1024, 10, "") {
 		t.Error("expected CanFit=false: only 1 free CPU, need 4")
 	}
 }
@@ -65,7 +65,7 @@ func TestCanFit_ExcludesNonReadyStatuses(t *testing.T) {
 				TotalMemoryMB: 262144, UsedMemoryMB: 0,
 				TotalDiskGB: 2000, UsedDiskGB: 0,
 			}
-			if h.CanFit(1, 512, 1) {
+			if h.CanFit(1, 512, 1, "") {
 				t.Errorf("status=%q: expected CanFit=false (non-ready host must never receive new placements)", tc.status)
 			}
 		})
@@ -81,7 +81,7 @@ func TestCanFit_DrainingHost_NeverReceivesNewPlacements(t *testing.T) {
 		TotalMemoryMB: 131072, UsedMemoryMB: 0,
 		TotalDiskGB: 1000, UsedDiskGB: 0,
 	}
-	if h.CanFit(1, 512, 10) {
+	if h.CanFit(1, 512, 10, "") {
 		t.Error("draining host must never receive new VM placements regardless of free resources")
 	}
 }
@@ -93,7 +93,7 @@ func TestCanFit_ReadyHost_FullyLoaded_ReturnsFalse(t *testing.T) {
 		TotalMemoryMB: 32768, UsedMemoryMB: 32768,
 		TotalDiskGB: 200, UsedDiskGB: 200,
 	}
-	if h.CanFit(1, 1024, 10) {
+	if h.CanFit(1, 1024, 10, "") {
 		t.Error("expected CanFit=false: host is fully loaded")
 	}
 }
@@ -115,7 +115,7 @@ func TestCanFit_RetiringHost_NeverReceivesNewPlacements(t *testing.T) {
 		TotalMemoryMB: 262144, UsedMemoryMB: 0,
 		TotalDiskGB: 2000, UsedDiskGB: 0,
 	}
-	if h.CanFit(1, 512, 1) {
+	if h.CanFit(1, 512, 1, "") {
 		t.Error("retiring host must never receive new VM placements regardless of free resources")
 	}
 }
@@ -129,7 +129,7 @@ func TestCanFit_RetiredHost_NeverReceivesNewPlacements(t *testing.T) {
 		TotalMemoryMB: 262144, UsedMemoryMB: 0,
 		TotalDiskGB: 2000, UsedDiskGB: 0,
 	}
-	if h.CanFit(1, 512, 1) {
+	if h.CanFit(1, 512, 1, "") {
 		t.Error("retired host must never receive new VM placements — terminal state")
 	}
 }
@@ -148,7 +148,7 @@ func TestCanFit_FenceRequiredTrue_StatusReady_Excluded(t *testing.T) {
 		TotalMemoryMB: 65536, UsedMemoryMB: 0,
 		TotalDiskGB: 500, UsedDiskGB: 0,
 	}
-	if h.CanFit(1, 512, 1) {
+	if h.CanFit(1, 512, 1, "") {
 		t.Error("fence_required=TRUE host must never receive placements regardless of status")
 	}
 }
@@ -163,7 +163,7 @@ func TestCanFit_FenceRequiredFalse_StatusReady_Allowed(t *testing.T) {
 		TotalMemoryMB: 65536, UsedMemoryMB: 0,
 		TotalDiskGB: 500, UsedDiskGB: 0,
 	}
-	if !h.CanFit(1, 512, 1) {
+	if !h.CanFit(1, 512, 1, "") {
 		t.Error("healthy ready host with fence_required=FALSE should allow placements")
 	}
 }
@@ -179,7 +179,7 @@ func TestCanFit_FenceRequiredHost_StatusUnhealthy_Excluded(t *testing.T) {
 		TotalMemoryMB: 131072, UsedMemoryMB: 0,
 		TotalDiskGB: 1000, UsedDiskGB: 0,
 	}
-	if h.CanFit(1, 512, 1) {
+	if h.CanFit(1, 512, 1, "") {
 		t.Error("unhealthy+fence_required host must never receive new placements")
 	}
 }
@@ -195,7 +195,7 @@ func TestCanFit_DegradedHost_WithReasonCode_Excluded(t *testing.T) {
 		TotalMemoryMB: 32768, UsedMemoryMB: 0,
 		TotalDiskGB: 200, UsedDiskGB: 0,
 	}
-	if h.CanFit(1, 1024, 1) {
+	if h.CanFit(1, 1024, 1, "") {
 		t.Error("degraded host must never receive new placements")
 	}
 }
@@ -210,7 +210,7 @@ func TestCanFit_UnhealthyHost_FenceRequiredExcluded(t *testing.T) {
 		TotalMemoryMB: 32768, UsedMemoryMB: 0,
 		TotalDiskGB: 200, UsedDiskGB: 0,
 	}
-	if h.CanFit(1, 1024, 1) {
+	if h.CanFit(1, 1024, 1, "") {
 		t.Error("unhealthy host (even without fence_required) must never receive placements")
 	}
 }
@@ -233,7 +233,7 @@ func TestCanFit_RecentlyHeartbeatingReadyHost_Allowed(t *testing.T) {
 		TotalMemoryMB: 16384, UsedMemoryMB: 4096,
 		TotalDiskGB: 100, UsedDiskGB: 10,
 	}
-	if !h.CanFit(4, 8192, 50) {
+	if !h.CanFit(4, 8192, 50, "") {
 		t.Error("recently-heartbeating ready host must be eligible for placement")
 	}
 }

@@ -137,6 +137,9 @@ func (h *StartHandler) Execute(ctx context.Context, job *db.JobRow) error {
 
 	sgRules := effectiveSGRulesToSpec(h.deps.Store, ctx, inst.ID)
 
+	// ── Resolve SSH public key from instance's ssh_key_name ──────────────────
+	sshPublicKey := h.resolveSSHKey(ctx, inst)
+
 	createReq := &runtimeclient.CreateInstanceRequest{
 		InstanceID:     inst.ID,
 		ImageURL:       imageURLFromID(inst.ImageID),
@@ -151,6 +154,8 @@ func (h *StartHandler) Execute(ctx context.Context, job *db.JobRow) error {
 			MacAddress: deriveMACAddress(inst.ID),
 			SGRules:    sgRules,
 		},
+		SSHPublicKey: sshPublicKey,
+		Hostname:     inst.ID,
 	}
 	if _, err := rtClient.CreateInstance(ctx, createReq); err != nil {
 		// Rollback: release IP, then fail instance.
@@ -233,4 +238,20 @@ func (h *StartHandler) SetRuntimeFactory(f func(hostID, address string) RuntimeC
 // SetReadinessFn overrides the readiness check function. Used by integration tests.
 func (h *StartHandler) SetReadinessFn(f func(ctx context.Context, ip string, timeout time.Duration) error) {
 	h.readinessFn = f
+}
+
+// resolveSSHKey returns the public key content for the instance's ssh_key_name.
+func (h *StartHandler) resolveSSHKey(ctx context.Context, inst *db.InstanceRow) string {
+	if inst.SSHKeyName == "" {
+		return ""
+	}
+	key, err := h.deps.Store.GetSSHKeyByPrincipalName(ctx, inst.OwnerPrincipalID, inst.SSHKeyName)
+	if err != nil || key == nil {
+		h.log.Warn("could not resolve SSH key for instance — booting without SSH key",
+			"instance_id", inst.ID,
+			"ssh_key_name", inst.SSHKeyName,
+		)
+		return ""
+	}
+	return key.PublicKey
 }

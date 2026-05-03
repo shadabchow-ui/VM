@@ -324,3 +324,142 @@ func TestClassifier_AttachmentMissingRuntime_Inactive(t *testing.T) {
 		t.Errorf("inactive attachment: class = %q, want none", result.Class)
 	}
 }
+
+// ── Runtime-aware drift classifier tests ─────────────────────────────────────
+
+func makeRuntimeEntry(id, state string, pid int32) RuntimeInventoryEntry {
+	return RuntimeInventoryEntry{
+		InstanceID: id,
+		State:      state,
+		PID:        pid,
+		HasTap:     state == "RUNNING",
+		HasDisk:    state != "DELETED",
+	}
+}
+
+func TestClassifier_RuntimeDrift_DBRunningNoRuntime(t *testing.T) {
+	inst := instWithState("running", 30*time.Second)
+	// Empty runtime inventory — no runtime process found for this instance.
+	runtimeByID := map[string]RuntimeInventoryEntry{}
+	result := ClassifyRuntimeDrift(inst, runtimeByID)
+	if result.Class != DriftDBRunningNoRuntime {
+		t.Errorf("running instance with no runtime: class = %q, want db_running_no_runtime", result.Class)
+	}
+}
+
+func TestClassifier_RuntimeDrift_DBRunningWithRuntime_Happy(t *testing.T) {
+	inst := instWithState("running", 30*time.Second)
+	runtimeByID := map[string]RuntimeInventoryEntry{
+		inst.ID: makeRuntimeEntry(inst.ID, "RUNNING", 12345),
+	}
+	result := ClassifyRuntimeDrift(inst, runtimeByID)
+	if result.Class != DriftNone {
+		t.Errorf("running instance with matching runtime: class = %q, want none", result.Class)
+	}
+}
+
+func TestClassifier_RuntimeDrift_DBStoppedRuntimePresent(t *testing.T) {
+	inst := instWithState("stopped", 1*time.Minute)
+	runtimeByID := map[string]RuntimeInventoryEntry{
+		inst.ID: makeRuntimeEntry(inst.ID, "RUNNING", 12345),
+	}
+	result := ClassifyRuntimeDrift(inst, runtimeByID)
+	if result.Class != DriftDBStoppedRuntimePresent {
+		t.Errorf("stopped instance with runtime present: class = %q, want db_stopped_runtime_present", result.Class)
+	}
+}
+
+func TestClassifier_RuntimeDrift_DBDeletingRuntimePresent(t *testing.T) {
+	inst := instWithState("deleting", 2*time.Minute)
+	runtimeByID := map[string]RuntimeInventoryEntry{
+		inst.ID: makeRuntimeEntry(inst.ID, "RUNNING", 12345),
+	}
+	result := ClassifyRuntimeDrift(inst, runtimeByID)
+	if result.Class != DriftDBStoppedRuntimePresent {
+		t.Errorf("deleting instance with runtime present: class = %q, want db_stopped_runtime_present", result.Class)
+	}
+}
+
+func TestClassifier_RuntimeDrift_DBDeletedStaleArtifacts(t *testing.T) {
+	inst := instWithState("deleted", 1*time.Hour)
+	runtimeByID := map[string]RuntimeInventoryEntry{
+		inst.ID: makeRuntimeEntry(inst.ID, "STOPPED", 0),
+	}
+	result := ClassifyRuntimeDrift(inst, runtimeByID)
+	if result.Class != DriftStaleHostArtifacts {
+		t.Errorf("deleted instance with runtime artifacts: class = %q, want stale_host_artifacts", result.Class)
+	}
+}
+
+func TestClassifier_RuntimeDrift_DBFailedStaleArtifacts(t *testing.T) {
+	inst := instWithState("failed", 2*time.Hour)
+	runtimeByID := map[string]RuntimeInventoryEntry{
+		inst.ID: makeRuntimeEntry(inst.ID, "STOPPED", 0),
+	}
+	result := ClassifyRuntimeDrift(inst, runtimeByID)
+	if result.Class != DriftStaleHostArtifacts {
+		t.Errorf("failed instance with runtime artifacts: class = %q, want stale_host_artifacts", result.Class)
+	}
+}
+
+func TestClassifier_RuntimeDrift_DBStoppedNoRuntime(t *testing.T) {
+	inst := instWithState("stopped", 10*time.Minute)
+	runtimeByID := map[string]RuntimeInventoryEntry{}
+	result := ClassifyRuntimeDrift(inst, runtimeByID)
+	if result.Class != DriftNone {
+		t.Errorf("stopped instance with no runtime: class = %q, want none", result.Class)
+	}
+}
+
+func TestClassifier_RuntimeDrift_NoRuntimeData_NilMap(t *testing.T) {
+	inst := instWithState("running", 30*time.Second)
+	result := ClassifyRuntimeDrift(inst, nil)
+	if result.Class != DriftDBRunningNoRuntime {
+		t.Errorf("running with nil runtime map: class = %q, want db_running_no_runtime", result.Class)
+	}
+}
+
+func TestClassifier_OrphanRuntimes_SingleOrphan(t *testing.T) {
+	runtimeByID := map[string]RuntimeInventoryEntry{
+		"inst-orphan-001": makeRuntimeEntry("inst-orphan-001", "RUNNING", 1001),
+		"inst-known-001":  makeRuntimeEntry("inst-known-001", "RUNNING", 1002),
+	}
+	dbIDs := map[string]bool{"inst-known-001": true}
+	orphans := ClassifyOrphanRuntimes(runtimeByID, dbIDs)
+	if len(orphans) != 1 {
+		t.Fatalf("expected 1 orphan, got %d", len(orphans))
+	}
+	if orphans[0].Class != DriftOrphanRuntimeProcess {
+		t.Errorf("orphan class = %q, want orphan_runtime_process", orphans[0].Class)
+	}
+}
+
+func TestClassifier_OrphanRuntimes_NoOrphans(t *testing.T) {
+	runtimeByID := map[string]RuntimeInventoryEntry{
+		"inst-known-001": makeRuntimeEntry("inst-known-001", "RUNNING", 1001),
+	}
+	dbIDs := map[string]bool{"inst-known-001": true}
+	orphans := ClassifyOrphanRuntimes(runtimeByID, dbIDs)
+	if len(orphans) != 0 {
+		t.Errorf("expected 0 orphans, got %d", len(orphans))
+	}
+}
+
+func TestClassifier_OrphanRuntimes_EmptyHost(t *testing.T) {
+	orphans := ClassifyOrphanRuntimes(map[string]RuntimeInventoryEntry{}, map[string]bool{})
+	if len(orphans) != 0 {
+		t.Errorf("expected 0 orphans on empty host, got %d", len(orphans))
+	}
+}
+
+func TestClassifier_RuntimeDrift_DBStoppedRuntimeDelayed(t *testing.T) {
+	inst := instWithState("stopped", 1*time.Hour)
+	// Runtime reports DELETED — no artifact, clean.
+	runtimeByID := map[string]RuntimeInventoryEntry{
+		inst.ID: {InstanceID: inst.ID, State: "DELETED", PID: 0},
+	}
+	result := ClassifyRuntimeDrift(inst, runtimeByID)
+	if result.Class != DriftNone {
+		t.Errorf("stopped instance with deleted runtime: class = %q, want none", result.Class)
+	}
+}

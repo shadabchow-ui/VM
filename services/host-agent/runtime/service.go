@@ -98,6 +98,12 @@ type InstanceStatus struct {
 	InstanceID string `json:"instance_id"`
 	State      string `json:"state"`
 	HostPID    int32  `json:"host_pid"`
+	DataDir    string `json:"data_dir,omitempty"`
+	TapDevice  string `json:"tap_device,omitempty"`
+	SocketPath string `json:"socket_path,omitempty"`
+	LogPath    string `json:"log_path,omitempty"`
+	CPUCores   int32  `json:"cpu_cores"`
+	MemoryMB   int32  `json:"memory_mb"`
 }
 
 type ListInstancesResponse struct {
@@ -279,8 +285,8 @@ func (s *RuntimeService) DeleteInstance(ctx context.Context, req *DeleteInstance
 // ListInstances returns the runtime status of all instances whose PID files exist.
 // Used by the reconciler to detect drift between DB state and hypervisor state.
 // Source: RUNTIMESERVICE_GRPC_V1 §ListInstances.
-func (s *RuntimeService) ListInstances(_ context.Context, _ *ListInstancesRequest) (*ListInstancesResponse, error) {
-	infos, err := s.vm.List(context.Background())
+func (s *RuntimeService) ListInstances(ctx context.Context, _ *ListInstancesRequest) (*ListInstancesResponse, error) {
+	infos, err := s.vm.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("ListInstances: %w", err)
 	}
@@ -290,6 +296,12 @@ func (s *RuntimeService) ListInstances(_ context.Context, _ *ListInstancesReques
 			InstanceID: info.InstanceID,
 			State:      info.State,
 			HostPID:    info.PID,
+			DataDir:    info.DataDir,
+			TapDevice:  info.TapDevice,
+			SocketPath: info.SocketPath,
+			LogPath:    info.LogPath,
+			CPUCores:   info.CPUCores,
+			MemoryMB:   info.MemoryMB,
 		})
 	}
 	return &ListInstancesResponse{Instances: statuses}, nil

@@ -39,6 +39,9 @@ type FakeRuntime struct {
 	// Key format: "op:instanceID" (e.g. "Create:inst-001").
 	// A key of "op:*" matches any instanceID for that operation.
 	Errors map[string]error
+
+	// HostID is set by the caller to simulate a real host agent identity.
+	HostID string
 }
 
 // NewFakeRuntime constructs a FakeRuntime with empty state.
@@ -64,6 +67,13 @@ func (f *FakeRuntime) Create(_ context.Context, spec InstanceSpec) (*RuntimeInfo
 		State:      "RUNNING",
 		PID:        1000 + int32(len(f.KnownInstances)),
 		DataDir:    f.DataRootDir + "/" + spec.InstanceID,
+		HostID:     f.HostID,
+		TapDevice:  spec.TapDevice,
+		DiskPaths:  []string{spec.RootfsPath},
+		SocketPath: f.DataRootDir + "/" + spec.InstanceID + "/firecracker.sock",
+		LogPath:    f.DataRootDir + "/" + spec.InstanceID + "/console.log",
+		CPUCores:   spec.CPUCores,
+		MemoryMB:   spec.MemoryMB,
 	}
 	f.KnownInstances[spec.InstanceID] = info
 	return &info, nil

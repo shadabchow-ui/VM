@@ -73,7 +73,9 @@ import (
 //	db/migrations/0014_image_trust_fields.up.sql.
 //
 // VM-P3B Job 2: added ProvenanceHash (col 20) and SignatureValid (col 21).
-// Total columns: 22.
+// VM-TRUSTED-IMAGE-FACTORY-PHASE-J: added Format (col 22), SizeBytes (col 23),
+//   ImageDigest (col 24), ValidationError (col 25).
+// Total columns: 26.
 type ImageRow struct {
 	ID               string
 	Name             string
@@ -101,6 +103,12 @@ type ImageRow struct {
 	//         db/migrations/0014_image_trust_fields.up.sql.
 	ProvenanceHash *string // SLSA L3 attestation digest; nil for non-platform images
 	SignatureValid *bool   // nil=not yet checked; true=verified; false=failed
+	// VM-TRUSTED-IMAGE-FACTORY-PHASE-J: artifact metadata fields.
+	// Source: db/migrations/0017_image_artifact_metadata.up.sql.
+	Format           string  // disk format (qcow2, raw, vmdk); empty until validated
+	SizeBytes        int64   // actual image artifact size in bytes; 0 until imported
+	ImageDigest      *string // content-addressed digest (sha256:<hex>); nil until validated
+	ValidationError  *string // last validation error message; nil on success or not yet run
 }
 
 // Image status constants — used at the DB layer without importing domain-model.
@@ -113,6 +121,17 @@ const (
 	ImageStatusObsolete          = "OBSOLETE"
 	ImageStatusFailed            = "FAILED"
 	ImageStatusPendingValidation = "PENDING_VALIDATION"
+)
+
+// ImageValidation status constants.
+// Source: db/migrations/006_images.up.sql (CHECK constraint),
+//
+//	vm-13-01__blueprint__ §Image Validation Service.
+const (
+	ImageValidationPending     = "pending"     // not yet validated
+	ImageValidationValidating  = "validating"  // validation in progress
+	ImageValidationPassed      = "passed"      // all required stages passed
+	ImageValidationFailed      = "failed"      // one or more stages failed
 )
 
 // Image visibility constants.
@@ -195,17 +214,22 @@ func ImageIsTrusted(sourceType string, provenanceHash *string, signatureValid *b
 // Order must match imageRow.Scan in the test harness (mempool_image_patch_test.go).
 // VM-P2C-P2: added import_url, family_name, family_version at positions 15–17.
 // VM-P3B Job 2: added provenance_hash, signature_valid at positions 20–21.
-// Total: 22 columns.
+// VM-TRUSTED-IMAGE-FACTORY-PHASE-J: added format, size_bytes, image_digest,
+//   validation_error at positions 22–25.
+// Total: 26 columns.
 const selectImageCols = `
 	id, name, os_family, os_version, architecture,
 	owner_id, visibility, source_type, storage_url, min_disk_gb,
 	status, validation_status, deprecated_at, obsoleted_at,
 	source_snapshot_id, import_url, family_name, family_version,
 	created_at, updated_at,
-	provenance_hash, signature_valid`
+	provenance_hash, signature_valid,
+	format, size_bytes, image_digest, validation_error`
 
 // scanImage scans one image row using the selectImageCols column order.
 // VM-P3B Job 2: extended to scan provenance_hash (col 20) and signature_valid (col 21).
+// VM-TRUSTED-IMAGE-FACTORY-PHASE-J: extended to scan format (col 22), size_bytes (col 23),
+//   image_digest (col 24), validation_error (col 25).
 func scanImage(row Row, r *ImageRow) error {
 	return row.Scan(
 		&r.ID, &r.Name, &r.OSFamily, &r.OSVersion, &r.Architecture,
@@ -214,6 +238,7 @@ func scanImage(row Row, r *ImageRow) error {
 		&r.SourceSnapshotID, &r.ImportURL, &r.FamilyName, &r.FamilyVersion,
 		&r.CreatedAt, &r.UpdatedAt,
 		&r.ProvenanceHash, &r.SignatureValid,
+		&r.Format, &r.SizeBytes, &r.ImageDigest, &r.ValidationError,
 	)
 }
 
@@ -457,6 +482,7 @@ func (r *Repo) CreateImage(ctx context.Context, row *ImageRow) error {
 			status, validation_status,
 			source_snapshot_id, import_url, family_name, family_version,
 			provenance_hash, signature_valid,
+			format, size_bytes, image_digest, validation_error,
 			created_at, updated_at
 		) VALUES (
 			$1,$2,$3,$4,$5,
@@ -464,6 +490,7 @@ func (r *Repo) CreateImage(ctx context.Context, row *ImageRow) error {
 			$11,$12,
 			$13,$14,$15,$16,
 			$17,$18,
+			$19,$20,$21,$22,
 			NOW(),NOW()
 		)
 	`,
@@ -472,6 +499,7 @@ func (r *Repo) CreateImage(ctx context.Context, row *ImageRow) error {
 		row.Status, row.ValidationStatus,
 		row.SourceSnapshotID, row.ImportURL, row.FamilyName, row.FamilyVersion,
 		row.ProvenanceHash, row.SignatureValid,
+		row.Format, row.SizeBytes, row.ImageDigest, row.ValidationError,
 	)
 	if err != nil {
 		return fmt.Errorf("CreateImage: %w", err)
@@ -550,6 +578,86 @@ func (r *Repo) UpdateImageSignature(ctx context.Context, id string, provenanceHa
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("UpdateImageSignature: image %s not found or not PLATFORM source type", id)
+	}
+	return nil
+}
+
+// WriteImageArtifactMetadata records artifact-level metadata on an image row.
+//
+// Called by the IMAGE_IMPORT worker after downloading the image artifact,
+// and by the IMAGE_VALIDATE worker after computing the digest.
+//
+// Only format, size_bytes, and image_digest are written; validation_status and
+// status are not affected by this method. Use UpdateImageValidationStatus for
+// state transitions.
+//
+// Source: db/migrations/0017_image_artifact_metadata.up.sql.
+func (r *Repo) WriteImageArtifactMetadata(ctx context.Context, id, format string, sizeBytes int64, imageDigest string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE images
+		SET format       = $2,
+		    size_bytes   = $3,
+		    image_digest = $4,
+		    updated_at   = NOW()
+		WHERE id = $1
+	`, id, format, sizeBytes, imageDigest)
+	if err != nil {
+		return fmt.Errorf("WriteImageArtifactMetadata: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("WriteImageArtifactMetadata: image %s not found", id)
+	}
+	return nil
+}
+
+// SetImageValidationError records a validation error message on the image row.
+//
+// Called by the IMAGE_VALIDATE worker when a stage fails, so the error is
+// observable on the image record itself (not just in validation_results detail_json).
+// Cleared (set to NULL) on successful re-validation by calling with an empty string.
+//
+// Source: vm-13-01__blueprint__ §Image Validation Service.
+func (r *Repo) SetImageValidationError(ctx context.Context, id string, validationError string) error {
+	var val interface{}
+	if validationError != "" {
+		val = validationError
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE images
+		SET validation_error = $2,
+		    updated_at       = NOW()
+		WHERE id = $1
+	`, id, val)
+	if err != nil {
+		return fmt.Errorf("SetImageValidationError: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("SetImageValidationError: image %s not found", id)
+	}
+	return nil
+}
+
+// SetValidationInProgress transitions validation_status to "validating" and
+// optionally clears any previous validation_error.
+//
+// Called by the IMAGE_VALIDATE worker when it claims the job, before running stages.
+// This makes the "validating" state visible on the image row while the job is running.
+//
+// Source: vm-13-01__blueprint__ §Image Validation Service.
+func (r *Repo) SetValidationInProgress(ctx context.Context, id string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE images
+		SET validation_status = 'validating',
+		    validation_error  = NULL,
+		    updated_at        = NOW()
+		WHERE id     = $1
+		  AND status = 'PENDING_VALIDATION'
+	`, id)
+	if err != nil {
+		return fmt.Errorf("SetValidationInProgress: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("SetValidationInProgress: image %s not found or not in PENDING_VALIDATION", id)
 	}
 	return nil
 }

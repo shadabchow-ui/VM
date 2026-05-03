@@ -92,9 +92,14 @@ type memPool struct {
 	volumeAttachments   map[string]*db.VolumeAttachmentRow // VM-P2B; keyed by attachment ID
 	snapshots           map[string]*db.SnapshotRow         // VM-P2B-S2
 	images              map[string]*db.ImageRow            // VM-P2C-P1
+	imageValResults     map[string][]*db.ImageValidationResultRow // VM-TRUSTED-IMAGE-FACTORY-PHASE-J (image_id → results)
 	// VM-P2D Slice 3: quota maps.
 	// quotas: scopeID → max_instances override. nil entry = use db.DefaultMaxInstances.
-	quotas map[string]int // VM-P2D-S3
+	quotas              map[string]int // VM-P2D-S3
+	// VM-VOLUME-QUOTA-ADMISSION-WIRING: volume GB quota overrides per scope.
+	// nil entry = use db.DefaultMaxVolumeGB.
+	volumeQuotaMaxGB    map[string]int
+	rootDiskByInstance  map[string]string // instanceID → diskID
 }
 
 func newMemPool() *memPool {
@@ -116,7 +121,10 @@ func newMemPool() *memPool {
 		volumeAttachments:   make(map[string]*db.VolumeAttachmentRow),
 		snapshots:           make(map[string]*db.SnapshotRow), // VM-P2B-S2
 		images:              make(map[string]*db.ImageRow),    // VM-P2C-P1
+		imageValResults:     make(map[string][]*db.ImageValidationResultRow), // VM-TRUSTED-IMAGE-FACTORY-PHASE-J
 		quotas:              make(map[string]int),             // VM-P2D-S3
+		volumeQuotaMaxGB:    make(map[string]int),             // VM-VOLUME-QUOTA
+		rootDiskByInstance:  make(map[string]string),           // instanceID → diskID
 	}
 }
 
@@ -206,6 +214,9 @@ func (p *memPool) seedRootDisk(row *db.RootDiskRow) {
 		row.Status = db.RootDiskStatusAttached
 	}
 	p.rootDisks[row.DiskID] = row
+	if row.InstanceID != nil {
+		p.rootDiskByInstance[*row.InstanceID] = row.DiskID
+	}
 }
 
 // seedNetworkInterface adds a NIC directly.
@@ -244,9 +255,64 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 			InstanceTypeID:   asStr(args[3]),
 			ImageID:          asStr(args[4]),
 			AvailabilityZone: asStr(args[5]),
+			SSHKeyName:       asStr(args[6]),
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
+		return &fakeTag{1}, nil
+
+	// VM-P2C-P2 / VM-TRUSTED-IMAGE-FACTORY-PHASE-J: CreateImage INSERT.
+	// Column order: id, name, os_family, os_version, architecture,
+	// owner_id, visibility, source_type, storage_url, min_disk_gb,
+	// status, validation_status, source_snapshot_id, import_url,
+	// family_name, family_version, provenance_hash, signature_valid,
+	// format, size_bytes, image_digest, validation_error.
+	case strings.Contains(sql, "INSERT INTO images"):
+		id := asStr(args[0])
+		now := time.Now()
+		minDisk := 0
+		if v, ok := args[9].(int); ok {
+			minDisk = v
+		}
+		var sizeBytes int64
+		if len(args) > 19 {
+			if v, ok := args[19].(int64); ok {
+				sizeBytes = v
+			}
+		}
+		img := &db.ImageRow{
+			ID:               id,
+			Name:             asStr(args[1]),
+			OSFamily:         asStr(args[2]),
+			OSVersion:        asStr(args[3]),
+			Architecture:     asStr(args[4]),
+			OwnerID:          asStr(args[5]),
+			Visibility:       asStr(args[6]),
+			SourceType:       asStr(args[7]),
+			StorageURL:       asStr(args[8]),
+			MinDiskGB:        minDisk,
+			Status:           asStr(args[10]),
+			ValidationStatus: asStr(args[11]),
+			CreatedAt:        now,
+			UpdatedAt:        now,
+			SourceSnapshotID: asStrPtr(args[12]),
+			ImportURL:        asStrPtr(args[13]),
+			FamilyName:       asStrPtr(args[14]),
+			FamilyVersion:    asIntPtr(args[15]),
+			ProvenanceHash:   asStrPtr(args[16]),
+			SignatureValid:   asBoolPtr(args[17]),
+		}
+		if len(args) > 18 {
+			img.Format = asStr(args[18])
+		}
+		img.SizeBytes = sizeBytes
+		if len(args) > 20 {
+			img.ImageDigest = asStrPtr(args[20])
+		}
+		if len(args) > 21 {
+			img.ValidationError = asStrPtr(args[21])
+		}
+		p.images[id] = img
 		return &fakeTag{1}, nil
 
 	case strings.Contains(sql, "UPDATE images"):
@@ -255,6 +321,64 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 		if !ok {
 			return &fakeTag{0}, nil
 		}
+
+		// SetValidationInProgress: "validation_status = 'validating'"
+		// SQL: UPDATE images SET validation_status = 'validating', validation_error = NULL, updated_at = NOW()
+		//      WHERE id = $1 AND status = 'PENDING_VALIDATION'
+		if strings.Contains(sql, "validation_status = 'validating'") {
+			if img.Status != db.ImageStatusPendingValidation {
+				return &fakeTag{0}, nil
+			}
+			img.ValidationStatus = db.ImageValidationValidating
+			img.ValidationError = nil
+			img.UpdatedAt = time.Now()
+			return &fakeTag{1}, nil
+		}
+
+		// WriteImageArtifactMetadata: "format = $2" (may have alignment whitespace)
+		if strings.Contains(sql, "format") && strings.Contains(sql, "$2") &&
+			!strings.Contains(sql, "family_version") {
+			img.Format = asStr(args[1])
+			if v, ok := args[2].(int64); ok {
+				img.SizeBytes = v
+			}
+			img.ImageDigest = asStrPtr(args[3])
+			img.UpdatedAt = time.Now()
+			return &fakeTag{1}, nil
+		}
+
+		// SetImageValidationError: "validation_error = $2"
+		if strings.Contains(sql, "validation_error") && strings.Contains(sql, "$2") &&
+			!strings.Contains(sql, "format") {
+			img.ValidationError = asStrPtr(args[1])
+			img.UpdatedAt = time.Now()
+			return &fakeTag{1}, nil
+		}
+
+		// UpdateImageValidationStatus: "AND status = 'PENDING_VALIDATION'" (in WHERE clause)
+		// AND uses placeholder $2, $3 for validation_status and status.
+		if strings.Contains(sql, "AND status = 'PENDING_VALIDATION'") {
+			if strings.Contains(sql, "validation_status = $2") {
+				// UpdateImageValidationStatus: args[0]=id, args[1]=validationStatus, args[2]=imageStatus
+				img.ValidationStatus = asStr(args[1])
+				img.Status = asStr(args[2])
+			} else {
+				// PromoteValidatedImage or FailValidatedImage: literal values in SET clause
+				// args[0]=id
+				// SQL uses alignment whitespace; check without exact spacing.
+				if strings.Contains(sql, "'ACTIVE'") && strings.Contains(sql, "status") {
+					img.Status = db.ImageStatusActive
+					img.ValidationStatus = db.ImageValidationPassed
+				} else if strings.Contains(sql, "'FAILED'") && strings.Contains(sql, "FAILED") {
+					img.Status = db.ImageStatusFailed
+					img.ValidationStatus = db.ImageValidationFailed
+				}
+			}
+			img.UpdatedAt = time.Now()
+			return &fakeTag{1}, nil
+		}
+
+		// Default: UpdateImageStatus (set status, deprecated_at, obsoleted_at)
 		img.Status = args[1].(string)
 		if len(args) > 2 && args[2] != nil {
 			v := args[2].(*time.Time)
@@ -570,6 +694,22 @@ func (p *memPool) Exec(_ context.Context, sql string, args ...any) (db.CommandTa
 			UpdatedAt:        now,
 		}
 		return &fakeTag{1}, nil
+
+	// VM-TRUSTED-IMAGE-FACTORY-PHASE-J: RecordValidationStage
+	// INSERT INTO image_validation_results (id, image_id, job_id, stage, result, detail_json, recorded_at)
+	// VALUES ($1, $2, $3, $4, $5, $6, NOW())
+	case strings.Contains(sql, "INSERT INTO image_validation_results"):
+		row := &db.ImageValidationResultRow{
+			ID:         asStr(args[0]),
+			ImageID:    asStr(args[1]),
+			JobID:      asStr(args[2]),
+			Stage:      asStr(args[3]),
+			Result:     asStr(args[4]),
+			DetailJSON: asStrPtr(args[5]),
+			RecordedAt: time.Now(),
+		}
+		p.imageValResults[row.ImageID] = append(p.imageValResults[row.ImageID], row)
+		return &fakeTag{1}, nil
 	}
 	return &fakeTag{0}, nil
 }
@@ -676,7 +816,7 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 	// VM-P2C-P1: ListImagesByPrincipal
 	// Matches WHERE visibility = 'PUBLIC' OR (visibility = 'PRIVATE' AND owner_id = $1)
 	// Source: image_repo.go ListImagesByPrincipal.
-	case strings.Contains(sql, "FROM images"):
+	case strings.Contains(sql, "FROM images") && !strings.Contains(sql, "image_validation_results"):
 		principalID := asStr(args[0])
 		var out []*db.ImageRow
 		for _, img := range p.images {
@@ -685,6 +825,24 @@ func (p *memPool) Query(_ context.Context, sql string, args ...any) (db.Rows, er
 			}
 		}
 		return &imageRows{rows: out}, nil
+
+	// VM-TRUSTED-IMAGE-FACTORY-PHASE-J: AllStagesPassed
+	// SELECT DISTINCT ON (stage) stage, result FROM image_validation_results WHERE image_id = $1 ...
+	case strings.Contains(sql, "FROM image_validation_results") && strings.Contains(sql, "DISTINCT ON"):
+		imageID := asStr(args[0])
+		results := p.imageValResults[imageID]
+		var rows []stringRow
+		// Find latest result per stage.
+		latest := make(map[string]string)
+		for _, r := range results {
+			latest[r.Stage] = r.Result
+		}
+		for stage, result := range latest {
+			if stage == "boot" || stage == "health" || stage == "security" || stage == "integrity" {
+				rows = append(rows, stringRow{stage: stage, result: result})
+			}
+		}
+		return &valResultRows{rows: rows}, nil
 	}
 	return &instRows{}, nil
 }
@@ -836,7 +994,7 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 		return &errRow{fmt.Errorf("no rows in result set")}
 
 	// VM-P2B: GetVolumeByID
-	case strings.Contains(sql, "FROM volumes") && strings.Contains(sql, "id = $1"):
+	case strings.Contains(sql, "FROM volumes") && strings.Contains(sql, "WHERE id = $1"):
 		id := asStr(args[0])
 		vol, ok := p.volumes[id]
 		if !ok || vol.DeletedAt != nil {
@@ -929,10 +1087,20 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 	// and handleGetImage). Visibility filtering is done in Go, not SQL.
 	// Source: image_repo.go GetImageByID.
 	// VM-P2D Slice 3: GetQuota — FROM project_quotas WHERE scope_id = $1
+	// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: expanded to 7 columns.
 	case strings.Contains(sql, "FROM project_quotas") && strings.Contains(sql, "scope_id = $1"):
 		scopeID := asStr(args[0])
 		if max, ok := p.quotas[scopeID]; ok {
-			return &quotaRow{scopeID: scopeID, maxInstances: max}
+			volGB := db.DefaultMaxVolumeGB
+			if vgb, okv := p.volumeQuotaMaxGB[scopeID]; okv {
+				volGB = vgb
+			}
+			return &quotaRow{
+				scopeID: scopeID, maxInstances: max,
+				maxVCPU: db.DefaultMaxVCPU, maxMemoryMB: db.DefaultMaxMemoryMB,
+				maxRootDiskGB: db.DefaultMaxRootDiskGB, maxVolumeGB: volGB,
+				maxIPCount: db.DefaultMaxIPCount,
+			}
 		}
 		// No row → signal ErrNoRows so GetQuota returns the default.
 		return &errRow{fmt.Errorf("no rows in result set")}
@@ -949,6 +1117,34 @@ func (p *memPool) QueryRow(_ context.Context, sql string, args ...any) db.Row {
 			}
 		}
 		return &intRow{value: count}
+
+	// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: SumActiveVCPUByScopeViaTypes
+	// SELECT COALESCE(SUM(it.vcpus), 0) FROM instances i JOIN instance_types it ...
+	case strings.Contains(sql, "SUM(it.vcpus)") && strings.Contains(sql, "JOIN instance_types"):
+		return &intRow{value: 0}
+
+	// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: SumActiveMemoryMBByScopeViaTypes
+	// SELECT COALESCE(SUM(it.memory_mb), 0) FROM instances i JOIN instance_types it ...
+	case strings.Contains(sql, "SUM(it.memory_mb)") && strings.Contains(sql, "JOIN instance_types"):
+		return &intRow{value: 0}
+
+	// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: SumActiveRootDiskGBByScope
+	// SELECT COALESCE(SUM(rd.size_gb), 0) FROM root_disks rd JOIN instances i ...
+	case strings.Contains(sql, "SUM(rd.size_gb)") && strings.Contains(sql, "JOIN instances i"):
+		return &intRow{value: 0}
+
+	// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: SumActiveVolumeGBByScope
+	// SELECT COALESCE(SUM(size_gb), 0) FROM volumes WHERE owner_principal_id = $1 ...
+	case strings.Contains(sql, "COALESCE(SUM(size_gb)") && strings.Contains(sql, "FROM volumes"):
+		scopeID := asStr(args[0])
+		sum := 0
+		for _, vol := range p.volumes {
+			if vol.OwnerPrincipalID == scopeID && vol.DeletedAt == nil &&
+				vol.Status != "deleted" && vol.Status != "failed" {
+				sum += vol.SizeGB
+			}
+		}
+		return &intRow{value: sum}
 
 	case strings.Contains(sql, "FROM images") && strings.Contains(sql, "family_name = $1"):
 		return p.familyQueryRowDispatch(sql, args)
@@ -982,8 +1178,8 @@ type instRow struct{ r *db.InstanceRow }
 
 func (row *instRow) Scan(dest ...any) error {
 	r := row.r
-	if len(dest) < 12 {
-		return fmt.Errorf("instRow.Scan: need 12 dest, got %d", len(dest))
+	if len(dest) < 13 {
+		return fmt.Errorf("instRow.Scan: need 13 dest, got %d", len(dest))
 	}
 	*dest[0].(*string) = r.ID
 	*dest[1].(*string) = r.Name
@@ -993,10 +1189,11 @@ func (row *instRow) Scan(dest ...any) error {
 	*dest[5].(*string) = r.ImageID
 	*dest[6].(**string) = r.HostID
 	*dest[7].(*string) = r.AvailabilityZone
-	*dest[8].(*int) = r.Version
-	*dest[9].(*time.Time) = r.CreatedAt
-	*dest[10].(*time.Time) = r.UpdatedAt
-	*dest[11].(**time.Time) = r.DeletedAt
+	*dest[8].(*string) = r.SSHKeyName
+	*dest[9].(*int) = r.Version
+	*dest[10].(*time.Time) = r.CreatedAt
+	*dest[11].(*time.Time) = r.UpdatedAt
+	*dest[12].(**time.Time) = r.DeletedAt
 	return nil
 }
 
@@ -1152,8 +1349,8 @@ func (r *instRows) Next() bool {
 
 func (r *instRows) Scan(dest ...any) error {
 	row := r.rows[r.pos-1]
-	if len(dest) < 12 {
-		return fmt.Errorf("instRows.Scan: need 12 dest, got %d", len(dest))
+	if len(dest) < 13 {
+		return fmt.Errorf("instRows.Scan: need 13 dest, got %d", len(dest))
 	}
 	*dest[0].(*string) = row.ID
 	*dest[1].(*string) = row.Name
@@ -1163,10 +1360,11 @@ func (r *instRows) Scan(dest ...any) error {
 	*dest[5].(*string) = row.ImageID
 	*dest[6].(**string) = row.HostID
 	*dest[7].(*string) = row.AvailabilityZone
-	*dest[8].(*int) = row.Version
-	*dest[9].(*time.Time) = row.CreatedAt
-	*dest[10].(*time.Time) = row.UpdatedAt
-	*dest[11].(**time.Time) = row.DeletedAt
+	*dest[8].(*string) = row.SSHKeyName
+	*dest[9].(*int) = row.Version
+	*dest[10].(*time.Time) = row.CreatedAt
+	*dest[11].(*time.Time) = row.UpdatedAt
+	*dest[12].(**time.Time) = row.DeletedAt
 	return nil
 }
 
@@ -1197,6 +1395,39 @@ func (r *stringRows) Scan(dest ...any) error {
 
 func (r *stringRows) Close()     {}
 func (r *stringRows) Err() error { return nil }
+
+// stringRow holds a stage+result pair for AllStagesPassed query results.
+type stringRow struct {
+	stage  string
+	result string
+}
+
+// valResultRows implements db.Rows for image_validation_results queries.
+type valResultRows struct {
+	rows []stringRow
+	pos  int
+}
+
+func (r *valResultRows) Next() bool {
+	if r.pos >= len(r.rows) {
+		return false
+	}
+	r.pos++
+	return true
+}
+
+func (r *valResultRows) Scan(dest ...any) error {
+	row := r.rows[r.pos-1]
+	if len(dest) < 2 {
+		return fmt.Errorf("valResultRows.Scan: need 2 dest")
+	}
+	*dest[0].(*string) = row.stage
+	*dest[1].(*string) = row.result
+	return nil
+}
+
+func (r *valResultRows) Close()     {}
+func (r *valResultRows) Err() error { return nil }
 
 // M10 Slice 1: projRow scans a single ProjectRow.
 type projRow struct{ r *db.ProjectRow }
@@ -1320,17 +1551,28 @@ func (r *rootDiskRows) Close()     {}
 func (r *rootDiskRows) Err() error { return nil }
 
 // VM-P2D Slice 3: quotaRow returns a single quota row for project_quotas queries.
+// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: expanded to 7 columns.
 type quotaRow struct {
-	scopeID      string
-	maxInstances int
+	scopeID       string
+	maxInstances  int
+	maxVCPU       int
+	maxMemoryMB   int
+	maxRootDiskGB int
+	maxVolumeGB   int
+	maxIPCount    int
 }
 
 func (row *quotaRow) Scan(dest ...any) error {
-	if len(dest) < 2 {
-		return fmt.Errorf("quotaRow.Scan: need 2 dest, got %d", len(dest))
+	if len(dest) < 7 {
+		return fmt.Errorf("quotaRow.Scan: need 7 dest, got %d", len(dest))
 	}
 	*dest[0].(*string) = row.scopeID
 	*dest[1].(*int) = row.maxInstances
+	*dest[2].(*int) = row.maxVCPU
+	*dest[3].(*int) = row.maxMemoryMB
+	*dest[4].(*int) = row.maxRootDiskGB
+	*dest[5].(*int) = row.maxVolumeGB
+	*dest[6].(*int) = row.maxIPCount
 	return nil
 }
 
@@ -1491,6 +1733,34 @@ func asStrPtr(v any) *string {
 	}
 	if s, ok := v.(string); ok && s != "" {
 		return &s
+	}
+	return nil
+}
+
+// asIntPtr extracts a *int from an any value.
+func asIntPtr(v any) *int {
+	if v == nil {
+		return nil
+	}
+	if ip, ok := v.(*int); ok {
+		return ip
+	}
+	if i, ok := v.(int); ok {
+		return &i
+	}
+	return nil
+}
+
+// asBoolPtr extracts a *bool from an any value.
+func asBoolPtr(v any) *bool {
+	if v == nil {
+		return nil
+	}
+	if bp, ok := v.(*bool); ok {
+		return bp
+	}
+	if b, ok := v.(bool); ok {
+		return &b
 	}
 	return nil
 }
@@ -2984,4 +3254,20 @@ func TestCapacity_ErrorCodeDefined(t *testing.T) {
 		t.Errorf("errInsufficientCapacity (%q) must differ from errInternalError (%q)",
 			errInsufficientCapacity, errInternalError)
 	}
+}
+
+// ── Instance shape resolution helpers for quota dimension tests ──────────────
+
+// instanceShapeVCPU returns the vCPU count for a given instance type.
+// Mirrors shapeVCPU from instance_validation.go.
+func instanceShapeVCPU(t string) int {
+	return map[string]int{"c1.small": 2, "c1.medium": 4, "c1.large": 8, "c1.xlarge": 16}[t]
+}
+
+func instanceShapeMemMB(t string) int {
+	return map[string]int{"c1.small": 4096, "c1.medium": 8192, "c1.large": 16384, "c1.xlarge": 32768}[t]
+}
+
+func instanceShapeDiskGB(t string) int {
+	return map[string]int{"c1.small": 50, "c1.medium": 100, "c1.large": 200, "c1.xlarge": 500}[t]
 }

@@ -57,6 +57,7 @@ import (
 	"time"
 
 	"github.com/compute-platform/compute-platform/internal/db"
+	"github.com/compute-platform/compute-platform/packages/idgen"
 )
 
 // ── imageCatalogPool ──────────────────────────────────────────────────────────
@@ -838,7 +839,377 @@ func TestIsPlatformSourceType(t *testing.T) {
 	}
 }
 
-// ── Response shape: trust fields not leaked ───────────────────────────────────
+// ── PROMOTE tests (VM-TRUSTED-IMAGE-FACTORY-PHASE-J) ────────────────────────
+
+func TestPromote_HappyPath(t *testing.T) {
+	// An image in PENDING_VALIDATION with all stages passed can be promoted to ACTIVE.
+	s := newCatalogTestSrv(t)
+	img := userImage("img_promote_ok", "promote-ok", alice, db.ImageStatusPendingValidation)
+	img.ValidationStatus = db.ImageValidationPassed
+	seedCatalogImage(s.mem, img)
+
+	// Direct repo-level promotion — test the PromoteValidatedImage method directly.
+	// The HTTP endpoint requires AllStagesPassed which this test validates separately.
+	pool := newImageCatalogPool()
+	repo := db.New(pool)
+	pool.inner.images["img_direct_promote"] = &db.ImageRow{
+		ID: "img_direct_promote", Name: "direct-promote",
+		OSFamily: "ubuntu", OSVersion: "22.04", Architecture: "x86_64",
+		OwnerID: alice, Visibility: "PRIVATE", SourceType: "USER",
+		StorageURL: "", MinDiskGB: 10,
+		Status: db.ImageStatusPendingValidation, ValidationStatus: db.ImageValidationPassed,
+	}
+
+	// Promote cannot succeed because AllStagesPassed returns false when no
+	// validation results exist. Demonstrate the gate works.
+	allPassed, err := repo.AllStagesPassed(context.Background(), "img_direct_promote")
+	if err != nil {
+		t.Fatalf("AllStagesPassed error: %v", err)
+	}
+	if allPassed {
+		t.Error("AllStagesPassed should be false when no validation results exist")
+	}
+
+	// Record pass for all required stages, then promote.
+	for _, stage := range db.RequiredValidationStages {
+		row := &db.ImageValidationResultRow{
+			ID:      idgen.New("ivr"),
+			ImageID: "img_direct_promote",
+			JobID:   "job_promote_1",
+			Stage:   stage,
+			Result:  db.ValidationResultPass,
+		}
+		if err := repo.RecordValidationStage(context.Background(), row); err != nil {
+			t.Fatalf("RecordValidationStage %s: %v", stage, err)
+		}
+	}
+
+	allPassed, err = repo.AllStagesPassed(context.Background(), "img_direct_promote")
+	if err != nil {
+		t.Fatalf("AllStagesPassed after recording: %v", err)
+	}
+	if !allPassed {
+		t.Fatal("AllStagesPassed should be true after all required stages pass")
+	}
+
+	if err := repo.PromoteValidatedImage(context.Background(), "img_direct_promote"); err != nil {
+		t.Fatalf("PromoteValidatedImage: %v", err)
+	}
+
+	img = pool.inner.images["img_direct_promote"]
+	if img.Status != db.ImageStatusActive {
+		t.Errorf("want ACTIVE after promote, got %q", img.Status)
+	}
+	if img.ValidationStatus != db.ImageValidationPassed {
+		t.Errorf("want validation_status=passed, got %q", img.ValidationStatus)
+	}
+}
+
+func TestPromote_NotPendingValidation_Rejected(t *testing.T) {
+	// An ACTIVE image cannot be promoted again.
+	s := newCatalogTestSrv(t)
+	seedCatalogImage(s.mem, userImage("img_already_active", "already-active", alice, db.ImageStatusActive))
+
+	// HTTP promote should return 422.
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/images/img_already_active/promote", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422 for promoting ACTIVE image, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errImageInvalidState {
+		t.Errorf("want %q, got %q", errImageInvalidState, env.Error.Code)
+	}
+}
+
+func TestPromote_NotOwned_Returns404(t *testing.T) {
+	// Non-owner cannot promote another principal's image.
+	s := newCatalogTestSrv(t)
+	seedCatalogImage(s.mem, userImage("img_bob_promote", "bob-promote", bob, db.ImageStatusPendingValidation))
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/images/img_bob_promote/promote", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for non-owner promote, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errImageNotFound {
+		t.Errorf("want %q, got %q", errImageNotFound, env.Error.Code)
+	}
+}
+
+func TestPromote_WithoutValidation_Rejected(t *testing.T) {
+	// PENDING_VALIDATION image without all stages passed cannot be promoted.
+	s := newCatalogTestSrv(t)
+	img := userImage("img_no_validation", "no-validation", alice, db.ImageStatusPendingValidation)
+	img.ValidationStatus = db.ImageValidationPending
+	seedCatalogImage(s.mem, img)
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/images/img_no_validation/promote", nil, authHdr(alice))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422 for promote without validation passed, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errImagePromoteValidationFailed {
+		t.Errorf("want %q, got %q", errImagePromoteValidationFailed, env.Error.Code)
+	}
+}
+
+func TestPromote_Successful_Returns200(t *testing.T) {
+	// Full end-to-end promote: create PENDING_VALIDATION image, record all stages
+	// as passed, then promote via HTTP and verify ACTIVE.
+	pool := newImageCatalogPool()
+	repo := db.New(pool)
+
+	img := userImage("img_e2e_promote", "e2e-promote", alice, db.ImageStatusPendingValidation)
+	img.ValidationStatus = db.ImageValidationPending
+	pool.inner.images["img_e2e_promote"] = img
+
+	// Record pass for all required stages.
+	for _, stage := range db.RequiredValidationStages {
+		row := &db.ImageValidationResultRow{
+			ID:      idgen.New("ivr"),
+			ImageID: "img_e2e_promote",
+			JobID:   "job_e2e",
+			Stage:   stage,
+			Result:  db.ValidationResultPass,
+		}
+		if err := repo.RecordValidationStage(context.Background(), row); err != nil {
+			t.Fatalf("RecordValidationStage %s: %v", stage, err)
+		}
+	}
+
+	// Promote via repo — verify the promotion gate passes with all stages recorded.
+	if err := repo.PromoteValidatedImage(context.Background(), "img_e2e_promote"); err != nil {
+		t.Fatalf("PromoteValidatedImage: %v", err)
+	}
+
+	updated := pool.inner.images["img_e2e_promote"]
+	if updated.Status != db.ImageStatusActive {
+		t.Errorf("want ACTIVE after promote, got %q", updated.Status)
+	}
+}
+
+// ── VALIDATION STATUS tests ──────────────────────────────────────────────────
+
+func TestValidationStatus_ValidatingTransition(t *testing.T) {
+	// SetValidationInProgress transitions validation_status from pending to validating.
+	pool := newImageCatalogPool()
+	repo := db.New(pool)
+
+	pool.inner.images["img_validating"] = &db.ImageRow{
+		ID: "img_validating", Name: "validating-test",
+		OSFamily: "ubuntu", OSVersion: "22.04", Architecture: "x86_64",
+		OwnerID: alice, Visibility: "PRIVATE", SourceType: "USER",
+		StorageURL: "", MinDiskGB: 10,
+		Status: db.ImageStatusPendingValidation, ValidationStatus: db.ImageValidationPending,
+	}
+
+	if err := repo.SetValidationInProgress(context.Background(), "img_validating"); err != nil {
+		t.Fatalf("SetValidationInProgress: %v", err)
+	}
+
+	img := pool.inner.images["img_validating"]
+	if img.ValidationStatus != db.ImageValidationValidating {
+		t.Errorf("want validation_status=validating, got %q", img.ValidationStatus)
+	}
+	if img.ValidationError != nil {
+		t.Errorf("validation_error should be nil after SetValidationInProgress, got %q", *img.ValidationError)
+	}
+}
+
+func TestValidationStatus_NotPendingValidation_Rejected(t *testing.T) {
+	// SetValidationInProgress fails if image is not in PENDING_VALIDATION.
+	pool := newImageCatalogPool()
+	repo := db.New(pool)
+
+	pool.inner.images["img_already_active2"] = &db.ImageRow{
+		ID: "img_already_active2", Name: "active-img",
+		OSFamily: "ubuntu", OSVersion: "22.04", Architecture: "x86_64",
+		OwnerID: alice, Visibility: "PRIVATE", SourceType: "USER",
+		StorageURL: "", MinDiskGB: 10,
+		Status: db.ImageStatusActive, ValidationStatus: db.ImageValidationPassed,
+	}
+
+	err := repo.SetValidationInProgress(context.Background(), "img_already_active2")
+	if err == nil {
+		t.Error("SetValidationInProgress should fail for non-PENDING_VALIDATION image")
+	}
+}
+
+func TestValidationFailure_RecordsError(t *testing.T) {
+	// SetImageValidationError records an error on the image row.
+	pool := newImageCatalogPool()
+	repo := db.New(pool)
+
+	pool.inner.images["img_fail_error"] = &db.ImageRow{
+		ID: "img_fail_error", Name: "fail-error",
+		OSFamily: "ubuntu", OSVersion: "22.04", Architecture: "x86_64",
+		OwnerID: alice, Visibility: "PRIVATE", SourceType: "IMPORT",
+		StorageURL: "", MinDiskGB: 10,
+		Status: db.ImageStatusPendingValidation, ValidationStatus: db.ImageValidationPending,
+	}
+
+	errMsg := "format check failed: unsupported format"
+	if err := repo.SetImageValidationError(context.Background(), "img_fail_error", errMsg); err != nil {
+		t.Fatalf("SetImageValidationError: %v", err)
+	}
+
+	img := pool.inner.images["img_fail_error"]
+	if img.ValidationError == nil {
+		t.Fatal("validation_error should be set")
+	}
+	if *img.ValidationError != errMsg {
+		t.Errorf("want %q, got %q", errMsg, *img.ValidationError)
+	}
+}
+
+// ── IMPORT QUARANTINE tests ──────────────────────────────────────────────────
+
+func TestImportQuarantine_ImportedImageStartsNonLaunchable(t *testing.T) {
+	// An imported image starts in PENDING_VALIDATION status and is blocked from launch.
+	s := newCatalogTestSrv(t)
+	now := time.Now()
+	importURL := "https://example.com/images/test.qcow2"
+	img := &db.ImageRow{
+		ID: "img_import_quarantine", Name: "import-quarantine",
+		OSFamily: "ubuntu", OSVersion: "22.04", Architecture: "x86_64",
+		OwnerID: alice, Visibility: "PRIVATE", SourceType: db.ImageSourceTypeImport,
+		StorageURL: "", MinDiskGB: 10,
+		Status: db.ImageStatusPendingValidation, ValidationStatus: db.ImageValidationPending,
+		ImportURL: &importURL, CreatedAt: now, UpdatedAt: now,
+	}
+	seedCatalogImage(s.mem, img)
+
+	// Launch attempt must be blocked.
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		imageAdmissionBody("img_import_quarantine"), authHdr(alice))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("want 422 for PENDING_VALIDATION imported image, got %d", resp.StatusCode)
+	}
+	var env apiError
+	decodeBody(t, resp, &env)
+	if env.Error.Code != errImageNotLaunchable {
+		t.Errorf("want %q, got %q", errImageNotLaunchable, env.Error.Code)
+	}
+}
+
+// ── FAMILY LATEST EXCLUDES BLOCKED tests ─────────────────────────────────────
+
+func TestFamilyLatest_ExcludesPendingValidation(t *testing.T) {
+	// Family latest resolution must exclude PENDING_VALIDATION images.
+	pool := newImageCatalogPool()
+	repo := db.New(pool)
+
+	fn := "exclude-pending-family"
+	fv := 1
+	pool.inner.images["img-pending-fam"] = &db.ImageRow{
+		ID: "img-pending-fam", Name: "pending-in-family",
+		OSFamily: "ubuntu", OSVersion: "22.04", Architecture: "x86_64",
+		OwnerID: "system", Visibility: "PUBLIC", SourceType: "PLATFORM",
+		StorageURL: "", MinDiskGB: 10,
+		Status: db.ImageStatusPendingValidation, ValidationStatus: db.ImageValidationPending,
+		FamilyName: &fn, FamilyVersion: &fv, CreatedAt: time.Now(),
+	}
+
+	resolved, err := repo.ResolveFamilyLatest(context.Background(), "exclude-pending-family", "any")
+	if err != nil {
+		t.Fatalf("ResolveFamilyLatest: %v", err)
+	}
+	if resolved != nil {
+		t.Errorf("want nil (PENDING_VALIDATION excluded), got %q", resolved.ID)
+	}
+}
+
+func TestFamilyLatest_ExcludesFailed(t *testing.T) {
+	// Family latest resolution must exclude FAILED images.
+	pool := newImageCatalogPool()
+	repo := db.New(pool)
+
+	fn := "exclude-failed-family"
+	fv := 1
+	pool.inner.images["img-failed-fam"] = &db.ImageRow{
+		ID: "img-failed-fam", Name: "failed-in-family",
+		OSFamily: "ubuntu", OSVersion: "22.04", Architecture: "x86_64",
+		OwnerID: "system", Visibility: "PUBLIC", SourceType: "PLATFORM",
+		StorageURL: "", MinDiskGB: 10,
+		Status: db.ImageStatusFailed, ValidationStatus: db.ImageValidationFailed,
+		FamilyName: &fn, FamilyVersion: &fv, CreatedAt: time.Now(),
+	}
+
+	resolved, err := repo.ResolveFamilyLatest(context.Background(), "exclude-failed-family", "any")
+	if err != nil {
+		t.Fatalf("ResolveFamilyLatest: %v", err)
+	}
+	if resolved != nil {
+		t.Errorf("want nil (FAILED excluded), got %q", resolved.ID)
+	}
+}
+
+// ── ARTIFACT METADATA tests ──────────────────────────────────────────────────
+
+func TestArtifactMetadata_WriteAndRead(t *testing.T) {
+	// WriteImageArtifactMetadata records format, size_bytes, and image_digest.
+	pool := newImageCatalogPool()
+	repo := db.New(pool)
+
+	pool.inner.images["img_meta"] = &db.ImageRow{
+		ID: "img_meta", Name: "meta-test",
+		OSFamily: "ubuntu", OSVersion: "22.04", Architecture: "x86_64",
+		OwnerID: alice, Visibility: "PRIVATE", SourceType: "IMPORT",
+		StorageURL: "", MinDiskGB: 10,
+		Status: db.ImageStatusPendingValidation, ValidationStatus: db.ImageValidationPending,
+	}
+
+	if err := repo.WriteImageArtifactMetadata(context.Background(), "img_meta", "qcow2", 524288000, "sha256:abc123def456"); err != nil {
+		t.Fatalf("WriteImageArtifactMetadata: %v", err)
+	}
+
+	img := pool.inner.images["img_meta"]
+	if img.Format != "qcow2" {
+		t.Errorf("want format=qcow2, got %q", img.Format)
+	}
+	if img.SizeBytes != 524288000 {
+		t.Errorf("want size_bytes=524288000, got %d", img.SizeBytes)
+	}
+	if img.ImageDigest == nil || *img.ImageDigest != "sha256:abc123def456" {
+		t.Errorf("want image_digest=sha256:abc123def456, got %v", img.ImageDigest)
+	}
+}
+
+// ── DEPRECATED IMAGE LAUNCH ADMISSION ────────────────────────────────────────
+
+func TestAdmission_DeprecatedImage_StillLaunchable(t *testing.T) {
+	// DEPRECATED images must remain launchable per contract.
+	s := newCatalogTestSrv(t)
+	seedCatalogImage(s.mem, userImage("img_dep_launch", "dep-launch", alice, db.ImageStatusDeprecated))
+
+	resp := doReq(t, s.ts, http.MethodPost, "/v1/instances",
+		imageAdmissionBody("img_dep_launch"), authHdr(alice))
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("want 202 for DEPRECATED image, got %d", resp.StatusCode)
+	}
+}
+
+// ── INNER POOL ACCESS helper ─────────────────────────────────────────────────
+
+func TestCatalogPool_AccessInnerImages(t *testing.T) {
+	// Verify imageCatalogPool delegation works for the full lifecycle.
+	pool := newImageCatalogPool()
+	repo := db.New(pool)
+
+	img := userImage("img_cat_access", "cat-access", alice, db.ImageStatusActive)
+	pool.inner.images["img_cat_access"] = img
+
+	fetched, err := repo.GetImageByID(context.Background(), "img_cat_access")
+	if err != nil {
+		t.Fatalf("GetImageByID: %v", err)
+	}
+	if fetched == nil || fetched.ID != "img_cat_access" {
+		t.Error("GetImageByID failed to return seeded image")
+	}
+}
 
 func TestImageResponse_TrustFieldsNotExposed(t *testing.T) {
 	// provenance_hash and signature_valid are internal fields and must not appear

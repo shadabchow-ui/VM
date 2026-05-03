@@ -200,6 +200,9 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	// Collect security group rules for host-side enforcement.
 	sgRules := effectiveSGRulesToSpec(h.deps.Store, ctx, inst.ID)
 
+	// ── Resolve SSH public key from instance's ssh_key_name ──────────────────
+	sshPublicKey := h.resolveSSHKey(ctx, inst)
+
 	createReq := &runtimeclient.CreateInstanceRequest{
 		InstanceID:     inst.ID,
 		ImageURL:       imageURLFromID(inst.ImageID),
@@ -214,7 +217,9 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 			MacAddress: deriveMACAddress(inst.ID),
 			SGRules:    sgRules,
 		},
-		ExtraDisks: extraDisks,
+		ExtraDisks:   extraDisks,
+		SSHPublicKey: sshPublicKey,
+		Hostname:     inst.ID,
 	}
 	if _, err := rtClient.CreateInstance(ctx, createReq); err != nil {
 		// Rollback: release IP, then fail instance.
@@ -409,4 +414,32 @@ func (h *CreateHandler) SetRuntimeFactory(f func(hostID, address string) Runtime
 // SetReadinessFn overrides the readiness check function. Used by integration tests.
 func (h *CreateHandler) SetReadinessFn(f func(ctx context.Context, ip string, timeout time.Duration) error) {
 	h.readinessFn = f
+}
+
+// resolveSSHKey returns the public key content for the instance's ssh_key_name.
+// Returns empty string when no ssh_key_name is set or the key cannot be resolved.
+// SSH key lookup failures are logged but non-fatal — the instance boots without
+// SSH key injection, which is acceptable for Phase 1 (the user can still access
+// via serial console or metadata service).
+func (h *CreateHandler) resolveSSHKey(ctx context.Context, inst *db.InstanceRow) string {
+	if inst.SSHKeyName == "" {
+		return ""
+	}
+	key, err := h.deps.Store.GetSSHKeyByPrincipalName(ctx, inst.OwnerPrincipalID, inst.SSHKeyName)
+	if err != nil {
+		h.log.Warn("could not resolve SSH key for instance — booting without SSH key",
+			"instance_id", inst.ID,
+			"ssh_key_name", inst.SSHKeyName,
+			"error", err,
+		)
+		return ""
+	}
+	if key == nil {
+		h.log.Warn("SSH key not found — booting without SSH key",
+			"instance_id", inst.ID,
+			"ssh_key_name", inst.SSHKeyName,
+		)
+		return ""
+	}
+	return key.PublicKey
 }

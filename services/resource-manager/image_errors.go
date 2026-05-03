@@ -6,6 +6,7 @@ package main
 // VM-P2C-P2: added custom image creation and import error codes.
 // VM-P2C-P3: added family resolution error codes.
 // VM-P3B Job 2: added platform trust boundary error code.
+// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: added promote validation failure code.
 //
 // Follows the same pattern as snapshot_errors.go and instance_errors.go:
 // constants only; all error writing goes through writeAPIError / writeAPIErrors.
@@ -107,4 +108,10 @@ const (
 	//    image with owner: platform. It MUST NOT attempt to verify signatures for
 	//    images with owner: project_id (custom images)."
 	errImageTrustViolation = "image_trust_violation"
+
+	// errImagePromoteValidationFailed is returned when POST /v1/images/{id}/promote
+	// is called but not all required validation stages have passed.
+	// Returns HTTP 422 Unprocessable Entity.
+	// Source: vm-13-01__blueprint__ §Image Catalog and Lifecycle Manager.
+	errImagePromoteValidationFailed = "image_promote_validation_failed"
 )

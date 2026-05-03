@@ -66,6 +66,27 @@ const (
 
 	// VM Job 10: quota event type.
 	EventQuotaExceeded = "quota.exceeded"
+
+	// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: denied-operation event types.
+	// Emitted when a principal attempts an operation they are not authorized to perform.
+	EventOperationDenied              = "operation.denied"
+	EventOperationDeniedQuota         = "operation.denied.quota"
+	EventOperationDeniedAuthorization = "operation.denied.authorization"
+	EventOperationDeniedCapacity      = "operation.denied.capacity"
+
+	// ── Runtime drift events ─────────────────────────────────────────────────
+	EventRuntimeDriftDBRunningNoRuntime        = "runtime.drift.db_running_no_runtime"
+	EventRuntimeDriftDBStoppedRuntimePresent   = "runtime.drift.db_stopped_runtime_present"
+	EventRuntimeDriftOrphanRuntime             = "runtime.drift.orphan_runtime_process"
+	EventRuntimeDriftStaleArtifacts            = "runtime.drift.stale_host_artifacts"
+
+	// ── Host lifecycle events ────────────────────────────────────────────────
+	EventHostDrainStarted   = "host.drain.started"
+	EventHostDrainCompleted = "host.drain.completed"
+	EventHostDegraded       = "host.degraded"
+	EventHostUnhealthy      = "host.unhealthy"
+	EventHostRecovered      = "host.recovered"
+	EventHostRetired        = "host.retired"
 )
 
 // InsertEvent appends an event to the instance event log.

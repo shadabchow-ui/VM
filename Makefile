@@ -3,7 +3,8 @@
         build-worker build-host-agent build-resource-manager build-scheduler build-cli \
         build-network-controller \
         m0-gate m1-gate m2-gate m8-gate m8-gate-full \
-        test-m8 \
+        phase-l-gate phase-l-gate-full \
+        test-m8 test-phase-l \
         test-network test-network-dryrun test-network-privileged test-network-e2e \
         run-worker run-host-agent run-network-controller
 
@@ -128,6 +129,20 @@ m8-gate:
 # Requires DATABASE_URL to be set and migrations applied.
 m8-gate-full:
 	DATABASE_URL=$(DATABASE_URL) bash scripts/m8-gate-check.sh --with-integration
+
+# Phase L gate: developer/operator confidence layer validation.
+# Safe by default — no DB, no Linux/KVM, no root.
+# Run with --with-integration for real DB tests.
+phase-l-gate:
+	bash scripts/phase-l-gate-check.sh
+
+# Phase L gate with integration tests against a real PostgreSQL instance.
+phase-l-gate-full:
+	DATABASE_URL=$(DATABASE_URL) bash scripts/phase-l-gate-check.sh --with-integration
+
+# Phase L unit test suite — runs all Phase L scaffolding tests.
+test-phase-l:
+	go test -v -short -run TestPhaseL_ -count=1 ./test/integration/...
 
 # Build network controller service (M2).
 build-network-controller:

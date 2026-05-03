@@ -167,6 +167,14 @@ type ObsoleteImageResponse struct {
 	Image ImageResponse `json:"image"`
 }
 
+// ── Promote ───────────────────────────────────────────────────────────────────
+
+// PromoteImageResponse is returned from POST /v1/images/{id}/promote with 200.
+// VM-TRUSTED-IMAGE-FACTORY-PHASE-J: promotion gate response.
+type PromoteImageResponse struct {
+	Image ImageResponse `json:"image"`
+}
+
 // ── Family alias ref (for create-instance) ────────────────────────────────────
 
 // ImageFamilyRef is the optional family-based image selection field embedded in

@@ -121,11 +121,24 @@ func main() {
 	// ── Start goroutines ──────────────────────────────────────────────────────
 	var wg sync.WaitGroup
 
-	// Heartbeat loop.
+	// Heartbeat loop — wires VMRuntime for real vm_load reporting.
+	vmLoadFn := func() int {
+		infos, err := vm.List(context.Background())
+		if err != nil {
+			return 0
+		}
+		count := 0
+		for _, info := range infos {
+			if info.IsRunning() {
+				count++
+			}
+		}
+		return count
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		HeartbeatLoop(ctx, cfg, mtlsClient, log)
+		HeartbeatLoop(ctx, cfg, mtlsClient, log, vmLoadFn)
 	}()
 
 	// RuntimeService HTTP server (dev fallback; not the production transport).

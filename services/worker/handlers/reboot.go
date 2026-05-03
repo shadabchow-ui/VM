@@ -105,6 +105,8 @@ func (h *RebootHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	// ── Step 5: Re-launch VM on the same host ─────────────────────────────────
 	// CreateInstance on host agent is idempotent — if the VM process already
 	// exists it returns success. Same rootfs path, same TAP, same IP.
+	sshPublicKey := h.resolveSSHKey(ctx, inst)
+
 	createReq := &runtimeclient.CreateInstanceRequest{
 		InstanceID:     inst.ID,
 		ImageURL:       imageURLFromID(inst.ImageID),
@@ -118,6 +120,8 @@ func (h *RebootHandler) Execute(ctx context.Context, job *db.JobRow) error {
 			TapDevice:  "tap-" + inst.ID[:8],
 			MacAddress: deriveMACAddress(inst.ID),
 		},
+		SSHPublicKey: sshPublicKey,
+		Hostname:     inst.ID,
 	}
 	if _, err := rtClient.CreateInstance(ctx, createReq); err != nil {
 		return h.failInstance(ctx, inst, fmt.Errorf("step5 CreateInstance (reboot): %w", err))
@@ -171,4 +175,20 @@ func (h *RebootHandler) SetRuntimeFactory(f func(hostID, address string) Runtime
 // SetReadinessFn overrides the readiness check function. Used by integration tests.
 func (h *RebootHandler) SetReadinessFn(f func(ctx context.Context, ip string, timeout time.Duration) error) {
 	h.readinessFn = f
+}
+
+// resolveSSHKey returns the public key content for the instance's ssh_key_name.
+func (h *RebootHandler) resolveSSHKey(ctx context.Context, inst *db.InstanceRow) string {
+	if inst.SSHKeyName == "" {
+		return ""
+	}
+	key, err := h.deps.Store.GetSSHKeyByPrincipalName(ctx, inst.OwnerPrincipalID, inst.SSHKeyName)
+	if err != nil || key == nil {
+		h.log.Warn("could not resolve SSH key for instance — booting without SSH key",
+			"instance_id", inst.ID,
+			"ssh_key_name", inst.SSHKeyName,
+		)
+		return ""
+	}
+	return key.PublicKey
 }

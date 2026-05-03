@@ -26,6 +26,7 @@ type InstanceRow struct {
 	ImageID          string
 	HostID           *string
 	AvailabilityZone string
+	SSHKeyName       string
 	Version          int
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
@@ -39,11 +40,12 @@ func (r *Repo) InsertInstance(ctx context.Context, row *InstanceRow) error {
 		INSERT INTO instances (
 			id, name, owner_principal_id, vm_state,
 			instance_type_id, image_id, availability_zone,
-			version, created_at, updated_at
-		) VALUES ($1,$2,$3,'requested',$4,$5,$6,0,NOW(),NOW())
+			ssh_key_name, version, created_at, updated_at
+		) VALUES ($1,$2,$3,'requested',$4,$5,$6,$7,0,NOW(),NOW())
 	`,
 		row.ID, row.Name, row.OwnerPrincipalID,
 		row.InstanceTypeID, row.ImageID, row.AvailabilityZone,
+		row.SSHKeyName,
 	)
 	if err != nil {
 		return fmt.Errorf("InsertInstance: %w", err)
@@ -58,14 +60,14 @@ func (r *Repo) GetInstanceByID(ctx context.Context, id string) (*InstanceRow, er
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, name, owner_principal_id, vm_state,
 		       instance_type_id, image_id, host_id, availability_zone,
-		       version, created_at, updated_at, deleted_at
+		       ssh_key_name, version, created_at, updated_at, deleted_at
 		FROM instances
 		WHERE id = $1
 		  AND deleted_at IS NULL
 	`, id).Scan(
 		&row.ID, &row.Name, &row.OwnerPrincipalID, &row.VMState,
 		&row.InstanceTypeID, &row.ImageID, &row.HostID, &row.AvailabilityZone,
-		&row.Version, &row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
+		&row.SSHKeyName, &row.Version, &row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("GetInstanceByID %s: %w", id, err)
@@ -124,7 +126,7 @@ func (r *Repo) ListInstancesByOwner(ctx context.Context, ownerPrincipalID string
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, name, owner_principal_id, vm_state,
 		       instance_type_id, image_id, host_id, availability_zone,
-		       version, created_at, updated_at, deleted_at
+		       ssh_key_name, version, created_at, updated_at, deleted_at
 		FROM instances
 		WHERE owner_principal_id = $1
 		  AND deleted_at IS NULL
@@ -141,7 +143,7 @@ func (r *Repo) ListInstancesByOwner(ctx context.Context, ownerPrincipalID string
 		if err := rows.Scan(
 			&row.ID, &row.Name, &row.OwnerPrincipalID, &row.VMState,
 			&row.InstanceTypeID, &row.ImageID, &row.HostID, &row.AvailabilityZone,
-			&row.Version, &row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
+			&row.SSHKeyName, &row.Version, &row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
 		); err != nil {
 			return nil, fmt.Errorf("ListInstancesByOwner scan: %w", err)
 		}
@@ -179,7 +181,7 @@ func (r *Repo) ListActiveInstances(ctx context.Context) ([]*InstanceRow, error) 
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, name, owner_principal_id, vm_state,
 		       instance_type_id, image_id, host_id, availability_zone,
-		       version, created_at, updated_at, deleted_at
+		       ssh_key_name, version, created_at, updated_at, deleted_at
 		FROM instances
 		WHERE deleted_at IS NULL
 		  AND vm_state NOT IN ('deleted', 'failed')
@@ -196,7 +198,7 @@ func (r *Repo) ListActiveInstances(ctx context.Context) ([]*InstanceRow, error) 
 		if err := rows.Scan(
 			&row.ID, &row.Name, &row.OwnerPrincipalID, &row.VMState,
 			&row.InstanceTypeID, &row.ImageID, &row.HostID, &row.AvailabilityZone,
-			&row.Version, &row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
+			&row.SSHKeyName, &row.Version, &row.CreatedAt, &row.UpdatedAt, &row.DeletedAt,
 		); err != nil {
 			return nil, fmt.Errorf("ListActiveInstances scan: %w", err)
 		}

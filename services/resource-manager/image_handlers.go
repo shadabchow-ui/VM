@@ -78,13 +78,13 @@ func (s *server) registerImageRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/images/", requirePrincipal(s.handleImageByID))
 }
 
-// handleImageRoot dispatches GET /v1/images.
-// POST /v1/images is not registered on this mux entry; callers expecting
-// image creation should use the dedicated POST route when available.
+// handleImageRoot dispatches GET /v1/images and POST /v1/images.
 func (s *server) handleImageRoot(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		s.handleListImages(w, r)
+	case http.MethodPost:
+		s.handleCreateImage(w, r)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -145,6 +145,10 @@ func (s *server) handleImageByID(w http.ResponseWriter, r *http.Request) {
 	// VM-P3B: POST /v1/images/{id}/grants
 	case actionRest == "grants" && r.Method == http.MethodPost:
 		s.handleGrantImageAccess(w, r, id)
+
+	// VM-TRUSTED-IMAGE-FACTORY-PHASE-J: POST /v1/images/{id}/promote
+	case actionRest == "promote" && r.Method == http.MethodPost:
+		s.handlePromoteImage(w, r, id)
 
 	// VM-P3B: DELETE /v1/images/{id}/grants/{grantee_principal_id}
 	case strings.HasPrefix(actionRest, "grants/") && r.Method == http.MethodDelete:
@@ -476,23 +480,17 @@ func (s *server) handleImportImage(w http.ResponseWriter, r *http.Request, req *
 // PUBLIC images (platform images): only if owned by caller (platform admin path;
 // standard users will hit 404 since they don't own platform images).
 //
+// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: uses centralized loadOwnedImage.
+//
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §3.4.
 func (s *server) handleDeprecateImage(w http.ResponseWriter, r *http.Request, id string) {
 	principal, _ := principalFromCtx(r.Context())
 
-	img, err := s.repo.GetImageByID(r.Context(), id)
-	if err != nil {
-		s.log.Error("GetImageByID (deprecate) failed", "image_id", id, "error", err)
-		writeDBError(w, err)
+	img, ok := s.loadOwnedImage(w, r, principal, id)
+	if !ok {
 		return
 	}
-	// Ownership check: 404-for-non-owner (not 403).
-	// Source: AUTH_OWNERSHIP_MODEL_V1 §3.
-	if img == nil || img.OwnerID != principal {
-		writeAPIError(w, http.StatusNotFound, errImageNotFound,
-			"The image does not exist or is not accessible.", "image_id")
-		return
-	}
+
 	// Only ACTIVE images may be deprecated.
 	if img.Status != db.ImageStatusActive {
 		writeAPIError(w, http.StatusUnprocessableEntity, errImageInvalidState,
@@ -531,22 +529,18 @@ func (s *server) handleDeprecateImage(w http.ResponseWriter, r *http.Request, id
 //
 // Transitions ACTIVE or DEPRECATED → OBSOLETE (synchronous status update).
 // OBSOLETE images are immediately blocked from launch.
+//
+// VM-ADMISSION-SCHEDULER-RBAC-PHASE-G-H: uses centralized loadOwnedImage.
+//
 // Source: P2_IMAGE_SNAPSHOT_MODEL.md §3.4.
 func (s *server) handleObsoleteImage(w http.ResponseWriter, r *http.Request, id string) {
 	principal, _ := principalFromCtx(r.Context())
 
-	img, err := s.repo.GetImageByID(r.Context(), id)
-	if err != nil {
-		s.log.Error("GetImageByID (obsolete) failed", "image_id", id, "error", err)
-		writeDBError(w, err)
+	img, ok := s.loadOwnedImage(w, r, principal, id)
+	if !ok {
 		return
 	}
-	// Ownership check: 404-for-non-owner.
-	if img == nil || img.OwnerID != principal {
-		writeAPIError(w, http.StatusNotFound, errImageNotFound,
-			"The image does not exist or is not accessible.", "image_id")
-		return
-	}
+
 	// ACTIVE and DEPRECATED images may be obsoleted.
 	if img.Status != db.ImageStatusActive && img.Status != db.ImageStatusDeprecated {
 		writeAPIError(w, http.StatusUnprocessableEntity, errImageInvalidState,
@@ -576,6 +570,81 @@ func (s *server) handleObsoleteImage(w http.ResponseWriter, r *http.Request, id 
 	)
 
 	writeJSON(w, http.StatusOK, ObsoleteImageResponse{Image: imageToResponse(img)})
+}
+
+// ── POST /v1/images/{id}/promote ─────────────────────────────────────────────
+
+// handlePromoteImage handles POST /v1/images/{id}/promote.
+//
+// Transitions PENDING_VALIDATION → ACTIVE if all required validation stages
+// have passed. The promotion gate (AllStagesPassed + PromoteValidatedImage) is
+// enforced atomically at the DB layer.
+//
+// Only the owning principal may promote a private image.
+// Returns 422 if the image is not in PENDING_VALIDATION status.
+// Returns 422 if not all validation stages have passed.
+//
+// Source: VM-TRUSTED-IMAGE-FACTORY-PHASE-J (promote requires validation passed),
+//
+//	vm-13-01__blueprint__ §Image Catalog and Lifecycle Manager.
+func (s *server) handlePromoteImage(w http.ResponseWriter, r *http.Request, id string) {
+	principal, _ := principalFromCtx(r.Context())
+
+	img, err := s.repo.GetImageByID(r.Context(), id)
+	if err != nil {
+		s.log.Error("GetImageByID (promote) failed", "image_id", id, "error", err)
+		writeDBError(w, err)
+		return
+	}
+	// Ownership check: 404-for-non-owner.
+	if img == nil || img.OwnerID != principal {
+		writeAPIError(w, http.StatusNotFound, errImageNotFound,
+			"The image does not exist or is not accessible.", "image_id")
+		return
+	}
+	// Only PENDING_VALIDATION images may be promoted.
+	if img.Status != db.ImageStatusPendingValidation {
+		writeAPIError(w, http.StatusUnprocessableEntity, errImageInvalidState,
+			"Image '"+id+"' cannot be promoted (current status: "+img.Status+"). Only PENDING_VALIDATION images may be promoted.", "image_id")
+		return
+	}
+
+	// Check that all required validation stages have passed.
+	allPassed, err := s.repo.AllStagesPassed(r.Context(), id)
+	if err != nil {
+		s.log.Error("AllStagesPassed failed", "image_id", id, "error", err)
+		writeDBError(w, err)
+		return
+	}
+	if !allPassed {
+		writeAPIError(w, http.StatusUnprocessableEntity, errImagePromoteValidationFailed,
+			"Image '"+id+"' cannot be promoted because not all validation stages have passed.", "image_id")
+		return
+	}
+
+	// Promote the image to ACTIVE.
+	if err := s.repo.PromoteValidatedImage(r.Context(), id); err != nil {
+		s.log.Error("PromoteValidatedImage failed", "image_id", id, "error", err)
+		writeDBError(w, err)
+		return
+	}
+
+	// Fetch updated row for response.
+	updated, err := s.repo.GetImageByID(r.Context(), id)
+	if err != nil {
+		s.log.Error("GetImageByID after promote failed", "image_id", id, "error", err)
+		writeDBError(w, err)
+		return
+	}
+
+	s.log.Info("audit_event",
+		"event_type", "IMAGE_PROMOTED",
+		"resource_type", "image",
+		"resource_id", id,
+		"actor", principal,
+	)
+
+	writeJSON(w, http.StatusOK, PromoteImageResponse{Image: imageToResponse(updated)})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

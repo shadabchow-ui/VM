@@ -1,0 +1,504 @@
+openapi: "3.0.3"
+info:
+  title: "Compute Platform API"
+  version: "2024-01-15"
+  description: >
+    VM control plane API for instance lifecycle, images, volumes, snapshots,
+    SSH keys, projects, and VPC networking.
+
+    All mutating endpoints accept an optional `Idempotency-Key` header for
+    retry-safe request deduplication.
+
+    Authentication: `X-Principal-ID` header (Phase 1). Phase 2 targets
+    SigV4 signed requests.
+
+    All error responses follow the registered error envelope
+    (see API_ERROR_CONTRACT_V1.md).
+
+    ## Unsupported / Partially implemented
+
+    - VPC/network endpoints: handler code is implemented and tested, but the
+      routes are NOT yet wired into the production HTTP mux. Available only
+      through the independent `NetworkHandlers` test seam.
+    - Instance networking (NICs, SGs) at launch: gateway handler code exists
+      but VPC network integration is incomplete.
+    - Quota enforcement: count-based model active; reservation-based deferred.
+    - RBAC: Phase 1 ownership model only (owner/principal). Phase 2 IAM not
+      implemented.
+    - KVM/real-machine runtime gate: all documented behaviour is proven at the
+      handler seam via unit + integration tests. Hardware-gate validation
+      requires Linux/KVM environment and is opt-in.
+    - Image trust/validation pipeline: platform signature validation exists;
+      user image import validation pipeline is minimal.
+    - Fleet maintenance (host drain/retire) is implemented on the internal API
+      (mTLS-protected) but not documented as a public endpoint — it is an
+      operator-only internal API.
+
+paths:
+  # ── Instances ──────────────────────────────────────────────────────────
+  /v1/instances:
+    get:
+      summary: "List instances"
+      operationId: "listInstances"
+      responses:
+        "200":
+          description: "Instance list (scoped to principal)"
+      parameters:
+        - name: "project_id"
+          in: "query"
+          schema:
+            type: "string"
+          description: "Optional: scope the list to a project"
+    post:
+      summary: "Create instance"
+      operationId: "createInstance"
+      responses:
+        "202":
+          description: "Instance creation accepted (async)"
+        "400":
+          description: "Invalid request"
+        "401":
+          description: "Missing or invalid authentication"
+        "422":
+          description: "Image not launchable, quota exceeded, or image family not found"
+
+  /v1/instances/{id}:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    get:
+      summary: "Describe instance"
+      operationId: "describeInstance"
+      responses:
+        "200":
+          description: "Instance details"
+        "404":
+          description: "Not found or not owned"
+    delete:
+      summary: "Delete instance"
+      operationId: "deleteInstance"
+      responses:
+        "202":
+          description: "Delete accepted (async)"
+
+  /v1/instances/{id}/stop:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    post:
+      summary: "Stop instance"
+      operationId: "stopInstance"
+      responses:
+        "202":
+          description: "Stop accepted"
+        "409":
+          description: "Illegal state transition"
+
+  /v1/instances/{id}/start:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    post:
+      summary: "Start instance"
+      operationId: "startInstance"
+      responses:
+        "202":
+          description: "Start accepted"
+        "409":
+          description: "Illegal state transition"
+
+  /v1/instances/{id}/reboot:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    post:
+      summary: "Reboot instance"
+      operationId: "rebootInstance"
+      responses:
+        "202":
+          description: "Reboot accepted"
+        "409":
+          description: "Illegal state transition"
+
+  /v1/instances/{id}/events:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    get:
+      summary: "List instance events"
+      operationId: "listInstanceEvents"
+      responses:
+        "200":
+          description: "Events (up to 100, newest first)"
+        "404":
+          description: "Instance not found or not owned"
+
+  /v1/instances/{id}/jobs/{job_id}:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+      - name: "job_id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    get:
+      summary: "Describe job"
+      operationId: "describeJob"
+      responses:
+        "200":
+          description: "Job status"
+        "404":
+          description: "Job not found, instance not found, or cross-account access"
+
+  # ── Images ─────────────────────────────────────────────────────────────
+  /v1/images:
+    get:
+      summary: "List images"
+      operationId: "listImages"
+      responses:
+        "200":
+          description: "Image list (visible to principal)"
+    post:
+      summary: "Create image (from snapshot or import)"
+      operationId: "createImage"
+      responses:
+        "202":
+          description: "Image creation accepted (async)"
+        "400":
+          description: "Invalid request (missing source_type, etc.)"
+
+  /v1/images/{id}:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    get:
+      summary: "Describe image"
+      operationId: "describeImage"
+      responses:
+        "200":
+          description: "Image details"
+        "404":
+          description: "Not found or not accessible"
+
+  /v1/images/{id}/deprecate:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    post:
+      summary: "Deprecate image"
+      operationId: "deprecateImage"
+      responses:
+        "200":
+          description: "Image deprecated"
+        "422":
+          description: "Only ACTIVE images can be deprecated"
+
+  /v1/images/{id}/obsolete:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    post:
+      summary: "Obsolete image"
+      operationId: "obsoleteImage"
+      responses:
+        "200":
+          description: "Image obsoleted"
+        "422":
+          description: "Only DEPRECATED images can be obsoleted"
+
+  /v1/images/{id}/grants:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    get:
+      summary: "List image share grants"
+      operationId: "listImageGrants"
+      responses:
+        "200":
+          description: "List of principals granted access"
+    post:
+      summary: "Grant image access to a principal"
+      operationId: "grantImageAccess"
+      responses:
+        "200":
+          description: "Grant created"
+
+  /v1/images/{id}/grants/{grantee_id}:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+      - name: "grantee_id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    delete:
+      summary: "Revoke image access"
+      operationId: "revokeImageAccess"
+      responses:
+        "200":
+          description: "Grant revoked"
+
+  # ── Volumes ────────────────────────────────────────────────────────────
+  /v1/volumes:
+    get:
+      summary: "List volumes"
+      operationId: "listVolumes"
+      responses:
+        "200":
+          description: "Volume list (scoped to principal)"
+    post:
+      summary: "Create volume"
+      operationId: "createVolume"
+      responses:
+        "202":
+          description: "Volume creation accepted (async)"
+
+  /v1/volumes/{id}:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    get:
+      summary: "Describe volume"
+      operationId: "describeVolume"
+      responses:
+        "200":
+          description: "Volume details"
+        "404":
+          description: "Not found or not owned"
+    delete:
+      summary: "Delete volume"
+      operationId: "deleteVolume"
+      responses:
+        "202":
+          description: "Delete accepted (async)"
+
+  /v1/instances/{id}/volumes:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    get:
+      summary: "List attached volumes for an instance"
+      operationId: "listInstanceVolumes"
+      responses:
+        "200":
+          description: "Attached volumes"
+    post:
+      summary: "Attach volume to instance"
+      operationId: "attachVolume"
+      responses:
+        "202":
+          description: "Attach accepted (async)"
+
+  /v1/instances/{id}/volumes/{vol_id}:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+      - name: "vol_id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    delete:
+      summary: "Detach volume from instance"
+      operationId: "detachVolume"
+      responses:
+        "202":
+          description: "Detach accepted (async)"
+
+  # ── Snapshots ──────────────────────────────────────────────────────────
+  /v1/snapshots:
+    get:
+      summary: "List snapshots"
+      operationId: "listSnapshots"
+      responses:
+        "200":
+          description: "Snapshot list (scoped to principal)"
+    post:
+      summary: "Create snapshot"
+      operationId: "createSnapshot"
+      responses:
+        "202":
+          description: "Snapshot creation accepted (async)"
+
+  /v1/snapshots/{id}:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    get:
+      summary: "Describe snapshot"
+      operationId: "describeSnapshot"
+      responses:
+        "200":
+          description: "Snapshot details"
+        "404":
+          description: "Not found or not owned"
+
+  # ── SSH Keys ───────────────────────────────────────────────────────────
+  /v1/ssh-keys:
+    get:
+      summary: "List SSH keys"
+      operationId: "listSSHKeys"
+      responses:
+        "200":
+          description: "SSH key list (scoped to principal)"
+    post:
+      summary: "Register SSH key"
+      operationId: "createSSHKey"
+      responses:
+        "201":
+          description: "SSH key registered"
+
+  /v1/ssh-keys/{id}:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    get:
+      summary: "Describe SSH key"
+      operationId: "describeSSHKey"
+      responses:
+        "200":
+          description: "SSH key details (fingerprint only, never the public key text)"
+        "404":
+          description: "Not found or not owned"
+    delete:
+      summary: "Delete SSH key"
+      operationId: "deleteSSHKey"
+      responses:
+        "200":
+          description: "SSH key deleted"
+
+  # ── Projects ───────────────────────────────────────────────────────────
+  /v1/projects:
+    get:
+      summary: "List projects"
+      operationId: "listProjects"
+      responses:
+        "200":
+          description: "Project list"
+    post:
+      summary: "Create project"
+      operationId: "createProject"
+      responses:
+        "201":
+          description: "Project created"
+
+  /v1/projects/{id}:
+    parameters:
+      - name: "id"
+        in: "path"
+        required: true
+        schema:
+          type: "string"
+    get:
+      summary: "Describe project"
+      operationId: "describeProject"
+      responses:
+        "200":
+          description: "Project details"
+        "404":
+          description: "Not found or not owned"
+
+  # ── Compatibility ──────────────────────────────────────────────────────
+  /healthz:
+    get:
+      summary: "Liveness probe"
+      operationId: "healthz"
+      responses:
+        "200":
+          description: "Service healthy (DB reachable)"
+        "503":
+          description: "Service degraded (DB unreachable)"
+
+  /v1/version:
+    get:
+      summary: "API version info"
+      operationId: "version"
+      responses:
+        "200":
+          description: "API version, minimum supported version, service name"
+
+  /v1/openapi.json:
+    get:
+      summary: "OpenAPI specification"
+      operationId: "openapi"
+      responses:
+        "200":
+          description: "OpenAPI 3.0.3 document"
+
+components:
+  schemas:
+    Error:
+      type: "object"
+      required: ["error"]
+      properties:
+        error:
+          type: "object"
+          required: ["code", "message", "request_id"]
+          properties:
+            code:
+              type: "string"
+              description: "Machine-readable error code (snake_case)"
+            message:
+              type: "string"
+              description: "Human-readable error description"
+            target:
+              type: "string"
+              description: "Request field causing the error"
+            request_id:
+              type: "string"
+              description: "Request correlation ID"
+            details:
+              type: "array"
+              description: "Sub-errors for batch validation"
+              items:
+                type: "object"

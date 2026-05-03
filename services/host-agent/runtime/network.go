@@ -36,6 +36,7 @@ type NetworkManager struct {
 	dryRun   bool
 	executor Executor
 	log      *slog.Logger
+	sgGen    *SGGeneration // generation tracker for compiled SG policies
 }
 
 // NewNetworkManager constructs a NetworkManager.

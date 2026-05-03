@@ -34,6 +34,7 @@ type fakeStore struct {
 	hosts     []*db.HostRecord
 	ips       map[string]string          // instanceID → ip
 	rootDisks map[string]*db.RootDiskRow // diskID → disk (M10 Slice 3)
+	sshKeys   map[string]*db.SSHKeyRow   // keyed by "principalID:name"
 }
 
 func newFakeStore() *fakeStore {
@@ -41,6 +42,7 @@ func newFakeStore() *fakeStore {
 		instances: make(map[string]*db.InstanceRow),
 		ips:       make(map[string]string),
 		rootDisks: make(map[string]*db.RootDiskRow),
+		sshKeys:   make(map[string]*db.SSHKeyRow),
 	}
 }
 
@@ -209,6 +211,19 @@ func (s *fakeStore) GetVolumeByID(_ context.Context, _ string) (*db.VolumeRow, e
 	return nil, nil // no volumes seeded in plain fakeStore
 }
 
+// ── SSH key retrieval (VM-RUNTIME-BOOT-LANE-PHASE-A-B-C) ────────────────────
+
+func (s *fakeStore) GetSSHKeyByPrincipalName(_ context.Context, principalID, name string) (*db.SSHKeyRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := fmt.Sprintf("%s:%s", principalID, name)
+	if row, ok := s.sshKeys[key]; ok {
+		cp := *row
+		return &cp, nil
+	}
+	return nil, nil
+}
+
 // ── SG rule retrieval (VM Job 4) ──────────────────────────────────────────────
 
 func (s *fakeStore) GetEffectiveSGRulesForInstance(_ context.Context, _ string) ([]db.EffectiveSGRuleRow, error) {
@@ -288,12 +303,14 @@ type fakeRuntime struct {
 	mu            sync.Mutex
 	createFail    bool
 	deletedInsts  []string
+	lastCreateReq *runtimeclient.CreateInstanceRequest // track for SSH key assertions
 	lastDeleteReq *runtimeclient.DeleteInstanceRequest // M10 Slice 3: capture delete flags
 }
 
 func (r *fakeRuntime) CreateInstance(_ context.Context, req *runtimeclient.CreateInstanceRequest) (*runtimeclient.CreateInstanceResponse, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.lastCreateReq = req
 	if r.createFail {
 		return nil, errors.New("fakeRuntime: CreateInstance failure")
 	}
@@ -849,3 +866,225 @@ func TestDeleteHandler_NoDiskRecord_StillCompletes(t *testing.T) {
 
 // M3 stub tests removed — stop/start/reboot are fully implemented.
 // Full test coverage is in stop_test.go, start_test.go, reboot_test.go.
+
+// ── SSH key flow tests (VM-RUNTIME-BOOT-LANE-PHASE-A-B-C) ──────────────────
+
+// TestCreateHandler_SSHKeyResolvedAndPassed verifies the SSH key is resolved
+// and passed to the runtime when the instance has a matching ssh_key_name.
+func TestCreateHandler_SSHKeyResolvedAndPassed(t *testing.T) {
+	store := newFakeStore()
+	net := &fakeNetwork{}
+	rt := &fakeRuntime{}
+
+	const id = "inst_ssh_key"
+	const principal = "princ_alice"
+	const keyName = "my-key"
+	const publicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+
+	// Seed SSH key.
+	store.sshKeys[principal+":"+keyName] = &db.SSHKeyRow{
+		ID:          "key_001",
+		PrincipalID: principal,
+		Name:        keyName,
+		PublicKey:   publicKey,
+	}
+
+	inst := newRequestedInstance(id)
+	inst.SSHKeyName = keyName
+	inst.OwnerPrincipalID = principal
+	store.instances[id] = inst
+	store.hosts = []*db.HostRecord{{ID: "host-ssh"}}
+
+	h := newTestCreateHandler(store, net, rt)
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_CREATE")); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if rt.lastCreateReq == nil {
+		t.Fatal("CreateInstance was not called")
+	}
+	if rt.lastCreateReq.SSHPublicKey != publicKey {
+		t.Errorf("SSHPublicKey = %q, want %q", rt.lastCreateReq.SSHPublicKey, publicKey)
+	}
+	if rt.lastCreateReq.Hostname != id {
+		t.Errorf("Hostname = %q, want %q", rt.lastCreateReq.Hostname, id)
+	}
+}
+
+// TestCreateHandler_SSHKeyNotFound_NonFatal verifies that a missing SSH key
+// does not block provisioning. The instance boots without SSH key injection.
+func TestCreateHandler_SSHKeyNotFound_NonFatal(t *testing.T) {
+	store := newFakeStore()
+	net := &fakeNetwork{}
+	rt := &fakeRuntime{}
+
+	const id = "inst_no_key"
+	const principal = "princ_alice"
+
+	inst := newRequestedInstance(id)
+	inst.SSHKeyName = "nonexistent-key"
+	inst.OwnerPrincipalID = principal
+	store.instances[id] = inst
+	store.hosts = []*db.HostRecord{{ID: "host-nokey"}}
+
+	// SSH key not seeded — lookup returns nil.
+
+	h := newTestCreateHandler(store, net, rt)
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_CREATE")); err != nil {
+		t.Fatalf("Execute with missing SSH key should succeed: %v", err)
+	}
+
+	if rt.lastCreateReq == nil {
+		t.Fatal("CreateInstance was not called")
+	}
+	if rt.lastCreateReq.SSHPublicKey != "" {
+		t.Errorf("SSHPublicKey = %q, want empty (key not found)", rt.lastCreateReq.SSHPublicKey)
+	}
+}
+
+// TestCreateHandler_NoSSHKeyName_EmptyKey verifies that when ssh_key_name is
+// empty, no SSH key resolution is attempted and an empty key is passed.
+func TestCreateHandler_NoSSHKeyName_EmptyKey(t *testing.T) {
+	store := newFakeStore()
+	net := &fakeNetwork{}
+	rt := &fakeRuntime{}
+
+	const id = "inst_no_name"
+
+	inst := newRequestedInstance(id)
+	inst.SSHKeyName = "" // no key specified
+	store.instances[id] = inst
+	store.hosts = []*db.HostRecord{{ID: "host-empty"}}
+
+	h := newTestCreateHandler(store, net, rt)
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_CREATE")); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if rt.lastCreateReq == nil {
+		t.Fatal("CreateInstance was not called")
+	}
+	if rt.lastCreateReq.SSHPublicKey != "" {
+		t.Errorf("SSHPublicKey = %q, want empty", rt.lastCreateReq.SSHPublicKey)
+	}
+}
+
+// TestCreateHandler_RootDiskIdempotent verifies root disk creation is idempotent
+// on job retry — the second create call reuses the existing disk record.
+func TestCreateHandler_RootDiskIdempotent(t *testing.T) {
+	store := newFakeStore()
+	net := &fakeNetwork{}
+	rt := &fakeRuntime{}
+
+	const id = "inst_rt_idem"
+
+	inst := newRequestedInstance(id)
+	store.instances[id] = inst
+	store.hosts = []*db.HostRecord{{ID: "host-rt"}}
+
+	h := newTestCreateHandler(store, net, rt)
+
+	// First call creates the disk.
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_CREATE")); err != nil {
+		t.Fatalf("first Execute: %v", err)
+	}
+
+	// Verify disk was created.
+	disk := store.getDiskByInstance(id)
+	if disk == nil {
+		t.Fatal("root disk was not created")
+	}
+	wantPath := "nfs://filer/vol/disk_" + id + ".qcow2"
+	if disk.StoragePath != wantPath {
+		t.Errorf("StoragePath = %q, want %q", disk.StoragePath, wantPath)
+	}
+
+	// Reset instance state and re-run (simulates job retry before instance reaches running).
+	store.instances[id].VMState = "requested"
+	store.instances[id].HostID = nil
+	store.instances[id].Version = 0
+
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_CREATE")); err != nil {
+		t.Fatalf("retry Execute: %v", err)
+	}
+
+	// Root disk should still be the same (idempotent — no duplicate).
+	disk2 := store.getDiskByInstance(id)
+	if disk2 == nil {
+		t.Fatal("root disk was lost on retry")
+	}
+	// DiskID is deterministic: "disk_" + instance_id
+	if disk2.DiskID != disk.DiskID {
+		t.Errorf("DiskID changed: %q → %q", disk.DiskID, disk2.DiskID)
+	}
+}
+
+// TestCreateHandler_RollbackCleansUp verifies that when CreateInstance fails
+// on the runtime, the handler rolls back by releasing the IP and marking the
+// instance as failed.
+func TestCreateHandler_RollbackCleansUp(t *testing.T) {
+	store := newFakeStore()
+	net := &fakeNetwork{}
+	rt := &fakeRuntime{}
+	rt.createFail = true
+
+	const id = "inst_rollback"
+
+	inst := newRequestedInstance(id)
+	store.instances[id] = inst
+	store.hosts = []*db.HostRecord{{ID: "host-rb"}}
+
+	h := newTestCreateHandler(store, net, rt)
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_CREATE")); err == nil {
+		t.Fatal("expected error from failed CreateInstance, got nil")
+	}
+
+	// Instance must be in failed state.
+	if store.instances[id].VMState != "failed" {
+		t.Errorf("vm_state = %q, want failed", store.instances[id].VMState)
+	}
+
+	// IP must be released.
+	if len(net.released) == 0 {
+		t.Error("IP was not released during rollback")
+	}
+}
+
+// TestSSHKeyFlow_StartHandler verifies the start handler also resolves SSH keys.
+func TestSSHKeyFlow_StartHandler(t *testing.T) {
+	store := newFakeStore()
+	net := &fakeNetwork{}
+	rt := &fakeRuntime{}
+
+	const id = "inst_start_ssh"
+	const principal = "princ_alice"
+	const keyName = "start-key"
+	const publicKey = "ssh-rsa AAAAB3NzaC1yc2E..."
+
+	store.sshKeys[principal+":"+keyName] = &db.SSHKeyRow{
+		ID:          "key_start",
+		PrincipalID: principal,
+		Name:        keyName,
+		PublicKey:   publicKey,
+	}
+
+	inst := newRequestedInstance(id)
+	inst.VMState = "stopped"
+	inst.SSHKeyName = keyName
+	inst.OwnerPrincipalID = principal
+	store.instances[id] = inst
+	store.ips[id] = "10.0.5.1"
+	store.hosts = []*db.HostRecord{{ID: "host-start"}}
+
+	h := newTestStartHandler(store, net, rt)
+	if err := h.Execute(context.Background(), testJob(id, "INSTANCE_START")); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if rt.lastCreateReq == nil {
+		t.Fatal("CreateInstance was not called")
+	}
+	if rt.lastCreateReq.SSHPublicKey != publicKey {
+		t.Errorf("SSHPublicKey = %q, want %q", rt.lastCreateReq.SSHPublicKey, publicKey)
+	}
+}

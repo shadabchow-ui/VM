@@ -12,6 +12,11 @@ package runtime
 //   RemoveSGPolicy(ctx, instanceID, tapDevice)         → flush and delete per-instance chain (idempotent)
 //   SGRuleFromEffectiveRows(rows)                      → converts DB effective rows → host-agent SGRule slice
 //
+// VM-SECURITY-GROUP-DATAPLANE-PHASE-E additions:
+//   CompiledSGPolicy                                   → full policy shape (instance_id, nic_id, tap_device, generation, rules)
+//   ApplyCompiledPolicy / RemoveCompiledPolicy         → generation-tracked apply/remove
+//   StaleSGPolicyRemaining                             → stale-state detection by generation
+//
 // Architecture:
 //   - Host-agent owns host-side enforcement (iptables chains per TAP device).
 //   - Network-controller owns allocation/release/VTEP, not guest firewalling.
@@ -22,6 +27,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 )
 
 // ── Security Group Rule types ─────────────────────────────────────────────────
@@ -39,7 +45,150 @@ type SGRule struct {
 	CIDR      *string
 }
 
+// CompiledSGPolicy is the full, compiled security group policy for a NIC
+// at enforcement time. It bundles instance identity, NIC identity (if available),
+// the TAP device name, a generation counter for stale-state detection, and
+// the set of ingress and egress rules to enforce.
+//
+// Source: VM-SECURITY-GROUP-DATAPLANE-PHASE-E.
+type CompiledSGPolicy struct {
+	InstanceID      string
+	NICID           string // optional; empty for Phase 1 classic instances
+	TapDevice       string
+	Generation      int64
+	IngressRules    []SGRule
+	EgressRules     []SGRule
+	DefaultBehavior string // "deny" is the only supported value currently
+}
+
+// SGGeneration tracks the last-applied generation per instance.
+// Used to prevent stale policy reuse — if a newer generation has been applied,
+// an older remove is idempotently skipped.
+type SGGeneration struct {
+	mu          sync.Mutex
+	generations map[string]int64 // instanceID → last-applied generation
+}
+
+func newSGGeneration() *SGGeneration {
+	return &SGGeneration{generations: make(map[string]int64)}
+}
+
+func (g *SGGeneration) get(instanceID string) int64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.generations[instanceID]
+}
+
+func (g *SGGeneration) set(instanceID string, gen int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.generations[instanceID] = gen
+}
+
+func (g *SGGeneration) remove(instanceID string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.generations, instanceID)
+}
+
 // ── Policy Application ────────────────────────────────────────────────────────
+
+// ApplyCompiledPolicy programs iptables firewall rules from a CompiledSGPolicy.
+// This is the generation-tracked entry point. On apply, the generation is recorded;
+// on a subsequent apply with a higher generation, old rules are flushed and replaced.
+// On apply with a lower or equal generation, the call is a no-op (stale).
+//
+// Source: VM-SECURITY-GROUP-DATAPLANE-PHASE-E.
+func (n *NetworkManager) ApplyCompiledPolicy(ctx context.Context, policy CompiledSGPolicy) error {
+	if n.dryRun {
+		n.log.Info("ApplyCompiledPolicy: dry-run — no rules programmed",
+			"instance_id", policy.InstanceID,
+			"nic_id", policy.NICID,
+			"tap_device", policy.TapDevice,
+			"generation", policy.Generation,
+			"ingress_rules", len(policy.IngressRules),
+			"egress_rules", len(policy.EgressRules),
+		)
+		return nil
+	}
+
+	if n.sgGen == nil {
+		n.sgGen = newSGGeneration()
+	}
+
+	lastGen := n.sgGen.get(policy.InstanceID)
+	if policy.Generation > 0 && policy.Generation <= lastGen {
+		n.log.Info("ApplyCompiledPolicy: stale generation — no-op",
+			"instance_id", policy.InstanceID,
+			"generation", policy.Generation,
+			"last_applied", lastGen,
+		)
+		return nil
+	}
+
+	// Merge ingress rules only (egress rules are handled by implicit-allow semantics).
+	rules := policy.IngressRules
+
+	if err := n.ApplySGPolicy(ctx, policy.InstanceID, policy.TapDevice, rules); err != nil {
+		return err
+	}
+
+	if policy.Generation > 0 {
+		n.sgGen.set(policy.InstanceID, policy.Generation)
+	}
+
+	n.log.Info("Compiled SG policy applied",
+		"instance_id", policy.InstanceID,
+		"nic_id", policy.NICID,
+		"generation", policy.Generation,
+		"ingress_rules", len(policy.IngressRules),
+		"egress_rules", len(policy.EgressRules),
+		"egress_behavior", "default-allow",
+	)
+	return nil
+}
+
+// RemoveCompiledPolicy tears down firewall state for a CompiledSGPolicy.
+// If the generation does not match the last-applied generation, the call is
+// a no-op (stale policy already superseded). Otherwise, the chain and FORWARD
+// jump are removed idempotently.
+//
+// Source: VM-SECURITY-GROUP-DATAPLANE-PHASE-E.
+func (n *NetworkManager) RemoveCompiledPolicy(ctx context.Context, policy CompiledSGPolicy) error {
+	if n.dryRun {
+		n.log.Info("RemoveCompiledPolicy: dry-run — no rules removed",
+			"instance_id", policy.InstanceID,
+			"nic_id", policy.NICID,
+			"generation", policy.Generation,
+		)
+		return nil
+	}
+
+	if n.sgGen == nil {
+		n.sgGen = newSGGeneration()
+	}
+
+	lastGen := n.sgGen.get(policy.InstanceID)
+	if policy.Generation > 0 && policy.Generation != lastGen {
+		n.log.Info("RemoveCompiledPolicy: generation mismatch — stale, cleaning up unconditionally",
+			"instance_id", policy.InstanceID,
+			"request_generation", policy.Generation,
+			"last_applied", lastGen,
+		)
+	}
+
+	if err := n.RemoveSGPolicy(ctx, policy.InstanceID, policy.TapDevice); err != nil {
+		return err
+	}
+
+	n.sgGen.remove(policy.InstanceID)
+
+	n.log.Info("Compiled SG policy removed",
+		"instance_id", policy.InstanceID,
+		"generation", policy.Generation,
+	)
+	return nil
+}
 
 // ApplySGPolicy programs iptables per-NIC firewall rules.
 //

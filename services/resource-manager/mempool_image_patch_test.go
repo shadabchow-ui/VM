@@ -43,8 +43,12 @@ package main
 //	19  updated_at          *time.Time
 //	20  provenance_hash     **string   (VM-P3B Job 2)
 //	21  signature_valid     **bool     (VM-P3B Job 2)
+//	22  format              *string    (VM-TRUSTED-IMAGE-FACTORY-PHASE-J)
+//	23  size_bytes          *int64     (VM-TRUSTED-IMAGE-FACTORY-PHASE-J)
+//	24  image_digest        **string   (VM-TRUSTED-IMAGE-FACTORY-PHASE-J)
+//	25  validation_error    **string   (VM-TRUSTED-IMAGE-FACTORY-PHASE-J)
 //
-// Total: 22 columns.
+// Total: 26 columns.
 // Source: image_repo.go selectImageCols, scanImage.
 
 import (
@@ -61,13 +65,13 @@ import (
 // Used by QueryRow branches: GetImageByID / GetImageForAdmission,
 // ResolveFamilyLatest, ResolveFamilyByVersion.
 //
-// Scan order must match selectImageCols in image_repo.go (22 columns).
+// Scan order must match selectImageCols in image_repo.go (26 columns).
 type imageRow struct{ r *db.ImageRow }
 
 func (row *imageRow) Scan(dest ...any) error {
 	r := row.r
-	if len(dest) < 22 {
-		return fmt.Errorf("imageRow.Scan: need 22 dest, got %d", len(dest))
+	if len(dest) < 26 {
+		return fmt.Errorf("imageRow.Scan: need 26 dest, got %d", len(dest))
 	}
 	*dest[0].(*string) = r.ID
 	*dest[1].(*string) = r.Name
@@ -92,6 +96,11 @@ func (row *imageRow) Scan(dest ...any) error {
 	// VM-P3B Job 2: trust boundary columns.
 	*dest[20].(**string) = r.ProvenanceHash
 	*dest[21].(**bool) = r.SignatureValid
+	// VM-TRUSTED-IMAGE-FACTORY-PHASE-J: artifact metadata columns.
+	*dest[22].(*string) = r.Format
+	*dest[23].(*int64) = r.SizeBytes
+	*dest[24].(**string) = r.ImageDigest
+	*dest[25].(**string) = r.ValidationError
 	return nil
 }
 
@@ -100,7 +109,7 @@ func (row *imageRow) Scan(dest ...any) error {
 // imageRows implements db.Rows for []*db.ImageRow.
 // Used by the Query branch handling ListImagesByPrincipal.
 //
-// Scan order must match selectImageCols in image_repo.go (22 columns).
+// Scan order must match selectImageCols in image_repo.go (26 columns).
 type imageRows struct {
 	rows []*db.ImageRow
 	pos  int
@@ -116,8 +125,8 @@ func (r *imageRows) Next() bool {
 
 func (r *imageRows) Scan(dest ...any) error {
 	row := r.rows[r.pos-1]
-	if len(dest) < 22 {
-		return fmt.Errorf("imageRows.Scan: need 22 dest, got %d", len(dest))
+	if len(dest) < 26 {
+		return fmt.Errorf("imageRows.Scan: need 26 dest, got %d", len(dest))
 	}
 	*dest[0].(*string) = row.ID
 	*dest[1].(*string) = row.Name
@@ -142,6 +151,11 @@ func (r *imageRows) Scan(dest ...any) error {
 	// VM-P3B Job 2: trust boundary columns.
 	*dest[20].(**string) = row.ProvenanceHash
 	*dest[21].(**bool) = row.SignatureValid
+	// VM-TRUSTED-IMAGE-FACTORY-PHASE-J: artifact metadata columns.
+	*dest[22].(*string) = row.Format
+	*dest[23].(*int64) = row.SizeBytes
+	*dest[24].(**string) = row.ImageDigest
+	*dest[25].(**string) = row.ValidationError
 	return nil
 }
 

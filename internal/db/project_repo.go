@@ -209,6 +209,147 @@ WHERE id = $1 AND deleted_at IS NULL`
 	return nil
 }
 
+// ── Project membership ───────────────────────────────────────────────────────
+
+// ProjectMemberRow is the DB projection of a project_members row.
+//
+// Column order matches all SELECT queries:
+//
+//	0: project_id   string
+//	1: principal_id string
+//	2: role         string
+//	3: added_by     string
+//	4: created_at   time.Time
+//	5: updated_at   time.Time
+type ProjectMemberRow struct {
+	ProjectID   string
+	PrincipalID string
+	Role        string
+	AddedBy     string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// IAM role constants for project membership.
+const (
+	ProjectRoleOwner    = "roles/owner"
+	ProjectRoleAdmin    = "roles/admin"
+	ProjectRoleOperator = "roles/operator"
+	ProjectRoleViewer   = "roles/viewer"
+)
+
+// AddProjectMember inserts a row into project_members.
+// Returns (nil, nil) on duplicate key (member already exists).
+func (r *Repo) AddProjectMember(ctx context.Context, projectID, principalID, role, addedBy string) (*ProjectMemberRow, error) {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO project_members (project_id, principal_id, role, added_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, NOW(), NOW())
+		ON CONFLICT (project_id, principal_id) DO NOTHING
+	`, projectID, principalID, role, addedBy)
+	if err != nil {
+		return nil, fmt.Errorf("AddProjectMember: %w", err)
+	}
+	return r.GetProjectMember(ctx, projectID, principalID)
+}
+
+// GetProjectMember fetches a single membership row.
+// Returns nil, nil when not found (caller checks nil).
+func (r *Repo) GetProjectMember(ctx context.Context, projectID, principalID string) (*ProjectMemberRow, error) {
+	m := &ProjectMemberRow{}
+	err := r.pool.QueryRow(ctx, `
+		SELECT project_id, principal_id, role, added_by, created_at, updated_at
+		FROM project_members
+		WHERE project_id = $1 AND principal_id = $2
+	`, projectID, principalID).Scan(
+		&m.ProjectID, &m.PrincipalID, &m.Role, &m.AddedBy, &m.CreatedAt, &m.UpdatedAt,
+	)
+	if err != nil {
+		if isNoRowsErr(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("GetProjectMember: %w", err)
+	}
+	return m, nil
+}
+
+// ListProjectMembers returns all members of a project.
+func (r *Repo) ListProjectMembers(ctx context.Context, projectID string) ([]*ProjectMemberRow, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT project_id, principal_id, role, added_by, created_at, updated_at
+		FROM project_members
+		WHERE project_id = $1
+		ORDER BY created_at ASC
+	`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("ListProjectMembers: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*ProjectMemberRow
+	for rows.Next() {
+		m := &ProjectMemberRow{}
+		if err := rows.Scan(
+			&m.ProjectID, &m.PrincipalID, &m.Role, &m.AddedBy, &m.CreatedAt, &m.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("ListProjectMembers scan: %w", err)
+		}
+		out = append(out, m)
+	}
+	if out == nil {
+		out = []*ProjectMemberRow{}
+	}
+	return out, rows.Err()
+}
+
+// RemoveProjectMember deletes a membership row.
+// Returns nil when no row matched (member not present).
+func (r *Repo) RemoveProjectMember(ctx context.Context, projectID, principalID string) error {
+	_, err := r.pool.Exec(ctx, `
+		DELETE FROM project_members
+		WHERE project_id = $1 AND principal_id = $2
+	`, projectID, principalID)
+	if err != nil {
+		return fmt.Errorf("RemoveProjectMember: %w", err)
+	}
+	return nil
+}
+
+// CheckProjectMemberHasRole returns true when the principal has at least the
+// given role in the project. Role hierarchy: owner > admin > operator > viewer.
+// An owner also satisfies admin/operator/viewer checks. Admin also
+// satisfies operator/viewer. Operator also satisfies viewer.
+func (r *Repo) CheckProjectMemberHasRole(ctx context.Context, projectID, principalID, minRole string) (bool, error) {
+	m, err := r.GetProjectMember(ctx, projectID, principalID)
+	if err != nil {
+		return false, err
+	}
+	if m == nil {
+		return false, nil
+	}
+	return roleIsAtLeast(m.Role, minRole), nil
+}
+
+// roleIsAtLeast returns true when actualRole meets or exceeds minRole in the
+// hierarchy: owner(4) > admin(3) > operator(2) > viewer(1).
+func roleIsAtLeast(actualRole, minRole string) bool {
+	return roleLevel(actualRole) >= roleLevel(minRole)
+}
+
+func roleLevel(r string) int {
+	switch r {
+	case ProjectRoleOwner:
+		return 4
+	case ProjectRoleAdmin:
+		return 3
+	case ProjectRoleOperator:
+		return 2
+	case ProjectRoleViewer:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // scanProject scans a single db.Row into a ProjectRow.
 // Column order must match the SELECT lists in GetProjectByID and GetProjectByPrincipalID.
 func scanProject(row Row) (*ProjectRow, error) {
