@@ -4,7 +4,8 @@
 // Errors thrown as ApiException — never swallowed.
 // 5xx → caller shows generic message + request_id.
 //
-// Source: API_ERROR_CONTRACT_V1 §1, §7; AUTH_OWNERSHIP_MODEL_V1 §1.
+// Demo mode:
+// Set VITE_DEMO_MODE=true to use in-browser sample data instead of calling the backend.
 
 import type {
   CreateInstanceRequest,
@@ -21,7 +22,6 @@ import type {
 } from '../types';
 import { ApiException } from '../types';
 
-// API base URL — configured via Vite env or empty string (dev proxy handles it).
 const BASE_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? '';
 const DEMO_MODE = (import.meta.env.VITE_DEMO_MODE as string | undefined) === 'true';
 
@@ -84,7 +84,7 @@ function getPrincipalID(): string {
   return (
     (import.meta.env.VITE_PRINCIPAL_ID as string | undefined) ||
     localStorage.getItem('principal_id') ||
-    '00000000-0000-0000-0000-000000000001' // default system principal for dev
+    '00000000-0000-0000-0000-000000000001'
   );
 }
 
@@ -143,13 +143,12 @@ export const instancesApi = {
 
   get(id: string): Promise<Instance> {
     if (DEMO_MODE) {
-      const instance = demoInstances.find((item) => item.id === id) ?? demoInstances[0];
-      return Promise.resolve(instance);
+      return Promise.resolve(demoInstances.find((item) => item.id === id) ?? demoInstances[0]);
     }
     return request<Instance>('GET', `/v1/instances/${id}`);
   },
 
-  create(req: CreateInstanceRequest, _idempotencyKey: string): Promise<CreateInstanceResponse> {
+  create(req: CreateInstanceRequest, idempotencyKey: string): Promise<CreateInstanceResponse> {
     if (DEMO_MODE) {
       const instance: Instance = {
         id: `inst-demo-${Date.now()}`,
@@ -168,29 +167,24 @@ export const instancesApi = {
       demoInstances.unshift(instance);
       return Promise.resolve({ instance });
     }
+
     return request<CreateInstanceResponse>('POST', '/v1/instances', req, {
-      'Idempotency-Key': _idempotencyKey,
+      'Idempotency-Key': idempotencyKey,
     });
   },
 
   stop(id: string): Promise<LifecycleResponse> {
-    if (DEMO_MODE) {
-      return Promise.resolve(demoJob(id, 'stop'));
-    }
+    if (DEMO_MODE) return Promise.resolve(demoJob(id, 'stop'));
     return request<LifecycleResponse>('POST', `/v1/instances/${id}/stop`);
   },
 
   start(id: string): Promise<LifecycleResponse> {
-    if (DEMO_MODE) {
-      return Promise.resolve(demoJob(id, 'start'));
-    }
+    if (DEMO_MODE) return Promise.resolve(demoJob(id, 'start'));
     return request<LifecycleResponse>('POST', `/v1/instances/${id}/start`);
   },
 
   reboot(id: string): Promise<LifecycleResponse> {
-    if (DEMO_MODE) {
-      return Promise.resolve(demoJob(id, 'reboot'));
-    }
+    if (DEMO_MODE) return Promise.resolve(demoJob(id, 'reboot'));
     return request<LifecycleResponse>('POST', `/v1/instances/${id}/reboot`);
   },
 
@@ -296,4 +290,3 @@ export const sshKeysApi = {
     return request<void>('DELETE', `/v1/ssh-keys/${id}`);
   },
 };
-
