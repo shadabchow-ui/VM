@@ -519,7 +519,18 @@ func (s *server) handleCreateInstance(w http.ResponseWriter, r *http.Request) {
 		var err error
 		nic, err = s.createInstanceNetworking(w, r, instanceID, principal, req.Networking)
 		if err != nil {
-			// rollback instance on failure
+			// Rollback: mark instance as failed so quota is freed promptly.
+			// Count-based quota auto-reclaims when vm_state='failed'.
+			if failErr := s.repo.UpdateInstanceState(r.Context(), instanceID, "requested", "failed", 0); failErr != nil {
+				s.log.Warn("rollback: could not mark instance failed after networking error",
+					"instance_id", instanceID, "error", failErr)
+			}
+			// RefundQuota is a no-op in the count-based model (failed instances are
+			// already excluded by CountActiveInstancesByScope). Called here for the
+			// explicit refund seam so future reservation-based models receive this signal.
+			if refundErr := s.repo.RefundQuota(r.Context(), quotaScopeID); refundErr != nil {
+				s.log.Warn("rollback: RefundQuota failed", "scope", quotaScopeID, "error", refundErr)
+			}
 			return
 		}
 	}

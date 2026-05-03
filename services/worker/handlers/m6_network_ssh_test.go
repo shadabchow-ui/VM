@@ -35,7 +35,6 @@ import (
 
 	"github.com/compute-platform/compute-platform/internal/db"
 	"github.com/compute-platform/compute-platform/packages/idgen"
-	runtimeclient "github.com/compute-platform/compute-platform/packages/runtime-client"
 	"github.com/compute-platform/compute-platform/services/reconciler"
 	"github.com/compute-platform/compute-platform/services/worker/handlers"
 )
@@ -287,7 +286,7 @@ func TestM6_StopFlow_IPReleasedAndInventoryClean(t *testing.T) {
 		Store:        repo,
 		Network:      &integFakeNetwork{repo: repo},
 		DefaultVPCID: integVPCID,
-		Runtime:      func(_, _ string) *runtimeclient.Client { return nil },
+		Runtime:      func(_, _ string) RuntimeClient { return nil },
 	}
 	stopH := handlers.NewStopHandler(deps, nil)
 	stopH.SetRuntimeFactory(func(_, _ string) handlers.RuntimeClient { return rt })
@@ -350,7 +349,7 @@ func TestM6_StopStartCycles_NoGhostIPs(t *testing.T) {
 			Store:        repo,
 			Network:      net,
 			DefaultVPCID: integVPCID,
-			Runtime:      func(_, _ string) *runtimeclient.Client { return nil },
+			Runtime:      func(_, _ string) RuntimeClient { return nil },
 		}
 	}
 
@@ -422,7 +421,7 @@ func newIntegStopHandler(t *testing.T, repo *db.Repo, rt *integFakeRuntime) *han
 		Store:        repo,
 		Network:      &integFakeNetwork{repo: repo},
 		DefaultVPCID: integVPCID,
-		Runtime:      func(_, _ string) *runtimeclient.Client { return nil },
+		Runtime:      func(_, _ string) RuntimeClient { return nil },
 	}
 	h := handlers.NewStopHandler(deps, nil)
 	h.SetRuntimeFactory(func(_, _ string) handlers.RuntimeClient { return rt })
@@ -436,7 +435,7 @@ func newIntegStartHandler(t *testing.T, repo *db.Repo, rt *integFakeRuntime) *ha
 		Store:        repo,
 		Network:      &integFakeNetwork{repo: repo},
 		DefaultVPCID: integVPCID,
-		Runtime:      func(_, _ string) *runtimeclient.Client { return nil },
+		Runtime:      func(_, _ string) RuntimeClient { return nil },
 	}
 	h := handlers.NewStartHandler(deps, nil)
 	h.SetRuntimeFactory(func(_, _ string) handlers.RuntimeClient { return rt })

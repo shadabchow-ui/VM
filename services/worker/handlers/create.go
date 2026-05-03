@@ -166,16 +166,13 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	h.writeEvent(ctx, inst.ID, db.EventIPAllocated, "IP allocated: "+allocatedIP)
 	log.Info("step4: IP allocated", "ip", allocatedIP)
 
-	// ── Step 5: Collect volume attachments and CreateInstance on Host Agent ──
+	// ── Step 5: Collect volume attachments, SG rules, and CreateInstance on Host Agent ──
 	hostAddr := selectedHost.ID + ":50051"
 	rtClient := h.runtimeFactory(selectedHost.ID, hostAddr)
 
 	// Collect active volume attachments (VM Job 8 — Volume attach/persistence gate).
-	// Attached volumes that have a storage_path are passed as extra block devices
-	// to the runtime so the guest sees them at boot.
 	attachments, attErr := h.deps.Store.ListActiveAttachmentsByInstance(ctx, inst.ID)
 	if attErr != nil {
-		// Non-fatal: log and continue without extra disks.
 		h.log.Error("Step5: ListActiveAttachmentsByInstance failed — non-fatal, skipping extra disks",
 			"instance_id", inst.ID, "error", attErr)
 		attachments = nil
@@ -183,7 +180,6 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 
 	var extraDisks []runtimeclient.ExtraDiskConfig
 	for _, att := range attachments {
-		// Derive host path from the volume's recorded storage_path.
 		vol, volErr := h.deps.Store.GetVolumeByID(ctx, att.VolumeID)
 		if volErr != nil || vol == nil || vol.StoragePath == nil || *vol.StoragePath == "" {
 			h.log.Warn("Step5: volume storage path missing — skipping extra disk",
@@ -201,6 +197,9 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 			"instance_id", inst.ID, "count", len(extraDisks))
 	}
 
+	// Collect security group rules for host-side enforcement.
+	sgRules := effectiveSGRulesToSpec(h.deps.Store, ctx, inst.ID)
+
 	createReq := &runtimeclient.CreateInstanceRequest{
 		InstanceID:     inst.ID,
 		ImageURL:       imageURLFromID(inst.ImageID),
@@ -208,13 +207,12 @@ func (h *CreateHandler) Execute(ctx context.Context, job *db.JobRow) error {
 		CPUCores:       shapeCPU(inst.InstanceTypeID),
 		MemoryMB:       shapeMemMB(inst.InstanceTypeID),
 		DiskGB:         shapeDiskGB(inst.InstanceTypeID),
-		// RootfsPath derives from disk storage path (NFS-backed qcow2).
-		// Source: 06-01-root-disk-model-and-persistence-semantics.md §CoW Implementation.
-		RootfsPath: fmt.Sprintf("/mnt/nfs/vols/%s.qcow2", diskID),
+		RootfsPath:     fmt.Sprintf("/mnt/nfs/vols/%s.qcow2", diskID),
 		Network: runtimeclient.NetworkConfig{
 			PrivateIP:  allocatedIP,
 			TapDevice:  "tap-" + inst.ID[:8],
 			MacAddress: deriveMACAddress(inst.ID),
+			SGRules:    sgRules,
 		},
 		ExtraDisks: extraDisks,
 	}
@@ -360,6 +358,34 @@ func shapeMemMB(t string) int32 {
 }
 func shapeDiskGB(t string) int32 {
 	return map[string]int32{"c1.small": 50, "c1.medium": 100, "c1.large": 200, "c1.xlarge": 500}[t]
+}
+
+// effectiveSGRulesToSpec reads the effective SG rules for an instance from the
+// store and converts them to the runtime client spec format. Returns nil for
+// Phase 1 classic instances (no NIC, no rules).
+func effectiveSGRulesToSpec(store InstanceStore, ctx context.Context, instanceID string) []runtimeclient.SGRuleSpec {
+	rows, err := store.GetEffectiveSGRulesForInstance(ctx, instanceID)
+	if err != nil || len(rows) == 0 {
+		return nil
+	}
+	specs := make([]runtimeclient.SGRuleSpec, 0, len(rows))
+	for _, r := range rows {
+		if r.Direction != "ingress" {
+			continue
+		}
+		if r.SourceSecurityGroupID != nil {
+			continue
+		}
+		specs = append(specs, runtimeclient.SGRuleSpec{
+			ID:        r.RuleID,
+			Direction: r.Direction,
+			Protocol:  r.Protocol,
+			PortFrom:  r.PortFrom,
+			PortTo:    r.PortTo,
+			CIDR:      r.CIDR,
+		})
+	}
+	return specs
 }
 
 // CreateJobPayload is optional JSON in the job for INSTANCE_CREATE.

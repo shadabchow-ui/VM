@@ -69,7 +69,7 @@ func newLifecycleFixture() *lifecycleFixture {
 
 func (f *lifecycleFixture) newCreateHandler() *CreateHandler {
 	deps := &Deps{Store: f.store, Network: f.net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 	h := NewCreateHandler(deps, testLog())
 	h.runtimeFactory = func(_, _ string) RuntimeClient { return f.rt }
 	h.readinessFn = instantReadiness
@@ -78,7 +78,7 @@ func (f *lifecycleFixture) newCreateHandler() *CreateHandler {
 
 func (f *lifecycleFixture) newStopHandler() *StopHandler {
 	deps := &Deps{Store: f.store, Network: f.net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 	h := NewStopHandler(deps, testLog())
 	h.runtimeFactory = func(_, _ string) RuntimeClient { return f.rt }
 	return h
@@ -86,7 +86,7 @@ func (f *lifecycleFixture) newStopHandler() *StopHandler {
 
 func (f *lifecycleFixture) newStartHandler() *StartHandler {
 	deps := &Deps{Store: f.store, Network: f.net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 	h := NewStartHandler(deps, testLog())
 	h.runtimeFactory = func(_, _ string) RuntimeClient { return f.rt }
 	h.readinessFn = instantReadiness
@@ -95,7 +95,7 @@ func (f *lifecycleFixture) newStartHandler() *StartHandler {
 
 func (f *lifecycleFixture) newRebootHandler() *RebootHandler {
 	deps := &Deps{Store: f.store, Network: f.net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 	h := NewRebootHandler(deps, testLog())
 	h.runtimeFactory = func(_, _ string) RuntimeClient { return f.rt }
 	h.readinessFn = instantReadiness
@@ -104,7 +104,7 @@ func (f *lifecycleFixture) newRebootHandler() *RebootHandler {
 
 func (f *lifecycleFixture) newDeleteHandler() *DeleteHandler {
 	deps := &Deps{Store: f.store, Network: f.net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 	h := NewDeleteHandler(deps, testLog())
 	h.runtimeFactory = func(_, _ string) RuntimeClient { return f.rt }
 	return h

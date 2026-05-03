@@ -1,28 +1,22 @@
 package runtimeclient
 
-// client.go — HTTP client for the Host Agent's RuntimeService.
+// client.go — HTTP/JSON client for the Host Agent's RuntimeService.
 //
 // Source: RUNTIMESERVICE_GRPC_V1 §2 (service definition),
 //         IMPLEMENTATION_PLAN_V1 §C1 (Host Agent VM lifecycle primitives).
 //
-// M2 implementation note:
-// The proto contract specifies gRPC transport. For M2, we implement an HTTP/JSON
-// client that matches the RuntimeService interface exactly. This avoids a protoc
-// dependency while keeping the contract boundary clean. The worker calls this
-// client the same way it would call a gRPC stub. Replacing with gRPC is a pure
-// transport swap — no caller changes required.
+// IMPORTANT: This is the dev/fallback HTTP transport. The production transport is
+// gRPC via grpc_client.go with mTLS. This HTTP client remains available for local
+// dev when mTLS infrastructure is not available. Set RUNTIME_CLIENT_MODE=http on
+// the worker and HOST_AGENT_TRANSPORT=http on the host agent to use this path.
 //
-// The client communicates with the Host Agent's RuntimeService HTTP server
-// (services/host-agent/runtime/service.go) over an authenticated internal channel.
+// The HTTP client communicates with the Host Agent's RuntimeService HTTP server.
 //
 // Timeouts (from RUNTIMESERVICE_GRPC_V1 §timeout):
 //   Default RPC timeout:         60 seconds
 //   CreateInstance timeout:      300 seconds (rootfs materialisation + VM boot)
 //
-// Authentication: in production, the HTTP client uses a mTLS certificate
-// issued to the worker service identity. For M2, the internal gateway handles
-// authentication at the network edge — the client sends requests plaintext
-// on the internal network.
+// Authentication: in production, the gRPC client uses mTLS certificates.
 
 import (
 	"bytes"
@@ -41,12 +35,23 @@ const (
 
 // ── Request / response types (mirror runtime/service.go) ─────────────────────
 
+// SGRuleSpec describes a security group rule for host-agent enforcement.
+type SGRuleSpec struct {
+	ID        string  `json:"id"`
+	Direction string  `json:"direction"` // "ingress" | "egress"
+	Protocol  string  `json:"protocol"`  // "tcp" | "udp" | "icmp" | "all"
+	PortFrom  *int    `json:"port_from,omitempty"`
+	PortTo    *int    `json:"port_to,omitempty"`
+	CIDR      *string `json:"cidr,omitempty"`
+}
+
 // NetworkConfig matches the NetworkConfig message in runtime.proto.
 type NetworkConfig struct {
-	PrivateIP  string `json:"private_ip"`
-	PublicIP   string `json:"public_ip"`
-	TapDevice  string `json:"tap_device"`
-	MacAddress string `json:"mac_address"`
+	PrivateIP  string       `json:"private_ip"`
+	PublicIP   string       `json:"public_ip"`
+	TapDevice  string       `json:"tap_device"`
+	MacAddress string       `json:"mac_address"`
+	SGRules    []SGRuleSpec `json:"sg_rules,omitempty"`
 }
 
 // ExtraDiskConfig describes an additional block device to attach to a VM.

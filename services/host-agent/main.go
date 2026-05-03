@@ -42,14 +42,17 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 
+	runtimev1 "github.com/compute-platform/compute-platform/packages/contracts/runtimev1"
 	"github.com/compute-platform/compute-platform/services/host-agent/metadata"
 	"github.com/compute-platform/compute-platform/services/host-agent/runtime"
+	"google.golang.org/grpc"
 )
 
 // agentConfig holds all Host Agent configuration from environment.
@@ -125,12 +128,28 @@ func main() {
 		HeartbeatLoop(ctx, cfg, mtlsClient, log)
 	}()
 
-	// RuntimeService HTTP server.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		startRuntimeHTTPServer(ctx, cfg.RuntimeAddr, wrappedSvc, log)
-	}()
+	// RuntimeService HTTP server (dev fallback; not the production transport).
+	// Production: gRPC server below is the canonical transport.
+	// Set HOST_AGENT_TRANSPORT=http to use HTTP server only.
+	transportMode := getEnvDefault("HOST_AGENT_TRANSPORT", "grpc")
+	if transportMode == "http" || transportMode == "both" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			startRuntimeHTTPServer(ctx, cfg.RuntimeAddr, wrappedSvc, log)
+		}()
+	}
+
+	// RuntimeService gRPC server (production transport).
+	// The gRPC server is bound to the same RUNTIME_ADDR.
+	// Set HOST_AGENT_TRANSPORT=http to skip gRPC and use HTTP only.
+	if transportMode == "grpc" || transportMode == "both" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			startRuntimeGRPCServer(ctx, cfg.RuntimeAddr, svc, log)
+		}()
+	}
 
 	// Metadata service.
 	// Production: METADATA_ADDR must be 169.254.169.254:80 (the link-local address
@@ -195,7 +214,9 @@ func getEnvDefault(key, def string) string {
 
 // ── RuntimeService HTTP server ────────────────────────────────────────────────
 // Exposes RuntimeService operations as HTTP/JSON endpoints.
-// The runtime-client/client.go calls these endpoints from the worker.
+// Dev-only transport. Production uses the gRPC server below.
+// The runtime-client/client.go calls these endpoints from the worker when
+// RUNTIME_CLIENT_MODE=http is set on the worker side.
 
 func startRuntimeHTTPServer(ctx context.Context, addr string, svc *instrumentedRuntimeService, log *slog.Logger) {
 	mux := http.NewServeMux()
@@ -237,6 +258,35 @@ func startRuntimeHTTPServer(ctx context.Context, addr string, svc *instrumentedR
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Error("RuntimeService HTTP server error", "error", err)
+	}
+}
+
+// startRuntimeGRPCServer starts the gRPC RuntimeService server on the given address.
+// This is the production transport. The worker connects to this server using the
+// gRPC client (packages/runtime-client/grpc_client.go) with mTLS.
+//
+// The gRPC server uses the raw RuntimeService (not the instrumented wrapper) because
+// metadata store population is handled by the gRPC server implementation layer.
+// Source: RUNTIMESERVICE_GRPC_V1 §7.
+func startRuntimeGRPCServer(ctx context.Context, addr string, svc *runtime.RuntimeService, log *slog.Logger) {
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Error("gRPC server: failed to listen", "addr", addr, "error", err)
+		return
+	}
+
+	grpcSrv := grpc.NewServer()
+	runtimev1.RegisterRuntimeServiceServer(grpcSrv, runtime.NewGRPCServer(svc, log))
+
+	log.Info("RuntimeService gRPC server starting", "addr", addr)
+
+	go func() {
+		<-ctx.Done()
+		grpcSrv.GracefulStop()
+	}()
+
+	if err := grpcSrv.Serve(lis); err != nil {
+		log.Error("gRPC server error", "error", err)
 	}
 }
 

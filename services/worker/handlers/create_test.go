@@ -209,6 +209,12 @@ func (s *fakeStore) GetVolumeByID(_ context.Context, _ string) (*db.VolumeRow, e
 	return nil, nil // no volumes seeded in plain fakeStore
 }
 
+// ── SG rule retrieval (VM Job 4) ──────────────────────────────────────────────
+
+func (s *fakeStore) GetEffectiveSGRulesForInstance(_ context.Context, _ string) ([]db.EffectiveSGRuleRow, error) {
+	return nil, nil // no SG rules seeded in plain fakeStore
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // eventTypes returns the list of event types written so far (for assertions).
@@ -347,7 +353,7 @@ func newTestCreateHandler(store *fakeStore, net *fakeNetwork, rt *fakeRuntime) *
 		Store:        store,
 		Network:      net,
 		DefaultVPCID: phase1VPCID,
-		Runtime:      func(_, _ string) *runtimeclient.Client { return nil }, // not called; overridden below
+		Runtime:      func(_, _ string) RuntimeClient { return nil }, // not called; overridden below
 	}
 	h := NewCreateHandler(deps, testLog())
 	h.runtimeFactory = func(_, _ string) RuntimeClient { return rt }
@@ -360,7 +366,7 @@ func newTestDeleteHandler(store *fakeStore, net *fakeNetwork, rt *fakeRuntime) *
 		Store:        store,
 		Network:      net,
 		DefaultVPCID: phase1VPCID,
-		Runtime:      func(_, _ string) *runtimeclient.Client { return nil },
+		Runtime:      func(_, _ string) RuntimeClient { return nil },
 	}
 	h := NewDeleteHandler(deps, testLog())
 	h.runtimeFactory = func(_, _ string) RuntimeClient { return rt }

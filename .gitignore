@@ -7,8 +7,23 @@ bin/
 /host-agent
 _claude_vm_p2a_s3_repo_pack/
 
-# Local frontend dependencies
+# ── Frontend generated/vendor artifacts ──────────────────────────────────────
+# Dependency installation artifacts (generated, not source).
 console/node_modules/
+console/.package-lock.json
 
-# Local frontend build output
+# Frontend build output (generated, not source).
 console/dist/
+console/build/
+
+# Frontend typecheck cache (generated).
+console/tsconfig.tsbuildinfo
+
+# ── IDE / editor ────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS ──────────────────────────────────────────────────────────────────────

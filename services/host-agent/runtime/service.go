@@ -40,6 +40,10 @@ type NetworkConfig struct {
 	PublicIP   string
 	TapDevice  string
 	MacAddress string
+	// SGRules is an optional list of ingress security group rules to apply.
+	// When non-nil, ApplySGPolicy is called after CreateTAP and ProgramNAT.
+	// When nil, no SG policy is applied (default deny-all via no chain jump).
+	SGRules []SGRule
 }
 
 type CreateInstanceRequest struct {
@@ -162,6 +166,16 @@ func (s *RuntimeService) CreateInstance(ctx context.Context, req *CreateInstance
 		return nil, fmt.Errorf("CreateInstance: NAT: %w", err)
 	}
 
+	// Step 3b: Apply security group policy.
+	if len(req.Network.SGRules) > 0 {
+		if err := s.net.ApplySGPolicy(ctx, req.InstanceID, tapDev, req.Network.SGRules); err != nil {
+			s.log.Warn("CreateInstance: ApplySGPolicy failed — continuing without SG",
+				"instance_id", req.InstanceID,
+				"error", err,
+			)
+		}
+	}
+
 	// Step 4: Launch VM via the configured runtime backend.
 	spec := InstanceSpec{
 		InstanceID:   req.InstanceID,
@@ -217,10 +231,12 @@ func (s *RuntimeService) StopInstance(ctx context.Context, req *StopInstanceRequ
 	return &StopInstanceResponse{InstanceID: req.InstanceID, State: "STOPPED"}, nil
 }
 
-// DeleteInstance destroys all VM resources: process, rootfs, TAP, NAT.
+// DeleteInstance destroys all VM resources: process, rootfs, TAP, NAT, SG policy.
 // Executes in reverse-allocation order:
 //
-//	process kill → TAP delete → NAT remove → rootfs delete
+//	process kill → TAP delete → SG policy remove → rootfs delete
+//
+// NAT removal is handled separately by the worker (RemoveNAT with known IPs).
 //
 // Source: RUNTIMESERVICE_GRPC_V1 §DeleteInstance, IMPLEMENTATION_PLAN_V1 rollback order.
 func (s *RuntimeService) DeleteInstance(ctx context.Context, req *DeleteInstanceRequest) (*DeleteInstanceResponse, error) {
@@ -239,11 +255,15 @@ func (s *RuntimeService) DeleteInstance(ctx context.Context, req *DeleteInstance
 			"instance_id", req.InstanceID, "error", err)
 	}
 
+	// 2b. Remove security group policy (idempotent).
+	tapDev := tapName(req.InstanceID)
+	_ = s.net.RemoveSGPolicy(ctx, req.InstanceID, tapDev)
+
 	// 3. Remove NAT rules.
 	// Note: privateIP and publicIP are not known at this layer — the worker
 	// passes them via the delete job payload and calls RemoveNAT separately
 	// before issuing DeleteInstance to the host agent.
-	// The Host Agent only handles process + TAP + rootfs.
+	// The Host Agent only handles process + TAP + SG + rootfs.
 
 	// 4. Delete rootfs overlay (Phase 1: always delete_on_termination=true).
 	if req.DeleteRootDisk {

@@ -131,3 +131,35 @@ func (r *Repo) CheckAndDecrementQuota(ctx context.Context, scopeID string) error
 	}
 	return nil
 }
+
+// RefundQuota is the explicit quota refund API for cases where the count-based
+// automatic reclamation is not sufficient (e.g. reservation-based models, or
+// callers that want to release quota before the instance row transitions).
+//
+// Phase 1 implementation: count-based model. Since CountActiveInstancesByScope
+// already excludes instances with vm_state IN ('deleted', 'failed'), this is
+// a logical no-op at the DB layer — the quota is automatically freed when the
+// instance transitions to failed or is soft-deleted. This method exists as the
+// explicit seam for future reservation-based quota models.
+//
+// Always returns nil. Never errors — quota integrity does not require explicit
+// refund in the count-based model.
+//
+// Source: vm-13-02__blueprint__ §core_contracts "Transactional Quota Integrity".
+func (r *Repo) RefundQuota(ctx context.Context, scopeID string) error {
+	// Count-based model: no explicit refund needed.
+	// When the instance is failed/soft-deleted, CountActiveInstancesByScope
+	// excludes it automatically. This method is the seam for Phase 2
+	// reservation-column models where an explicit decrement is required.
+	_ = scopeID
+	return nil
+}
+
+// ReserveQuota provides a forward-compatible seam for reservation-based quota.
+// Phase 1: delegates to CheckAndDecrementQuota (count-based equivalent).
+// Returns ErrQuotaExceeded when the scope is at or above its limit.
+//
+// Source: vm-13-02__blueprint__ §future_phases "Reservation-Based Quota".
+func (r *Repo) ReserveQuota(ctx context.Context, scopeID string) error {
+	return r.CheckAndDecrementQuota(ctx, scopeID)
+}

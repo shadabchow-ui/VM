@@ -51,13 +51,67 @@ func main() {
 	repo := db.New(&sqlDBPool{sqlDB})
 
 	network := handlers.NewNetworkControllerClient(ncURL)
+
+	// Runtime client factory: gRPC (production default) or HTTP/JSON (dev fallback).
+	// Set RUNTIME_CLIENT_MODE=http to use the HTTP/JSON client for local dev
+	// without mTLS. The HTTP client is a dev-only transport and does NOT support
+	// mTLS. Default mode is gRPC with mTLS.
+	runtimeMode := os.Getenv("RUNTIME_CLIENT_MODE")
+	var runtimeFactory func(hostID, address string) handlers.RuntimeClient
+	switch runtimeMode {
+	case "http":
+		runtimeFactory = func(hostID, address string) handlers.RuntimeClient {
+			return runtimeclient.NewClient(hostID, address, nil)
+		}
+	default:
+		// Production: gRPC with mTLS (when cert files are configured).
+		caCertPath := os.Getenv("RUNTIME_CA_CERT")
+		clientCertPath := os.Getenv("RUNTIME_CLIENT_CERT")
+		clientKeyPath := os.Getenv("RUNTIME_CLIENT_KEY")
+
+		var grpcOpts []string // keep track for audit
+		if caCertPath != "" {
+			dialOpt, err := runtimeclient.LoadClientCertFromFiles(clientCertPath, clientKeyPath, caCertPath)
+			if err != nil {
+				log.Error("failed to load mTLS config, falling back to insecure gRPC", "error", err)
+				runtimeFactory = func(hostID, address string) handlers.RuntimeClient {
+					client, err := runtimeclient.NewGRPCClient(hostID, address)
+					if err != nil {
+						log.Error("grpc dial failed", "host_id", hostID, "error", err)
+						return nil
+					}
+					return client
+				}
+			} else {
+				grpcOpts = append(grpcOpts, "mtls")
+				runtimeFactory = func(hostID, address string) handlers.RuntimeClient {
+					client, err := runtimeclient.NewGRPCClient(hostID, address, dialOpt)
+					if err != nil {
+						log.Error("grpc dial failed", "host_id", hostID, "error", err)
+						return nil
+					}
+					return client
+				}
+			}
+		} else {
+			// Dev mode: gRPC without mTLS. Production MUST set RUNTIME_CA_CERT.
+			log.Warn("RUNTIME_CA_CERT not set — using gRPC without mTLS (dev-only)")
+			runtimeFactory = func(hostID, address string) handlers.RuntimeClient {
+				client, err := runtimeclient.NewGRPCClient(hostID, address)
+				if err != nil {
+					log.Error("grpc dial failed", "host_id", hostID, "error", err)
+					return nil
+				}
+				return client
+			}
+		}
+	}
+
 	deps := &handlers.Deps{
 		Store:        repo,
 		Network:      network,
 		DefaultVPCID: "00000000-0000-0000-0000-000000000001",
-		Runtime: func(hostID, address string) *runtimeclient.Client {
-			return runtimeclient.NewClient(hostID, address, nil)
-		},
+		Runtime:      runtimeFactory,
 	}
 
 	// VM-P2B: volume job handlers.

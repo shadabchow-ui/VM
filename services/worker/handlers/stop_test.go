@@ -49,7 +49,7 @@ func newTestStopHandler(store *fakeStore, net *fakeNetwork, rt RuntimeClient) *S
 		Store:        store,
 		Network:      net,
 		DefaultVPCID: phase1VPCID,
-		Runtime:      func(_, _ string) *runtimeclient.Client { return nil },
+		Runtime:      func(_, _ string) RuntimeClient { return nil },
 	}
 	h := NewStopHandler(deps, testLog())
 	h.runtimeFactory = func(_, _ string) RuntimeClient { return rt }

@@ -151,7 +151,7 @@ func makeDepsNIC(store InstanceStore, net *fakeNetwork) *Deps {
 		Store:        store,
 		Network:      net,
 		DefaultVPCID: phase1VPCID,
-		Runtime:      func(_, _ string) *runtimeclient.Client { return nil },
+		Runtime:      func(_, _ string) RuntimeClient { return nil },
 	}
 }
 
@@ -354,7 +354,7 @@ func TestNIC_Phase1Classic_NoNICPaths(t *testing.T) {
 		Store:        base,
 		Network:      net,
 		DefaultVPCID: phase1VPCID,
-		Runtime:      func(_, _ string) *runtimeclient.Client { return nil },
+		Runtime:      func(_, _ string) RuntimeClient { return nil },
 	}
 
 	ctx := context.Background()

@@ -60,6 +60,12 @@ type InstanceStore interface {
 	// Called by the delete handler as the final NIC lifecycle step.
 	SoftDeleteNetworkInterface(ctx context.Context, nicID string) error
 
+	// Security group rule retrieval (VM Job 4 — SG enforcement MVP).
+	// GetEffectiveSGRulesForInstance returns the union of all ingress SG rules
+	// attached to the instance's primary NIC. Returns an empty slice when the
+	// instance has no NIC or no rules (Phase 1 classic — safe no-op).
+	GetEffectiveSGRulesForInstance(ctx context.Context, instanceID string) ([]db.EffectiveSGRuleRow, error)
+
 	// Root disk operations (M10 Slice 3)
 	// Source: 06-01-root-disk-model-and-persistence-semantics.md,
 	//         P2_VOLUME_MODEL.md §1.
@@ -102,11 +108,15 @@ type RuntimeClient interface {
 
 // Deps holds all shared dependencies for job handlers.
 // Construct once in worker/main.go; pass to each handler constructor.
+//
+// Runtime is a factory that returns a RuntimeClient. In production, this returns
+// a gRPC client (grpc_client.go) with mTLS. For dev, set RUNTIME_CLIENT_MODE=http
+// to use the HTTP/JSON fallback (client.go).
 type Deps struct {
 	Store        InstanceStore
 	Network      NetworkController
-	Runtime      func(hostID, address string) *runtimeclient.Client // factory (production)
-	DefaultVPCID string                                             // Phase 1: all instances share one VPC
+	Runtime      func(hostID, address string) RuntimeClient // factory — gRPC (production) or HTTP/JSON (dev)
+	DefaultVPCID string                                     // Phase 1: all instances share one VPC
 }
 
 // ── VolumeStore ───────────────────────────────────────────────────────────────

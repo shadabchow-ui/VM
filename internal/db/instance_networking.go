@@ -361,6 +361,24 @@ func SubnetContainsIP(cidr, ipStr string) (bool, error) {
 	return network.Contains(ip), nil
 }
 
+// ── VM Job 4: SG enforcement MVP ──────────────────────────────────────────────
+
+// GetEffectiveSGRulesForInstance returns the union of all security group rules
+// attached to the instance's primary NIC. Returns an empty slice when the
+// instance has no NIC (Phase 1 classic instance — safe no-op at caller).
+//
+// Source: VM Job 4 — TAP/bridge/NAT + security group enforcement MVP.
+func (r *Repo) GetEffectiveSGRulesForInstance(ctx context.Context, instanceID string) ([]EffectiveSGRuleRow, error) {
+	nic, err := r.GetPrimaryNetworkInterfaceByInstance(ctx, instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("GetEffectiveSGRulesForInstance: %w", err)
+	}
+	if nic == nil {
+		return nil, nil // Phase 1 classic — no NIC, no rules
+	}
+	return r.GetEffectiveSGRulesForNIC(ctx, nic.ID)
+}
+
 // ── VM Job 5: Stale NIC detection for reconciliation ─────────────────────────
 
 // StaleNICRow is the result row for ListStaleNetworkInterfaces.

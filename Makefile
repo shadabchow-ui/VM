@@ -4,6 +4,7 @@
         build-network-controller \
         m0-gate m1-gate m2-gate m8-gate m8-gate-full \
         test-m8 \
+        test-network test-network-dryrun test-network-privileged test-network-e2e \
         run-worker run-host-agent run-network-controller
 
 # ── Linting ───────────────────────────────────────────────────────────────────
@@ -165,3 +166,31 @@ m2-smoke-test:
 
 
 ci: lint test build-all
+
+# ── Network Gate (VM Job 4 — TAP/bridge/NAT + SG enforcement MVP) ─────────────
+
+# Dry-run unit tests for host-agent networking. Runs on macOS without Linux/KVM.
+# Verifies TAP, NAT, SG policy command generation and idempotency using FakeExecutor.
+test-network-dryrun:
+	go test -v -count=1 ./services/host-agent/runtime/... -run 'TestNetworkDryRun|TestCreateTAP|TestDeleteTAP|TestProgramNAT|TestRemoveNAT|TestSG_'
+
+# Full networking unit test suite (dry-run + privileged util tests).
+# Covers: TAP, bridge, NAT, SG policy, executor, inspection helpers.
+test-network:
+	go test -count=1 ./services/host-agent/runtime/...
+
+# Privileged networking tests. Requires Linux with CAP_NET_ADMIN.
+# Verifies real kernel iptables/ip state.
+# Usage: sudo NETWORK_DRY_RUN=false make test-network-privileged
+test-network-privileged:
+	go test -v -count=1 ./services/host-agent/runtime/... -run 'TestPrivilegedNet|TestE2E_RealVM'
+
+# E2E network dataplane tests. Requires Linux, CAP_NET_ADMIN, and Firecracker/KVM.
+# Usage: REALVM_E2E=1 NETWORK_DRY_RUN=false sudo make test-network-e2e
+test-network-e2e:
+	go test -v -count=1 -tags=e2e -timeout=30m ./test/e2e/network/... ./test/e2e/realvm/...
+
+# Worker-level networking lifecycle tests (SSH SLA + NAT + SG).
+# Uses mocked stores and runtimes — no real infrastructure required.
+test-worker-network:
+	go test -v -count=1 ./services/worker/handlers/... -run 'TestNAT|TestSSH'

@@ -143,7 +143,7 @@ func newIntegCreateHandler(t *testing.T, repo *db.Repo, rt *integFakeRuntime) *h
 		Store:        repo,
 		Network:      &integFakeNetwork{repo: repo},
 		DefaultVPCID: integVPCID,
-		Runtime:      func(_, _ string) *runtimeclient.Client { return nil },
+		Runtime:      func(_, _ string) handlers.RuntimeClient { return nil },
 	}
 	h := handlers.NewCreateHandler(deps, nil)
 	// Override runtime factory to return our fake.
@@ -159,7 +159,7 @@ func newIntegDeleteHandler(t *testing.T, repo *db.Repo, rt *integFakeRuntime) *h
 		Store:        repo,
 		Network:      &integFakeNetwork{repo: repo},
 		DefaultVPCID: integVPCID,
-		Runtime:      func(_, _ string) *runtimeclient.Client { return nil },
+		Runtime:      func(_, _ string) handlers.RuntimeClient { return nil },
 	}
 	h := handlers.NewDeleteHandler(deps, nil)
 	h.SetRuntimeFactory(func(_, _ string) handlers.RuntimeClient { return rt })

@@ -135,6 +135,8 @@ func (h *StartHandler) Execute(ctx context.Context, job *db.JobRow) error {
 	hostAddr := selectedHost.ID + ":50051"
 	rtClient := h.runtimeFactory(selectedHost.ID, hostAddr)
 
+	sgRules := effectiveSGRulesToSpec(h.deps.Store, ctx, inst.ID)
+
 	createReq := &runtimeclient.CreateInstanceRequest{
 		InstanceID:     inst.ID,
 		ImageURL:       imageURLFromID(inst.ImageID),
@@ -147,6 +149,7 @@ func (h *StartHandler) Execute(ctx context.Context, job *db.JobRow) error {
 			PrivateIP:  allocatedIP,
 			TapDevice:  "tap-" + inst.ID[:8],
 			MacAddress: deriveMACAddress(inst.ID),
+			SGRules:    sgRules,
 		},
 	}
 	if _, err := rtClient.CreateInstance(ctx, createReq); err != nil {

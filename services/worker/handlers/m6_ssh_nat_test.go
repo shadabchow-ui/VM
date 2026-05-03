@@ -153,7 +153,7 @@ func TestSSH_SLA_CreateHandler_RunningOnlyAfterSSHReady(t *testing.T) {
 	rt := &fakeFullRuntime{}
 
 	deps := &Deps{Store: store, Network: net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 
 	h := NewCreateHandler(deps, testLog())
 	h.SetRuntimeFactory(func(_, _ string) RuntimeClient { return rt })
@@ -187,7 +187,7 @@ func TestSSH_SLA_CreateHandler_ReadinessFnCalledBeforeRunning(t *testing.T) {
 	rt := &fakeFullRuntime{}
 
 	deps := &Deps{Store: store, Network: net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 
 	h := NewCreateHandler(deps, testLog())
 	h.SetRuntimeFactory(func(_, _ string) RuntimeClient { return rt })
@@ -316,7 +316,7 @@ func TestNAT_ProgrammedOnCreate(t *testing.T) {
 	rt := &natRecordingRuntime{}
 
 	deps := &Deps{Store: store, Network: net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 	h := NewCreateHandler(deps, testLog())
 	h.SetRuntimeFactory(func(_, _ string) RuntimeClient { return rt })
 	h.SetReadinessFn(instantReadiness)
@@ -347,7 +347,7 @@ func TestNAT_RemovedOnDelete(t *testing.T) {
 	rt := &natRecordingRuntime{}
 
 	deps := &Deps{Store: store, Network: net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 
 	// Create first.
 	createH := NewCreateHandler(deps, testLog())
@@ -398,7 +398,7 @@ func TestNAT_RemovedOnStop(t *testing.T) {
 	rt := &natRecordingRuntime{}
 
 	deps := &Deps{Store: store, Network: net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 
 	// Create.
 	createH := NewCreateHandler(deps, testLog())
@@ -445,7 +445,7 @@ func TestNAT_Idempotent_RepeatedDelete(t *testing.T) {
 	rt := &natRecordingRuntime{}
 
 	deps := &Deps{Store: store, Network: net, DefaultVPCID: phase1VPCID,
-		Runtime: func(_, _ string) *runtimeclient.Client { return nil }}
+		Runtime: func(_, _ string) RuntimeClient { return nil }}
 
 	createH := NewCreateHandler(deps, testLog())
 	createH.SetRuntimeFactory(func(_, _ string) RuntimeClient { return rt })
