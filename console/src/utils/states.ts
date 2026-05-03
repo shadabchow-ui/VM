@@ -22,8 +22,6 @@ const ALLOWED_ACTIONS: Record<InstanceStatus, ActionName[]> = {
   deleting: [],
   deleted: [],
   failed: ['delete'],
-  error: ['delete'],
-  unknown: [],
 };
 
 export function isActionAllowed(status: InstanceStatus, action: ActionName): boolean {
@@ -121,21 +119,5 @@ export const STATE_DISPLAY: Record<InstanceStatus, StateDisplay> = {
     borderColor: '#fecaca',
     spinner: false,
     isError: true,
-  },
-  error: {
-    label: 'Error',
-    color: '#dc2626',
-    bgColor: '#fef2f2',
-    borderColor: '#fecaca',
-    spinner: false,
-    isError: true,
-  },
-  unknown: {
-    label: 'Unknown',
-    color: '#6b7280',
-    bgColor: '#f9fafb',
-    borderColor: '#e5e7eb',
-    spinner: false,
-    isError: false,
   },
 };

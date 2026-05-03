@@ -30,8 +30,8 @@ import type {
   SSHKey,
   VersionInfo,
   ApiErrorEnvelope,
-} from '../types';
-import { ApiException } from '../types';
+} from './types';
+import { ApiException } from './types';
 
 // API base URL — configured via Vite env or empty string (dev proxy handles it).
 const BASE_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? '';
