@@ -20,7 +20,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         display: 'flex',
         height: '100vh',
         overflow: 'hidden',
-        background: '#0f1117',
+        background: 'linear-gradient(135deg, #222222 0%, #000000 100%)',
         fontFamily: 'IBM Plex Sans, sans-serif',
       }}
     >
@@ -29,8 +29,8 @@ export function Layout({ children }: { children: React.ReactNode }) {
         style={{
           width: 216,
           flexShrink: 0,
-          background: '#12151e',
-          borderRight: '1px solid rgba(255,255,255,0.07)',
+          background: 'linear-gradient(180deg, #222222 0%, #050505 100%)',
+          borderRight: '1px solid rgba(255,255,255,0.10)',
           display: 'flex',
           flexDirection: 'column',
         }}
@@ -39,7 +39,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <div
           style={{
             padding: '18px 20px 16px',
-            borderBottom: '1px solid rgba(255,255,255,0.07)',
+            borderBottom: '1px solid rgba(255,255,255,0.10)',
             display: 'flex',
             alignItems: 'center',
             gap: 6,
@@ -50,13 +50,13 @@ export function Layout({ children }: { children: React.ReactNode }) {
               fontFamily: 'IBM Plex Mono, monospace',
               fontSize: 13,
               fontWeight: 500,
-              color: '#f3f4f6',
+              color: '#f5f5f5',
               letterSpacing: '0.06em',
             }}
           >
             COMPUTE
           </span>
-          <span style={{ color: '#3b82f6', fontSize: 16, lineHeight: 1 }}>›</span>
+          <span style={{ color: '#f5f5f5', fontSize: 16, lineHeight: 1 }}>›</span>
         </div>
 
         {/* Section label */}
@@ -87,8 +87,8 @@ export function Layout({ children }: { children: React.ReactNode }) {
                   padding: '9px 20px',
                   textDecoration: 'none',
                   color: active ? '#e5e7eb' : '#6b7280',
-                  background: active ? 'rgba(59,130,246,0.09)' : 'transparent',
-                  borderLeft: active ? '2px solid #3b82f6' : '2px solid transparent',
+                  background: active ? 'rgba(255,255,255,0.08)' : 'transparent',
+                  borderLeft: active ? '2px solid #f5f5f5' : '2px solid transparent',
                   fontSize: 13,
                   transition: 'all 0.12s',
                 }}
